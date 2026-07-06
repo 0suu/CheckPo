@@ -27,8 +27,9 @@ pub use atomic_io::{read_json, sync_parent_dir, write_bytes_atomic, write_json_a
 pub use db_file::{db_path, open_db};
 pub(crate) use layout::object_id_from_loose_relative_path;
 pub use layout::{
-    canonical_utc, init_repo_layout, load_repo_config, now_utc_string, object_path,
-    refs_latest_path, repo_root, snapshot_path, snapshots_dir, validate_repository_config,
+    canonical_utc, checkpoint_names_path, init_repo_layout, load_repo_config, now_utc_string,
+    object_path, refs_latest_path, repo_root, snapshot_path, snapshots_dir,
+    validate_repository_config,
 };
 pub(crate) use lock::FileLock;
 pub use lock::{acquire_repository_lock, RepositoryLock};

@@ -543,6 +543,58 @@ fn list_and_storage_summary_rebuild_missing_sqlite_index() {
 }
 
 #[test]
+fn rename_checkpoint_preserves_id_and_applies_to_all_summary_paths() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let created = core::create_checkpoint(&project, "before", Default::default()).unwrap();
+
+    let renamed =
+        core::rename_checkpoint(&project, created.checkpoint_id.as_str(), "after").unwrap();
+
+    assert_eq!(renamed.checkpoint_id, created.checkpoint_id);
+    assert_eq!(renamed.name, "after");
+
+    let checkpoints = core::list_checkpoints(&project).unwrap();
+    assert_eq!(checkpoints[0].checkpoint_id, created.checkpoint_id);
+    assert_eq!(checkpoints[0].name, "after");
+
+    let context = core::load_project(&project).unwrap();
+    let (indexed_checkpoints, storage) =
+        core::checkpoint_summaries_and_storage_summary_from_index(&context).unwrap();
+    assert_eq!(indexed_checkpoints[0].checkpoint_id, created.checkpoint_id);
+    assert_eq!(indexed_checkpoints[0].name, "after");
+    assert_eq!(storage.checkpoint_count, 1);
+
+    let repo = repo_path(&view);
+    let snapshot = core::load_snapshot(&repo, &created.checkpoint_id).unwrap();
+    assert_eq!(snapshot.name, "before");
+}
+
+#[test]
+fn corrupt_checkpoint_display_names_do_not_block_checkpoint_list() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let created = core::create_checkpoint(&project, "before", Default::default()).unwrap();
+    let names_path = repo_path(&view).join("refs").join("checkpoint_names.json");
+    fs::write(&names_path, "not json").unwrap();
+
+    let checkpoints = core::list_checkpoints(&project).unwrap();
+
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].checkpoint_id, created.checkpoint_id);
+    assert_eq!(checkpoints[0].name, "before");
+    assert!(!checkpoints[0].warnings.is_empty());
+
+    let context = core::load_project(&project).unwrap();
+    let (indexed_checkpoints, _) =
+        core::checkpoint_summaries_and_storage_summary_from_index(&context).unwrap();
+    assert_eq!(indexed_checkpoints[0].name, "before");
+    assert!(!indexed_checkpoints[0].warnings.is_empty());
+}
+
+#[test]
 fn list_checkpoints_propagates_unreadable_sqlite_index_for_current_project() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();

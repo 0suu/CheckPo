@@ -182,13 +182,47 @@ pub fn list_checkpoints(project_path: impl AsRef<Path>) -> Result<Vec<Checkpoint
 pub fn list_checkpoints_for_project(
     project: &crate::ProjectContext,
 ) -> Result<Vec<CheckpointSummary>> {
-    match crate::list_checkpoint_summaries_from_index(project) {
-        Ok(checkpoints) => Ok(checkpoints),
+    let mut checkpoints = match crate::list_checkpoint_summaries_from_index(project) {
+        Ok(checkpoints) => checkpoints,
         Err(_) if project.location_status == crate::ProjectLocationStatus::CopiedSuspected => {
-            list_checkpoints_from_snapshots(project)
+            list_checkpoints_from_snapshots(project)?
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    };
+    crate::apply_checkpoint_name_overrides(project, &mut checkpoints);
+    Ok(checkpoints)
+}
+
+pub fn rename_checkpoint(
+    project_path: impl AsRef<Path>,
+    checkpoint_id: &str,
+    name: &str,
+) -> Result<CheckpointSummary> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(crate::user_error(
+            "checkpoint rename requires --name <name>.",
+        ));
     }
+    let project = load_project(project_path)?;
+    crate::ensure_project_location_allows_mutation(&project)?;
+    let _lock = acquire_repository_lock(&project.repo_root, "checkpoint-rename")?;
+    ensure_no_pending_transactions(&project)?;
+    let id = SnapshotId::parse(checkpoint_id)?;
+    let snapshot = load_project_snapshot(&project, &id)?;
+    let (mut names, warnings) = crate::read_checkpoint_name_overrides(&project);
+    if name == snapshot.name {
+        names.remove(id.as_str());
+    } else {
+        names.insert(id.to_string(), name.to_string());
+    }
+    crate::write_checkpoint_name_overrides(&project, &names)?;
+    Ok(summary_from_snapshot(
+        id,
+        &snapshot,
+        name.to_string(),
+        warnings,
+    ))
 }
 
 pub fn delete_checkpoint(
@@ -237,6 +271,12 @@ pub fn delete_checkpoint(
             ));
         }
     }
+    match crate::remove_checkpoint_name_override(&project, &id) {
+        Ok(name_warnings) => warnings.extend(name_warnings),
+        Err(error) => warnings.push(format!(
+            "checkpoint display name cleanup failed after delete: {error}"
+        )),
+    }
     Ok(CheckpointDeleteResult {
         deleted_checkpoint_id: id,
         deleted_snapshot_path: path,
@@ -257,15 +297,13 @@ fn list_checkpoints_from_snapshots(
         if snapshot.project_id != project.project_id {
             continue;
         }
-        summaries.push(CheckpointSummary {
-            checkpoint_id: snapshot_id,
-            name: snapshot.name,
-            created_at_utc: snapshot.created_at_utc,
-            file_count: snapshot.files.len(),
-            logical_size_bytes: snapshot.files.iter().map(|file| file.size_bytes).sum(),
-            newly_stored_bytes: 0,
-            warnings: Vec::new(),
-        });
+        let name = snapshot.name.clone();
+        summaries.push(summary_from_snapshot(
+            snapshot_id,
+            &snapshot,
+            name,
+            Vec::new(),
+        ));
     }
     summaries.sort_by(|a, b| {
         b.created_at_utc
@@ -273,6 +311,23 @@ fn list_checkpoints_from_snapshots(
             .then_with(|| b.checkpoint_id.cmp(&a.checkpoint_id))
     });
     Ok(summaries)
+}
+
+fn summary_from_snapshot(
+    checkpoint_id: SnapshotId,
+    snapshot: &SnapshotFile,
+    name: String,
+    warnings: Vec<String>,
+) -> CheckpointSummary {
+    CheckpointSummary {
+        checkpoint_id,
+        name,
+        created_at_utc: snapshot.created_at_utc.clone(),
+        file_count: snapshot.files.len(),
+        logical_size_bytes: snapshot.files.iter().map(|file| file.size_bytes).sum(),
+        newly_stored_bytes: 0,
+        warnings,
+    }
 }
 
 fn refresh_fingerprints_after_checkpoint(

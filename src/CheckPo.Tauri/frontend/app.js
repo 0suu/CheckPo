@@ -36,6 +36,7 @@ const state = {
   projectHistory: readProjectHistory(),
   checkpoints: [],
   selectedCheckpointId: null,
+  renamingCheckpointId: null,
   storage: null,
   gcPlan: null,
   rollbackPlan: null,
@@ -605,28 +606,256 @@ function renderCheckpoints() {
     return;
   }
   for (const checkpoint of checkpoints) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `checkpoint-row${checkpoint.checkpointId === state.selectedCheckpointId ? " is-selected" : ""}`;
-    button.innerHTML = `
+    const isRenaming = checkpoint.checkpointId === state.renamingCheckpointId;
+    const row = document.createElement(isRenaming ? "div" : "button");
+    if (!isRenaming) row.type = "button";
+    row.className = `checkpoint-row${checkpoint.checkpointId === state.selectedCheckpointId ? " is-selected" : ""}${isRenaming ? " is-renaming" : ""}`;
+    row.dataset.checkpointId = checkpoint.checkpointId;
+    if (isRenaming) {
+      row.setAttribute("role", "option");
+      row.tabIndex = 0;
+    }
+    row.innerHTML = `
       <span class="checkpoint-id mono"></span>
       <strong class="checkpoint-title"></strong>
       <span class="checkpoint-meta"></span>
     `;
-    button.querySelector(".checkpoint-id").textContent = String(checkpoint.checkpointId || "").slice(0, 4) || "----";
-    button.querySelector(".checkpoint-title").textContent = checkpoint.name || checkpoint.checkpointId;
-    button.querySelector(".checkpoint-meta").textContent =
+    row.querySelector(".checkpoint-id").textContent = String(checkpoint.checkpointId || "").slice(0, 4) || "----";
+    row.querySelector(".checkpoint-meta").textContent =
       `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0} files`;
-    button.addEventListener("click", () => {
-      state.selectedCheckpointId = checkpoint.checkpointId;
-      state.rollbackPlan = null;
-      renderCheckpoints();
-      renderProjectLabels();
-      updateControls();
+    if (isRenaming) {
+      const title = row.querySelector(".checkpoint-title");
+      const input = document.createElement("input");
+      input.className = "checkpoint-rename-input";
+      input.type = "text";
+      input.value = checkpoint.name || checkpoint.checkpointId;
+      input.setAttribute("aria-label", "チェックポイント名");
+      title.replaceChildren(input);
+      setupCheckpointRenameInput(input, checkpoint);
+      requestAnimationFrame(() => {
+        input.focus();
+        input.select();
+      });
+    } else {
+      row.querySelector(".checkpoint-title").textContent = checkpoint.name || checkpoint.checkpointId;
+      row.addEventListener("click", () => selectCheckpoint(checkpoint.checkpointId));
+    }
+    row.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      selectCheckpoint(checkpoint.checkpointId, { render: !isRenaming });
+      showCheckpointContextMenu(event.clientX, event.clientY, checkpoint);
     });
-    checkpointSection.append(button);
+    checkpointSection.append(row);
   }
   list.append(checkpointSection);
+}
+
+function selectCheckpoint(checkpointId, options = {}) {
+  state.selectedCheckpointId = checkpointId;
+  state.rollbackPlan = null;
+  if (options.render !== false) renderCheckpoints();
+  renderProjectLabels();
+  updateControls();
+}
+
+function beginRenameCheckpoint(checkpointId) {
+  if (state.busy || state.confirming) return;
+  state.renamingCheckpointId = checkpointId;
+  renderCheckpoints();
+}
+
+function setupCheckpointRenameInput(input, checkpoint) {
+  let committing = false;
+  const previousName = String(checkpoint.name || checkpoint.checkpointId || "").trim();
+  const cancel = () => {
+    if (committing) return;
+    state.renamingCheckpointId = null;
+    renderCheckpoints();
+  };
+  const commit = async () => {
+    if (committing) return;
+    const name = input.value.trim();
+    if (!name) {
+      setStatus("チェックポイント名を入力してください。");
+      input.focus();
+      return;
+    }
+    if (name === previousName) {
+      cancel();
+      return;
+    }
+    committing = true;
+    await run("名前を変更中", async () => {
+      const updated = await invokeCommand("rename_checkpoint", {
+        projectPath: getProjectPath(),
+        checkpointId: checkpoint.checkpointId,
+        name,
+      });
+      const updatedId = updated.checkpointId || updated.checkpoint_id || checkpoint.checkpointId;
+      state.checkpoints = state.checkpoints.map((item) => (
+        item.checkpointId === updatedId ? { ...item, name: updated.name || name } : item
+      ));
+      if (state.currentDiff?.checkpoint?.checkpointId === updatedId) {
+        state.currentDiff.checkpoint.name = updated.name || name;
+      }
+      state.renamingCheckpointId = null;
+      renderCheckpoints();
+      renderProjectLabels();
+      setStatus("チェックポイント名を変更しました。");
+    });
+    if (state.renamingCheckpointId === checkpoint.checkpointId) committing = false;
+  };
+  input.addEventListener("click", (event) => event.stopPropagation());
+  input.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commit();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancel();
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!input.value.trim()) {
+      cancel();
+      return;
+    }
+    commit();
+  });
+}
+
+function showCheckpointContextMenu(x, y, checkpoint) {
+  const destructiveBlocked = state.projectLocationStatus === "copiedSuspected";
+  showContextMenu(x, y, [
+    { label: "名前を変更", action: () => beginRenameCheckpoint(checkpoint.checkpointId) },
+    { label: "この状態に戻す", action: () => previewRestoreCheckpoint(checkpoint.checkpointId) },
+    { separator: true },
+    { label: "IDをコピー", action: () => copyCheckpointId(checkpoint.checkpointId) },
+    { separator: true },
+    {
+      label: "削除",
+      danger: true,
+      disabled: destructiveBlocked,
+      action: () => deleteCheckpointById(checkpoint.checkpointId),
+    },
+  ]);
+}
+
+function showProjectContextMenu(x, y) {
+  showContextMenu(x, y, [
+    {
+      label: "エクスプローラーで開く",
+      disabled: !state.projectPath,
+      action: openProjectInFileManager,
+    },
+  ]);
+}
+
+function showContextMenu(x, y, items) {
+  const menu = $("contextMenu");
+  if (!menu) return;
+  menu.replaceChildren();
+  for (const item of items) {
+    if (item.separator) {
+      const separator = document.createElement("div");
+      separator.className = "context-menu-separator";
+      separator.setAttribute("role", "separator");
+      menu.append(separator);
+      continue;
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `context-menu-item${item.danger ? " danger" : ""}`;
+    button.textContent = item.label;
+    button.disabled = state.busy || state.confirming || Boolean(item.disabled);
+    button.setAttribute("role", "menuitem");
+    button.addEventListener("click", () => {
+      hideContextMenu();
+      if (!button.disabled) item.action();
+    });
+    menu.append(button);
+  }
+  menu.hidden = false;
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  requestAnimationFrame(() => {
+    const rect = menu.getBoundingClientRect();
+    const left = Math.min(x, window.innerWidth - rect.width - 8);
+    const top = Math.min(y, window.innerHeight - rect.height - 8);
+    menu.style.left = `${Math.max(8, left)}px`;
+    menu.style.top = `${Math.max(8, top)}px`;
+    menu.querySelector("button:not(:disabled)")?.focus();
+  });
+}
+
+function hideContextMenu() {
+  const menu = $("contextMenu");
+  if (menu) menu.hidden = true;
+}
+
+async function copyCheckpointId(checkpointId) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(checkpointId);
+    } else {
+      const text = document.createElement("textarea");
+      text.value = checkpointId;
+      text.style.position = "fixed";
+      text.style.opacity = "0";
+      document.body.append(text);
+      text.select();
+      document.execCommand("copy");
+      text.remove();
+    }
+    setStatus("チェックポイントIDをコピーしました。");
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function previewRestoreCheckpoint(checkpointId) {
+  selectCheckpoint(checkpointId);
+  await run("戻す内容を確認中", async () => {
+    renderRollbackPlan(await invokeCommand("preview_restore", {
+      projectPath: getProjectPath(),
+      checkpointId,
+    }));
+  });
+}
+
+async function deleteCheckpointById(checkpointId) {
+  const checkpoint = state.checkpoints.find((item) => item.checkpointId === checkpointId);
+  selectCheckpoint(checkpointId);
+  state.confirming = true;
+  updateControls();
+  let confirmed = false;
+  try {
+    const name = checkpoint?.name || checkpointId;
+    confirmed = await confirmAction(`「${name}」を削除します。続行しますか？`, "削除");
+  } finally {
+    state.confirming = false;
+    updateControls();
+  }
+  if (!confirmed) return;
+  await run("削除中", async () => {
+    await invokeCommand("delete_checkpoint", { projectPath: getProjectPath(), checkpointId, confirmed: true });
+    state.selectedCheckpointId = null;
+    state.renamingCheckpointId = null;
+    await refreshProject();
+    await refreshLatestDiff({ allowBusy: true });
+  });
+}
+
+async function openProjectInFileManager() {
+  if (!state.projectPath) return;
+  await run("エクスプローラーを開いています", async () => {
+    await invokeCommand("open_project_in_file_manager", { projectPath: getProjectPath() });
+    setStatus("Unityプロジェクトの場所を開きました。");
+  });
 }
 
 function renderProjectHistory() {
@@ -971,6 +1200,23 @@ function bindEvents() {
     renderProjectHistory();
     $("projectSelectionOverlay").hidden = false;
   });
+  $("projectMenuButton").addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    showProjectContextMenu(event.clientX, event.clientY);
+  });
+  document.addEventListener("contextmenu", (event) => {
+    if (event.defaultPrevented) return;
+    event.preventDefault();
+    hideContextMenu();
+  });
+  document.addEventListener("click", (event) => {
+    if (!$("contextMenu")?.contains(event.target)) hideContextMenu();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hideContextMenu();
+  });
+  window.addEventListener("resize", hideContextMenu);
+  window.addEventListener("scroll", hideContextMenu, true);
   $("addProjectFromEmptyButton").addEventListener("click", () => {
     openProjectRegistration();
   });
@@ -1208,32 +1454,11 @@ function bindEvents() {
     });
   });
   $("deleteCheckpointButton")?.addEventListener("click", async () => {
-    const checkpointId = getCheckpointId();
-    state.confirming = true;
-    updateControls();
-    let confirmed = false;
-    try {
-      confirmed = await confirmAction("選択したチェックポイントを削除します。続行しますか？", "削除");
-    } finally {
-      state.confirming = false;
-      updateControls();
-    }
-    if (!confirmed) return;
-    await run("削除中", async () => {
-      await invokeCommand("delete_checkpoint", { projectPath: getProjectPath(), checkpointId, confirmed: true });
-      state.selectedCheckpointId = null;
-      await refreshProject();
-      await refreshLatestDiff({ allowBusy: true });
-    });
+    await deleteCheckpointById(getCheckpointId());
   });
   $("diffButton").addEventListener("click", runExactDiff);
   $("previewRollbackButton").addEventListener("click", async () => {
-    await run("戻す内容を確認中", async () => {
-      renderRollbackPlan(await invokeCommand("preview_restore", {
-        projectPath: getProjectPath(),
-        checkpointId: getCheckpointId(),
-      }));
-    });
+    await previewRestoreCheckpoint(getCheckpointId());
   });
   $("applyRollbackButton").addEventListener("click", async () => {
     if (!state.rollbackPlan) {

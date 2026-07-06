@@ -90,7 +90,8 @@ pub fn checkpoint_summaries_and_storage_summary_from_index(
     let db_path = crate::db_path(&project.repo_root);
     let conn = open_db(&project.repo_root)?;
     create_schema(&conn, &db_path)?;
-    let checkpoints = query_checkpoint_summaries(&conn, &db_path, project)?;
+    let mut checkpoints = query_checkpoint_summaries(&conn, &db_path, project)?;
+    crate::apply_checkpoint_name_overrides(project, &mut checkpoints);
     let storage = query_storage_summary(&conn, &db_path, project)?;
     Ok((checkpoints, storage))
 }

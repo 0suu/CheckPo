@@ -1,4 +1,5 @@
 mod checkpoint;
+mod checkpoint_names;
 mod db;
 mod diff;
 mod discard;
@@ -15,6 +16,7 @@ mod verify;
 
 pub use checkpoint::{
     create_checkpoint, delete_checkpoint, list_checkpoints, list_checkpoints_for_project,
+    rename_checkpoint,
 };
 pub use db::{
     checkpoint_summaries_and_storage_summary_from_index, rebuild_index,
@@ -66,6 +68,10 @@ pub use verify::{
     verify_project_with_progress_and_cancellation,
 };
 
+pub(crate) use checkpoint_names::{
+    apply_checkpoint_name_overrides, read_checkpoint_name_overrides,
+    remove_checkpoint_name_override, write_checkpoint_name_overrides,
+};
 pub(crate) use db::{
     delete_snapshot_from_index, index_snapshot_with_index_connection, invalidate_file_fingerprints,
     list_checkpoint_summaries_from_index, load_file_fingerprints, open_index_connection,
@@ -80,10 +86,10 @@ pub(crate) use project::{
 };
 pub(crate) use scanner::scan_project_for_checkpoint;
 pub(crate) use storage::{
-    acquire_repository_lock, available_space_bytes, canonical_utc, copy_file_no_replace, hash_file,
-    init_repo_layout, list_snapshot_ids, load_project_snapshot, load_repo_config,
-    move_file_no_replace, now_utc_string, object_id_from_loose_relative_path, refs_latest_path,
-    repo_root, snapshots_dir, sync_parent_dir, validate_repository_config,
+    acquire_repository_lock, available_space_bytes, canonical_utc, checkpoint_names_path,
+    copy_file_no_replace, hash_file, init_repo_layout, list_snapshot_ids, load_project_snapshot,
+    load_repo_config, move_file_no_replace, now_utc_string, object_id_from_loose_relative_path,
+    refs_latest_path, repo_root, snapshots_dir, sync_parent_dir, validate_repository_config,
     verify_file_hash_and_size, write_json_atomic, write_latest_snapshot_id, CopySourceDisposition,
     RepositoryLock,
 };

@@ -226,6 +226,41 @@ async fn delete_checkpoint(
 }
 
 #[tauri::command]
+async fn rename_checkpoint(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    checkpoint_id: String,
+    name: String,
+) -> AppResult {
+    run_guarded_blocking(state, None, move || {
+        core::rename_checkpoint(&project_path, &checkpoint_id, &name)
+            .map(|summary| json!(summary))
+            .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn open_project_in_file_manager(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+) -> AppResult {
+    run_guarded_blocking(state, None, move || {
+        let project = core::load_project(&project_path).map_err(to_app_error)?;
+        let path = project.project_root.as_path();
+        if !path.is_dir() {
+            return Err(AppError::new(
+                "notFound",
+                format!("project folder was not found: {}", path.display()),
+            ));
+        }
+        open_folder_in_file_manager(path)?;
+        Ok(json!({ "path": path }))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn diff_checkpoint(
     state: tauri::State<'_, OperationState>,
     project_path: String,
@@ -550,6 +585,8 @@ pub fn run() {
             create_checkpoint,
             list_checkpoints,
             delete_checkpoint,
+            rename_checkpoint,
+            open_project_in_file_manager,
             diff_checkpoint,
             diff_checkpoint_full,
             preview_restore,
@@ -573,6 +610,32 @@ pub fn run() {
 
 fn to_update_error(error: tauri_plugin_updater::Error) -> AppError {
     AppError::new("updater", error.to_string())
+}
+
+fn open_folder_in_file_manager(path: &std::path::Path) -> Result<(), AppError> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer.exe");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| AppError::new("io", error.to_string()))
 }
 
 fn project_snapshot(project_path: String) -> AppResult {

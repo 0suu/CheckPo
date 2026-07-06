@@ -77,6 +77,10 @@ pub fn refs_latest_path(repo_root: &Path) -> PathBuf {
     repo_root.join("refs").join("latest")
 }
 
+pub fn checkpoint_names_path(repo_root: &Path) -> PathBuf {
+    repo_root.join("refs").join("checkpoint_names.json")
+}
+
 pub fn object_path(repo_root: &Path, object_id: &ObjectId) -> PathBuf {
     let id = object_id.as_str();
     repo_root
