@@ -121,7 +121,7 @@ async function invokeCommand(command, args = {}, options = {}) {
     throw new Error("Tauri invoke API is not available.");
   }
   const trackOperation = command !== "cancel_current_operation" && !options.fromAutoRefresh;
-  if (command !== "cancel_current_operation" && !options.fromAutoRefresh) {
+  if (trackOperation) {
     if (state.autoRefreshInFlight && state.busy) {
       setBusyIndeterminate("自動更新の完了待ち");
     }
@@ -383,7 +383,6 @@ async function refreshLatestDiff(options = {}) {
       updateFilterChips(0, 0, 0);
       return;
     }
-    const previousDiffSummary = $("diffSummary").textContent;
     if (!backgroundRefresh) {
       $("diffSummary").textContent = t("diffLoading");
     }
@@ -396,7 +395,6 @@ async function refreshLatestDiff(options = {}) {
       { fromAutoRefresh: true },
     );
     if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) {
-      $("diffSummary").textContent = previousDiffSummary;
       return;
     }
     renderDiff(diff);
@@ -511,7 +509,7 @@ function renderPending(items) {
 }
 
 function shortId(value) {
-  return String(value || "").slice(0, 8) || "unknown";
+  return String(value ?? "").slice(0, 8) || "unknown";
 }
 
 function recoverySummary(result) {
@@ -1287,14 +1285,10 @@ function bindEvents() {
   $("recoverTransactionsButton").addEventListener("click", async () => {
     await run("復旧中", async () => {
       const result = await invokeCommand("recover_transactions", { projectPath: getProjectPath() });
-      if ((result?.failedTransactionCount ?? 0) > 0) {
-        setBusyIndeterminate("再読み込み中");
-        await refreshProject();
-      }
-      ensureRecoverySucceeded(result);
       setBusyIndeterminate("再読み込み中");
       await refreshProject();
       await refreshLatestDiff({ allowBusy: true });
+      ensureRecoverySucceeded(result);
       setStatus(recoverySummary(result));
     });
   });
