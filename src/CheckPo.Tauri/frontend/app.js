@@ -123,7 +123,7 @@ async function invokeCommand(command, args = {}, options = {}) {
   const trackOperation = command !== "cancel_current_operation" && !options.fromAutoRefresh;
   if (trackOperation) {
     if (state.autoRefreshInFlight && state.busy) {
-      setBusyIndeterminate("自動更新の完了待ち");
+      setBusyIndeterminate(t("waitingForAutoRefresh"));
     }
     await waitForAutoRefreshToFinish();
   }
@@ -178,7 +178,7 @@ async function waitForAutoRefreshToFinish() {
 
 async function run(title, task, options = {}) {
   if (state.busy) {
-    setStatus("別の処理中です。完了してからもう一度実行してください。");
+    setStatus(t("anotherOperationInProgress"));
     return;
   }
   state.busy = true;
@@ -186,7 +186,7 @@ async function run(title, task, options = {}) {
   $("busyOverlay").hidden = false;
   $("busyTitle").textContent = title;
   resetBusyProgress();
-  setBusyIndeterminate(options.initialBusyLabel || "開始中");
+  setBusyIndeterminate(options.initialBusyLabel || t("starting"));
   updateControls();
   try {
     return await task();
@@ -501,15 +501,18 @@ function renderPending(items) {
   }
   const states = items
     .slice(0, 3)
-    .map((item) => `${shortId(item.transactionId)}:${item.state || "unknown"}`)
+    .map((item) => `${shortId(item.transactionId)}:${item.state || t("unknownState")}`)
     .join(" / ");
-  const omitted = items.length > 3 ? ` / 他 ${items.length - 3} 件` : "";
+  const omitted = items.length > 3 ? tf("otherItems", { count: items.length - 3 }) : "";
   $("pendingTransactionText").textContent =
-    `${items.length} 件の中断された書き戻しがあります。復旧してください。${states ? ` (${states}${omitted})` : ""}`;
+    tf("pendingTransactionsMessage", {
+      count: items.length,
+      details: states ? ` (${states}${omitted})` : "",
+    });
 }
 
 function shortId(value) {
-  return String(value ?? "").slice(0, 8) || "unknown";
+  return String(value ?? "").slice(0, 8) || t("unknownTransaction");
 }
 
 function recoverySummary(result) {
@@ -517,10 +520,12 @@ function recoverySummary(result) {
   const failed = result?.failedTransactionCount ?? 0;
   if (failed > 0) {
     const first = result?.failedTransactions?.[0];
-    const detail = first ? `: ${shortId(first.transactionId)} ${first.error}` : "";
-    return `復旧に失敗した transaction があります（成功 ${recovered} / 失敗 ${failed}）${detail}`;
+    const detail = first
+      ? tf("recoveryFailureDetail", { id: shortId(first.transactionId), error: first.error })
+      : "";
+    return tf("recoveryFailed", { recovered, failed, detail });
   }
-  return `復旧しました（${recovered} 件）。`;
+  return tf("recoverySucceeded", { count: recovered });
 }
 
 function ensureRecoverySucceeded(result) {
