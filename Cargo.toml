@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+  "src/CheckPo.Core",
+  "src/CheckPo.Cli",
+  "src/CheckPo.Tauri/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.85"
