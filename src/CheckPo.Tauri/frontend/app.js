@@ -751,7 +751,7 @@ function updateControls() {
       return;
     }
     if (button.id === "cancelOperationButton") {
-      button.disabled = !state.busy || !state.currentOperationCancellable;
+      button.disabled = !state.busy || !state.currentOperationCancellable || state.cancelRequested;
       return;
     }
     if (button.id === "installUpdateButton") {
