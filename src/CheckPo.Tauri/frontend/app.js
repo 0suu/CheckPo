@@ -49,6 +49,7 @@ const state = {
   busy: false,
   autoRefreshInFlight: false,
   lastAutoRefreshAt: 0,
+  userOperationSerial: 0,
   activeCommand: null,
   cancelRequested: false,
   currentOperationCancellable: false,
@@ -119,14 +120,20 @@ async function invokeCommand(command, args = {}, options = {}) {
   if (!tauriInvoke) {
     throw new Error("Tauri invoke API is not available.");
   }
+  const trackOperation = command !== "cancel_current_operation" && !options.fromAutoRefresh;
   if (command !== "cancel_current_operation" && !options.fromAutoRefresh) {
+    if (state.autoRefreshInFlight && state.busy) {
+      setBusyIndeterminate("自動更新の完了待ち");
+    }
     await waitForAutoRefreshToFinish();
   }
-  if (command !== "cancel_current_operation") {
+  if (trackOperation) {
     state.activeCommand = command;
     state.cancelRequested = false;
   }
-  state.currentOperationCancellable = immediatelyCancellableCommands.has(command);
+  if (trackOperation) {
+    state.currentOperationCancellable = immediatelyCancellableCommands.has(command);
+  }
   updateControls();
   try {
     let busyRetryIndex = 0;
@@ -151,7 +158,7 @@ async function invokeCommand(command, args = {}, options = {}) {
       }
     }
   } finally {
-    if (state.activeCommand === command) {
+    if (trackOperation && state.activeCommand === command) {
       state.activeCommand = null;
       state.currentOperationCancellable = false;
     }
@@ -170,11 +177,16 @@ async function waitForAutoRefreshToFinish() {
 }
 
 async function run(title, task, options = {}) {
-  if (state.busy) return;
+  if (state.busy) {
+    setStatus("別の処理中です。完了してからもう一度実行してください。");
+    return;
+  }
   state.busy = true;
+  state.userOperationSerial += 1;
   $("busyOverlay").hidden = false;
   $("busyTitle").textContent = title;
   resetBusyProgress();
+  setBusyIndeterminate(options.initialBusyLabel || "開始中");
   updateControls();
   try {
     return await task();
@@ -353,13 +365,17 @@ async function refreshProject(options = {}) {
 
 async function refreshLatestDiff(options = {}) {
   if ((state.busy && !options.allowBusy) || state.autoRefreshInFlight || !state.projectPath) return;
+  const backgroundRefresh = !options.allowBusy;
+  const startedUserOperationSerial = state.userOperationSerial;
   state.autoRefreshInFlight = true;
   try {
     if (options.refreshProject) {
       await refreshProject({ fromAutoRefresh: true });
+      if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) return;
     }
     const checkpointId = latestCheckpointId();
     if (!checkpointId) {
+      if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) return;
       state.currentDiff = null;
       $("diffSummary").textContent = t("diffEmpty");
       $("diffGroups").replaceChildren();
@@ -367,15 +383,23 @@ async function refreshLatestDiff(options = {}) {
       updateFilterChips(0, 0, 0);
       return;
     }
-    $("diffSummary").textContent = t("diffLoading");
-    renderDiff(await invokeCommand(
+    const previousDiffSummary = $("diffSummary").textContent;
+    if (!backgroundRefresh) {
+      $("diffSummary").textContent = t("diffLoading");
+    }
+    const diff = await invokeCommand(
       "diff_checkpoint",
       {
         projectPath: getProjectPath(),
         checkpointId,
       },
       { fromAutoRefresh: true },
-    ));
+    );
+    if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) {
+      $("diffSummary").textContent = previousDiffSummary;
+      return;
+    }
+    renderDiff(diff);
   } catch (error) {
     if (!options.silent) setStatus(errorText(error));
   } finally {
@@ -473,7 +497,38 @@ function renderStorage() {
 
 function renderPending(items) {
   $("pendingTransactionBanner").hidden = items.length === 0;
-  $("pendingTransactionText").textContent = `${items.length} 件の未完了 transaction があります。復旧してください。`;
+  if (items.length === 0) {
+    $("pendingTransactionText").textContent = "";
+    return;
+  }
+  const states = items
+    .slice(0, 3)
+    .map((item) => `${shortId(item.transactionId)}:${item.state || "unknown"}`)
+    .join(" / ");
+  const omitted = items.length > 3 ? ` / 他 ${items.length - 3} 件` : "";
+  $("pendingTransactionText").textContent =
+    `${items.length} 件の中断された書き戻しがあります。復旧してください。${states ? ` (${states}${omitted})` : ""}`;
+}
+
+function shortId(value) {
+  return String(value || "").slice(0, 8) || "unknown";
+}
+
+function recoverySummary(result) {
+  const recovered = result?.recoveredTransactionCount ?? 0;
+  const failed = result?.failedTransactionCount ?? 0;
+  if (failed > 0) {
+    const first = result?.failedTransactions?.[0];
+    const detail = first ? `: ${shortId(first.transactionId)} ${first.error}` : "";
+    return `復旧に失敗した transaction があります（成功 ${recovered} / 失敗 ${failed}）${detail}`;
+  }
+  return `復旧しました（${recovered} 件）。`;
+}
+
+function ensureRecoverySucceeded(result) {
+  if ((result?.failedTransactionCount ?? 0) > 0) {
+    throw new Error(recoverySummary(result));
+  }
 }
 
 function renderProjectWarnings(warnings) {
@@ -1231,9 +1286,16 @@ function bindEvents() {
   });
   $("recoverTransactionsButton").addEventListener("click", async () => {
     await run("復旧中", async () => {
-      await invokeCommand("recover_transactions", { projectPath: getProjectPath() });
+      const result = await invokeCommand("recover_transactions", { projectPath: getProjectPath() });
+      if ((result?.failedTransactionCount ?? 0) > 0) {
+        setBusyIndeterminate("再読み込み中");
+        await refreshProject();
+      }
+      ensureRecoverySucceeded(result);
+      setBusyIndeterminate("再読み込み中");
       await refreshProject();
       await refreshLatestDiff({ allowBusy: true });
+      setStatus(recoverySummary(result));
     });
   });
   $("cancelOperationButton").addEventListener("click", async () => {
