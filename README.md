@@ -1,6 +1,6 @@
-# CheckPo Local
+# CheckPo
 
-CheckPo Local は、Unity / VRChat 向けのローカル checkpoint / diff / restore / discard ツールです。Git の代替ではありません。branch、merge、conflict などの Git 概念をユーザーに見せず、Unity プロジェクト内の安全な範囲だけを保存・比較・巻き戻します。
+CheckPo は、Unity / VRChat 向けのローカル checkpoint / diff / restore / discard ツールです。Git の代替ではありません。branch、merge、conflict などの Git 概念をユーザーに見せず、Unity プロジェクト内の安全な範囲だけを保存・比較・巻き戻します。
 
 ## 安全境界
 
