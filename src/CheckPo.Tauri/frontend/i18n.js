@@ -89,6 +89,7 @@ const messages = {
     updateInstalling: "更新をダウンロードして適用中",
     updateInstalled: "更新を適用しました。アプリを再起動します。",
     updateNotAvailable: "利用できる更新はありません。",
+    updateCheckFailed: "更新を確認できませんでした: {error}",
     operationNotCancellable: "この処理は中止できません。",
     waitingForAutoRefresh: "自動更新の完了待ち",
     anotherOperationInProgress: "別の処理中です。完了してからもう一度実行してください。",

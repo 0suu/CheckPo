@@ -291,8 +291,26 @@ function renderUpdateBanner() {
   });
 }
 
+function updateCheckFailedText(error) {
+  return tf("updateCheckFailed", { error: errorText(error) || "unknown" });
+}
+
+function showUpdateCheckError(error) {
+  const message = updateCheckFailedText(error);
+  if ($("updateSettingsStatus")) {
+    $("updateSettingsStatus").textContent = message;
+  }
+  setStatus(message);
+  setResult({ error: message });
+}
+
 async function checkForUpdate(options = {}) {
-  if (!tauriInvoke) return null;
+  if (!tauriInvoke) {
+    const error = new Error("Tauri invoke API is not available.");
+    if (!options.silent) showUpdateCheckError(error);
+    if (options.rethrow) throw error;
+    return null;
+  }
   try {
     if ($("updateSettingsStatus") && !options.silent) {
       $("updateSettingsStatus").textContent = t("updateChecking");
@@ -310,14 +328,20 @@ async function checkForUpdate(options = {}) {
     state.availableUpdate = null;
     renderUpdateBanner();
     updateControls();
-    if (!options.silent) showError(error);
+    if (!options.silent) showUpdateCheckError(error);
+    if (options.rethrow) throw error;
     return null;
   }
 }
 
 async function installAvailableUpdate() {
   await run("更新中", async () => {
-    const update = await checkForUpdate();
+    let update;
+    try {
+      update = await checkForUpdate({ rethrow: true });
+    } catch (_) {
+      return;
+    }
     if (!update) {
       setStatus(t("updateNotAvailable"));
       return;
