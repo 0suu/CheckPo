@@ -200,6 +200,7 @@ pub struct DiffResult {
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
     pub unchanged_count: usize,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

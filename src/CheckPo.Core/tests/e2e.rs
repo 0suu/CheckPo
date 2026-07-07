@@ -737,7 +737,7 @@ fn same_size_same_mtime_change_is_not_hidden_by_fingerprint_cache() {
 }
 
 #[test]
-fn fast_diff_detects_same_size_same_mtime_change() {
+fn metadata_diff_can_miss_same_size_same_mtime_change() {
     let (_guard, _temp, project, _data) = setup();
     let file = project.join("Assets/Avatar/Foo.prefab");
     fs::write(&file, "one").unwrap();
@@ -747,11 +747,12 @@ fn fast_diff_detects_same_size_same_mtime_change() {
     fs::write(&file, "two").unwrap();
     filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(original_mtime)).unwrap();
 
-    let diff = core::diff_checkpoint(&project, checkpoint.checkpoint_id.as_str()).unwrap();
+    let diff = core::diff_checkpoint_metadata(&project, checkpoint.checkpoint_id.as_str()).unwrap();
 
-    assert!(diff
+    assert!(!diff
         .modified
         .contains(&"Assets/Avatar/Foo.prefab".to_string()));
+    assert_eq!(diff.unchanged_count, 2);
 }
 
 #[test]
@@ -770,6 +771,49 @@ fn full_diff_detects_same_size_same_mtime_change_with_fingerprint_cache() {
     assert!(diff
         .modified
         .contains(&"Assets/Avatar/Foo.prefab".to_string()));
+}
+
+#[test]
+fn metadata_diff_detects_added_deleted_and_metadata_changed_files() {
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    let deleted_file = project.join("Packages/locked.json");
+    fs::write(&file, "one").unwrap();
+    fs::write(&deleted_file, "{}").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "one", Default::default()).unwrap();
+
+    fs::write(project.join("Assets/Avatar/Added.prefab"), "added").unwrap();
+    fs::write(&file, "changed size").unwrap();
+    fs::remove_file(&deleted_file).unwrap();
+
+    let diff = core::diff_checkpoint_metadata(&project, checkpoint.checkpoint_id.as_str()).unwrap();
+
+    assert!(diff
+        .added
+        .contains(&"Assets/Avatar/Added.prefab".to_string()));
+    assert!(diff
+        .modified
+        .contains(&"Assets/Avatar/Foo.prefab".to_string()));
+    assert!(diff.deleted.contains(&"Packages/locked.json".to_string()));
+    assert!(diff.warnings.is_empty());
+}
+
+#[test]
+fn metadata_diff_warns_when_tracked_root_is_not_directory() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    fs::remove_dir(project.join("Packages")).unwrap();
+    fs::write(project.join("Packages"), "not a directory").unwrap();
+
+    let diff = core::diff_checkpoint_metadata(&project, checkpoint.checkpoint_id.as_str()).unwrap();
+
+    assert!(diff
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("Packages: tracked root is not a directory")));
 }
 
 #[test]

@@ -148,7 +148,7 @@ async function invokeCommand(command, args = {}, options = {}) {
           && errorKind(error) === "operationBusy";
         if (!canRetryBusy) throw error;
         if (state.autoRefreshInFlight && !options.fromAutoRefresh) {
-          setStatus("自動更新の完了を待っています。");
+          setStatus(t("waitingForAutoRefresh"));
           await waitForAutoRefreshToFinish();
           continue;
         }
@@ -295,6 +295,12 @@ function updateCheckFailedText(error) {
   return tf("updateCheckFailed", { error: errorText(error) || "unknown" });
 }
 
+function updateAutoRefreshStatus() {
+  const indicator = $("autoRefreshStatus");
+  if (!indicator) return;
+  indicator.hidden = !state.autoRefreshInFlight;
+}
+
 function showUpdateCheckError(error) {
   const message = updateCheckFailedText(error);
   if ($("updateSettingsStatus")) {
@@ -393,6 +399,7 @@ async function refreshLatestDiff(options = {}) {
   const backgroundRefresh = !options.allowBusy;
   const startedUserOperationSerial = state.userOperationSerial;
   state.autoRefreshInFlight = true;
+  updateAutoRefreshStatus();
   try {
     if (options.refreshProject) {
       await refreshProject({ fromAutoRefresh: true });
@@ -411,8 +418,9 @@ async function refreshLatestDiff(options = {}) {
     if (!backgroundRefresh) {
       $("diffSummary").textContent = t("diffLoading");
     }
+    const diffCommand = options.metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint";
     const diff = await invokeCommand(
-      "diff_checkpoint",
+      diffCommand,
       {
         projectPath: getProjectPath(),
         checkpointId,
@@ -423,10 +431,14 @@ async function refreshLatestDiff(options = {}) {
       return;
     }
     renderDiff(diff);
+    if (Array.isArray(diff?.warnings) && diff.warnings.length) {
+      setStatus(`高速確認で一部確認できませんでした:\n${diff.warnings.join("\n")}`);
+    }
   } catch (error) {
     if (!options.silent) setStatus(errorText(error));
   } finally {
     state.autoRefreshInFlight = false;
+    updateAutoRefreshStatus();
   }
 }
 
@@ -435,7 +447,7 @@ function scheduleFocusRefresh() {
   const now = Date.now();
   if (now - state.lastAutoRefreshAt < 750) return;
   state.lastAutoRefreshAt = now;
-  refreshLatestDiff({ refreshProject: true, silent: true });
+  refreshLatestDiff({ silent: true, metadataOnly: true });
 }
 
 function queueFocusRefresh() {
@@ -904,7 +916,7 @@ function renderProjectHistory() {
       $("projectSelectionOverlay").hidden = true;
       await run("読み込み中", async () => {
         renderSnapshot(await invokeCommand("load_project", { projectPath: project.path }));
-        await refreshLatestDiff({ allowBusy: true });
+        await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
       });
     });
     list.append(button);
@@ -1392,7 +1404,7 @@ function bindEvents() {
           });
           renderStartedProject(snapshot, "プロジェクトを開始しました。");
         }
-        await refreshLatestDiff({ allowBusy: true });
+        await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
         $("projectRegistrationOverlay").hidden = true;
       }, { rethrow: true, suppressError: true });
     } catch (error) {

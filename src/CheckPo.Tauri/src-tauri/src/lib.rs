@@ -275,6 +275,20 @@ async fn diff_checkpoint(
 }
 
 #[tauri::command]
+async fn diff_checkpoint_metadata(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    checkpoint_id: String,
+) -> AppResult {
+    run_guarded_blocking(state, None, move || {
+        core::diff_checkpoint_metadata(&project_path, &checkpoint_id)
+            .map(|result| json!(result))
+            .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn diff_checkpoint_full(
     app: AppHandle,
     state: tauri::State<'_, OperationState>,
@@ -588,6 +602,7 @@ pub fn run() {
             rename_checkpoint,
             open_project_in_file_manager,
             diff_checkpoint,
+            diff_checkpoint_metadata,
             diff_checkpoint_full,
             preview_restore,
             apply_restore,
@@ -879,6 +894,30 @@ mod tests {
         assert_eq!(cancelled.message, "operation cancelled");
         assert_eq!(invalid.kind, "invalidProject");
         assert_eq!(invalid.message, "invalid Unity project: missing marker");
+    }
+
+    #[test]
+    fn frontend_diff_routes_keep_fast_diff_to_open_and_focus_only() {
+        let app_js = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/app.js"),
+        )
+        .unwrap();
+
+        assert!(app_js.contains(
+            r#"const diffCommand = options.metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint";"#
+        ));
+        assert!(app_js.contains(r#"refreshLatestDiff({ silent: true, metadataOnly: true });"#));
+        assert!(!app_js.contains(
+            r#"refreshLatestDiff({ refreshProject: true, silent: true, metadataOnly: true });"#
+        ));
+        assert_eq!(
+            app_js
+                .matches(r#"refreshLatestDiff({ allowBusy: true, metadataOnly: true });"#)
+                .count(),
+            2
+        );
+        assert!(app_js.contains(r#"invokeCommand("diff_checkpoint_full""#));
+        assert!(app_js.contains(r#"await refreshLatestDiff({ allowBusy: true });"#));
     }
 }
 

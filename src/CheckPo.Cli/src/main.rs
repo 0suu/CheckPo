@@ -507,6 +507,9 @@ fn print_diff(result: &core::DiffResult) {
     println!("Modified: {}", result.modified.len());
     println!("Deleted: {}", result.deleted.len());
     println!("Unchanged: {}", result.unchanged_count);
+    for warning in &result.warnings {
+        println!("Warning: {warning}");
+    }
 }
 
 fn print_plan(plan: &core::OperationPlan) {
