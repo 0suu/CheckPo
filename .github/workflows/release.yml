@@ -49,7 +49,7 @@ jobs:
           - name: Windows
             platform: windows-latest
             rust-target: x86_64-pc-windows-msvc
-            args: --no-sign --bundles nsis
+            args: --bundles nsis
 
     steps:
       - name: Checkout
