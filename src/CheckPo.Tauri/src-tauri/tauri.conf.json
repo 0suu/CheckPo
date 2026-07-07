@@ -24,7 +24,10 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
-    "icon": [],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
     "macOS": {
       "signingIdentity": "-",
       "hardenedRuntime": false
