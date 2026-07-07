@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 
 type ProgressFn = Box<dyn Fn(core::OperationProgress) + Send + Sync>;
 type AppResult = Result<Value, AppError>;
@@ -608,8 +608,21 @@ pub fn run() {
         .expect("failed to run CheckPo Tauri app");
 }
 
-fn to_update_error(error: tauri_plugin_updater::Error) -> AppError {
-    AppError::new("updater", error.to_string())
+fn to_update_error(error: UpdaterError) -> AppError {
+    match error {
+        UpdaterError::TargetNotFound(target) => AppError::new(
+            "updateTargetNotFound",
+            format!("このOS/CPU向けの更新ファイルが latest.json にありません。target: {target}"),
+        ),
+        UpdaterError::TargetsNotFound(targets) => AppError::new(
+            "updateTargetNotFound",
+            format!(
+                "このOS/CPU向けの更新ファイルが latest.json にありません。候補: {}",
+                targets.join(", ")
+            ),
+        ),
+        error => AppError::new("updater", error.to_string()),
+    }
 }
 
 fn open_folder_in_file_manager(path: &std::path::Path) -> Result<(), AppError> {
