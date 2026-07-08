@@ -520,6 +520,34 @@ async fn cleanup_journals(
 }
 
 #[tauri::command]
+async fn analyze_orphan_temp_files(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+) -> AppResult {
+    run_guarded_blocking(state, None, move || {
+        core::analyze_orphan_temp_files(&project_path)
+            .map(|result| json!(result))
+            .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn cleanup_orphan_temp_files(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    confirmed: bool,
+) -> AppResult {
+    require_confirmation(confirmed, "temporary file cleanup requires confirmation.")?;
+    run_guarded_blocking(state, None, move || {
+        core::cleanup_orphan_temp_files(&project_path, core::ApplyOptions { yes: true })
+            .map(|result| json!(result))
+            .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
 fn cancel_current_operation(state: tauri::State<'_, OperationState>) -> AppResult {
     let token = state
         .current
@@ -615,6 +643,8 @@ pub fn run() {
             list_transactions,
             recover_transactions,
             cleanup_journals,
+            analyze_orphan_temp_files,
+            cleanup_orphan_temp_files,
             cancel_current_operation,
             check_for_update,
             install_update

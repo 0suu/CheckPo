@@ -12,7 +12,7 @@ Packages/**
 ProjectSettings/**
 ```
 
-`Assets`、`Packages`、`ProjectSettings` というディレクトリ自体は操作対象ではありません。`README.md`、`.git/`、`Library/`、`Temp/`、`Logs/`、`UserSettings/`、`.checkpo/`、絶対パス、`..` を含むパス、backslash を含むパスは拒否します。symlink は checkpoint 作成時に追跡せず、restore / discard では通常ファイルとして辿りません。
+`Assets`、`Packages`、`ProjectSettings` というディレクトリ自体は操作対象ではありません。`README.md`、`.git/`、`Library/`、`Temp/`、`Logs/`、`UserSettings/`、`.checkpo/`、絶対パス、`..` を含むパス、backslash を含むパス、Windows 予約名、末尾が dot/space のパスは拒否します。symlink は checkpoint 作成時に追跡せず、restore / discard では通常ファイルとして辿りません。
 
 Core の破壊的操作は `TrackedUnityFilePath` だけを受け取り、CLI/Tauri から来た文字列は境界で即 validation します。UI の disabled 状態には安全性を依存しません。
 
@@ -68,6 +68,7 @@ checkpo status <project-path> [--json]
 checkpo checkpoint create <project-path> --name <name> [--init-if-needed] [--json]
 checkpo checkpoint list <project-path> [--json]
 checkpo checkpoint delete <project-path> <checkpoint-id> --yes [--json]
+checkpo checkpoint rename <project-path> <checkpoint-id> --name <name> [--json]
 
 checkpo diff <project-path> --checkpoint <checkpoint-id> [--json]
 
@@ -85,6 +86,8 @@ checkpo storage set-root <project-path> --storage-root <path> --yes [--json]
 checkpo transactions list <project-path> [--json]
 checkpo transactions recover <project-path> [--json]
 checkpo maintenance cleanup-journals <project-path> [--json]
+checkpo maintenance temp-files analyze <project-path> [--json]
+checkpo maintenance temp-files cleanup <project-path> --yes [--json]
 ```
 
 unknown option は `clap` で error になります。旧クラウド出力、別フォルダ復元、旧巻き戻し互換 command はありません。

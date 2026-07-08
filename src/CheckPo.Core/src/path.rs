@@ -51,6 +51,18 @@ impl TrackedUnityFilePath {
             if *segment == "." || *segment == ".." {
                 return Err(invalid_path(input, "dot segments are not allowed"));
             }
+            if segment.ends_with(' ') || segment.ends_with('.') {
+                return Err(invalid_path(
+                    input,
+                    "segments ending with space or dot are not allowed",
+                ));
+            }
+            if is_windows_reserved_name(segment) {
+                return Err(invalid_path(
+                    input,
+                    "Windows reserved file names are not allowed",
+                ));
+            }
         }
         Ok(Self(value.to_string()))
     }
@@ -252,6 +264,82 @@ pub fn relative_path_from_project(project_root: &Path, full_path: &Path) -> Resu
     Ok(parts.join("/"))
 }
 
+pub(crate) fn is_checkpo_temporary_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if is_checkpo_owned_temporary_file_name(name) {
+        return true;
+    }
+    if !name.starts_with('.') || !name.ends_with(".tmp") {
+        return false;
+    }
+    let body = &name[1..name.len() - ".tmp".len()];
+    let Some((_, suffix)) = body.rsplit_once('.') else {
+        return false;
+    };
+    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn is_checkpo_owned_temporary_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_checkpo_owned_temporary_file_name)
+}
+
+fn is_checkpo_owned_temporary_file_name(name: &str) -> bool {
+    name.starts_with(".checkpo-") && name.ends_with(".tmp")
+}
+
 fn invalid_path(input: &str, reason: &str) -> CheckPoError {
     CheckPoError::InvalidTrackedPath(format!("{input}: {reason}"))
+}
+
+fn is_windows_reserved_name(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or(segment);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .and_then(single_reserved_digit)
+            .is_some()
+        || upper
+            .strip_prefix("LPT")
+            .and_then(single_reserved_digit)
+            .is_some()
+}
+
+fn single_reserved_digit(value: &str) -> Option<()> {
+    (value.len() == 1 && value.as_bytes()[0].is_ascii_digit() && value != "0").then_some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrackedUnityFilePath;
+
+    #[test]
+    fn tracked_path_rejects_windows_reserved_names() {
+        for path in [
+            "Assets/CON",
+            "Assets/con.txt",
+            "Assets/Aux.asset",
+            "Assets/COM1.prefab",
+            "Assets/LPT9.meta",
+            "ProjectSettings/NUL",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_segments_ending_with_dot_or_space() {
+        for path in [
+            "Assets/Foo.",
+            "Assets/Foo ",
+            "Assets/Folder./File.asset",
+            "Assets/Folder /File.asset",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
+        }
+    }
 }

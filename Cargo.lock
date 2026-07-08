@@ -612,7 +612,6 @@ dependencies = [
  "chrono",
  "dirs",
  "filetime",
- "hex",
  "libc",
  "rayon",
  "rusqlite",

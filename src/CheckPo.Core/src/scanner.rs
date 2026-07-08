@@ -1,7 +1,7 @@
 use crate::{
-    canonical_utc, hash_file, relative_path_from_project, report_operation_progress,
-    CancellationToken, CheckPoError, OperationProgress, Result, ScanWarning, ScannedFile,
-    TrackedUnityFilePath,
+    canonical_utc, hash_file, is_checkpo_temporary_file, relative_path_from_project,
+    report_operation_progress, CancellationToken, CheckPoError, OperationProgress, Result,
+    ScanWarning, ScannedFile, TrackedUnityFilePath,
 };
 use rayon::prelude::*;
 use std::fs;
@@ -17,6 +17,13 @@ struct PendingScannedFile {
     modified_at_utc: String,
     hash: Option<crate::ObjectId>,
     fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScannedMetadataFile {
+    pub(crate) path: TrackedUnityFilePath,
+    pub(crate) size_bytes: u64,
+    pub(crate) modified_at_utc: String,
 }
 
 pub fn scan_project_for_checkpoint(
@@ -37,12 +44,126 @@ pub fn scan_project_for_checkpoint(
     )
 }
 
+pub(crate) fn scan_project_metadata(
+    project_root: &Path,
+) -> Result<(Vec<ScannedMetadataFile>, Vec<ScanWarning>)> {
+    let (files, warnings) = collect_project_files(project_root, None)?;
+    Ok((
+        files
+            .into_iter()
+            .map(|file| ScannedMetadataFile {
+                path: file.path,
+                size_bytes: file.size_bytes,
+                modified_at_utc: file.modified_at_utc,
+            })
+            .collect(),
+        warnings,
+    ))
+}
+
+pub(crate) fn format_scan_warning(warning: &ScanWarning) -> String {
+    format!("{}: {}", warning.relative_path, warning.reason)
+}
+
 fn scan_project_internal(
     project_root: &Path,
     cached: Option<&std::collections::BTreeMap<TrackedUnityFilePath, crate::CachedFileFingerprint>>,
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>)> {
+    let (mut files, mut warnings) = collect_project_files(project_root, cancellation)?;
+    for file in &mut files {
+        let metadata = match fs::metadata(&file.full_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warnings.push(ScanWarning {
+                    relative_path: file.path.to_string(),
+                    reason: format!("file metadata could not be read: {error}"),
+                });
+                continue;
+            }
+        };
+        match file_fingerprint(&file.full_path, &metadata) {
+            Ok(fingerprint) => file.fingerprint = fingerprint,
+            Err(error) => warnings.push(ScanWarning {
+                relative_path: file.path.to_string(),
+                reason: format!("file fingerprint could not be read: {error}"),
+            }),
+        }
+        file.hash = cached
+            .and_then(|records| records.get(&file.path))
+            .filter(|record| {
+                Some(record.fingerprint.as_str()) == file.fingerprint.as_deref()
+                    && record.size_bytes == file.size_bytes
+            })
+            .map(|record| record.object_id.clone());
+    }
+    let total = files.len();
+    let mut completed = 0_usize;
+    for chunk in files.chunks_mut(PARALLEL_HASH_CHUNK_SIZE) {
+        crate::ensure_not_cancelled(cancellation)?;
+        let chunk_warnings = chunk
+            .par_iter_mut()
+            .map(|file| -> Result<Option<ScanWarning>> {
+                crate::ensure_not_cancelled(cancellation)?;
+                if file.hash.is_some() {
+                    return Ok(None);
+                }
+                match hash_file(&file.full_path) {
+                    Ok(hash) => {
+                        file.hash = Some(hash);
+                        Ok(None)
+                    }
+                    Err(error) => Ok(Some(ScanWarning {
+                        relative_path: file.path.to_string(),
+                        reason: format!("file content could not be read: {error}"),
+                    })),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        warnings.extend(chunk_warnings.into_iter().flatten());
+        completed += chunk.len();
+        report_operation_progress(
+            progress,
+            "scan",
+            completed,
+            total,
+            chunk.last().map(|file| file.path.to_string()),
+        );
+    }
+    files.retain(|file| file.hash.is_some());
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    if files
+        .iter()
+        .any(|file| !file.full_path.starts_with(project_root))
+    {
+        return Err(CheckPoError::OutsideTrackedScope(
+            project_root.display().to_string(),
+        ));
+    }
+    let files = files
+        .into_iter()
+        .map(|file| {
+            let hash = file.hash.ok_or_else(|| {
+                CheckPoError::Unexpected(format!("scan hash missing for {}", file.path))
+            })?;
+            Ok(ScannedFile {
+                path: file.path,
+                full_path: file.full_path,
+                size_bytes: file.size_bytes,
+                modified_at_utc: file.modified_at_utc,
+                hash,
+                fingerprint: file.fingerprint,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((files, warnings))
+}
+
+fn collect_project_files(
+    project_root: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<PendingScannedFile>, Vec<ScanWarning>)> {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
     for root in ["Assets", "Packages", "ProjectSettings"] {
@@ -134,48 +255,25 @@ fn scan_project_internal(
             if !metadata.is_file() {
                 continue;
             }
-            let modified = metadata
-                .modified()
-                .map_err(|error| crate::io_error(&full_path, error))?;
-            let fingerprint = file_fingerprint(&full_path, &metadata)?;
-            let hash = cached
-                .and_then(|records| records.get(&path))
-                .filter(|record| {
-                    Some(record.fingerprint.as_str()) == fingerprint.as_deref()
-                        && record.size_bytes == metadata.len()
-                })
-                .map(|record| record.object_id.clone())
-                .map(Some)
-                .unwrap_or(None);
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(error) => {
+                    warnings.push(ScanWarning {
+                        relative_path: path.to_string(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             files.push(PendingScannedFile {
                 path,
                 full_path,
                 size_bytes: metadata.len(),
                 modified_at_utc: canonical_utc(modified),
-                hash,
-                fingerprint,
+                hash: None,
+                fingerprint: None,
             });
         }
-    }
-    let total = files.len();
-    let mut completed = 0_usize;
-    for chunk in files.chunks_mut(PARALLEL_HASH_CHUNK_SIZE) {
-        crate::ensure_not_cancelled(cancellation)?;
-        chunk.par_iter_mut().try_for_each(|file| -> Result<()> {
-            crate::ensure_not_cancelled(cancellation)?;
-            if file.hash.is_none() {
-                file.hash = Some(hash_file(&file.full_path)?);
-            }
-            Ok(())
-        })?;
-        completed += chunk.len();
-        report_operation_progress(
-            progress,
-            "scan",
-            completed,
-            total,
-            chunk.last().map(|file| file.path.to_string()),
-        );
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     if files
@@ -186,40 +284,7 @@ fn scan_project_internal(
             project_root.display().to_string(),
         ));
     }
-    let files = files
-        .into_iter()
-        .map(|file| {
-            let hash = file.hash.ok_or_else(|| {
-                CheckPoError::Unexpected(format!("scan hash missing for {}", file.path))
-            })?;
-            Ok(ScannedFile {
-                path: file.path,
-                full_path: file.full_path,
-                size_bytes: file.size_bytes,
-                modified_at_utc: file.modified_at_utc,
-                hash,
-                fingerprint: file.fingerprint,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
     Ok((files, warnings))
-}
-
-fn is_checkpo_temporary_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    if name.starts_with(".checkpo-") && name.ends_with(".tmp") {
-        return true;
-    }
-    if !name.starts_with('.') || !name.ends_with(".tmp") {
-        return false;
-    }
-    let body = &name[1..name.len() - ".tmp".len()];
-    let Some((_, suffix)) = body.rsplit_once('.') else {
-        return false;
-    };
-    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(unix)]

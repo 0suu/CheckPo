@@ -25,9 +25,16 @@ pub fn build_plan_with_progress_and_cancellation(
         .map(|file| (file.path.clone(), file))
         .collect::<BTreeMap<_, _>>();
     let mut operations = Vec::new();
+    let mut warnings = Vec::new();
     match kind {
         OperationPlanKind::Restore => {
-            let (working, _) = crate::scan_project_for_checkpoint(project, progress, cancellation)?;
+            let (working, scan_warnings) =
+                crate::scan_project_for_checkpoint(project, progress, cancellation)?;
+            warnings.extend(
+                scan_warnings
+                    .iter()
+                    .map(crate::scanner::format_scan_warning),
+            );
             let working_map = working
                 .into_iter()
                 .map(|file| {
@@ -169,7 +176,8 @@ pub fn build_plan_with_progress_and_cancellation(
                 .collect()
         }),
         operations,
-    ))
+    )
+    .with_warnings(warnings))
 }
 
 pub(super) fn validate_expected_plan(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {
@@ -180,6 +188,12 @@ pub(super) fn validate_expected_plan(project: &ProjectContext, plan: &OperationP
         plan.kind,
         plan.selected_paths.as_deref(),
     )?;
+    if !current.warnings.is_empty() {
+        return Err(crate::user_error(format!(
+            "operation cannot be applied while scan warnings exist: {}",
+            current.warnings.join("; ")
+        )));
+    }
     if &current != plan {
         return Err(CheckPoError::WorkingTreeChanged(
             "operation plan changed after preview".to_string(),
@@ -189,6 +203,11 @@ pub(super) fn validate_expected_plan(project: &ProjectContext, plan: &OperationP
 }
 
 fn validate_plan_shape(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {
+    if !plan.warnings.is_empty() {
+        return Err(CheckPoError::Corruption(
+            "operation plan contains scan warnings and cannot be applied".to_string(),
+        ));
+    }
     let mut sorted = plan.operations.clone();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
     if sorted != plan.operations {

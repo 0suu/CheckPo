@@ -61,7 +61,6 @@ fn assert_copied_project_error(error: &core::CheckPoError) {
 fn tracked_unity_file_path_validation() {
     for path in [
         "Assets/Foo.prefab",
-        "Assets/Foo.prefab ",
         "Assets/ Avatar/Foo.prefab",
         "Assets/Foo.prefab.meta",
         "Packages/manifest.json",
@@ -87,6 +86,10 @@ fn tracked_unity_file_path_validation() {
         "Assets\\Foo.prefab",
         "Assets//Foo.prefab",
         "Assets/./Foo.prefab",
+        "Assets/Foo.prefab ",
+        "Assets/Foo.prefab.",
+        "Assets/CON.txt",
+        "Assets/LPT1.asset",
         ".checkpo/project.json",
     ] {
         assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
@@ -712,6 +715,78 @@ fn checkpoint_scan_skips_checkpo_temporary_files() {
         .any(|warning| warning.contains(".Foo.prefab.")));
     assert!(diff.added.is_empty());
     assert_eq!(diff.unchanged_count, 2);
+}
+
+#[test]
+fn full_diff_and_restore_plan_report_scan_warnings_for_temporary_files() {
+    let (_guard, _temp, project, _data) = setup();
+    init_project_for_test(&project).unwrap();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    fs::write(
+        project.join("Assets/Avatar/.checkpo-Foo.prefab-1234567890abcdef1234567890abcdef.tmp"),
+        "temp",
+    )
+    .unwrap();
+
+    let diff = core::diff_checkpoint(&project, checkpoint.checkpoint_id.as_str()).unwrap();
+    let plan = core::preview_restore(&project, checkpoint.checkpoint_id.as_str()).unwrap();
+
+    assert!(diff
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("temporary CheckPo file was skipped")));
+    assert!(plan
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("temporary CheckPo file was skipped")));
+    let error = core::apply_restore_plan(
+        &project,
+        checkpoint.checkpoint_id.as_str(),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("scan warnings"));
+}
+
+#[test]
+fn orphan_checkpo_temporary_files_can_be_cleaned_up_explicitly() {
+    let (_guard, _temp, project, _data) = setup();
+    init_project_for_test(&project).unwrap();
+    let temp_file =
+        project.join("Assets/Avatar/.checkpo-Foo.prefab-1234567890abcdef1234567890abcdef.tmp");
+    fs::write(&temp_file, "temp").unwrap();
+
+    let plan = core::analyze_orphan_temp_files(&project).unwrap();
+    assert_eq!(plan.file_count, 1);
+    assert_eq!(plan.total_bytes, 4);
+
+    let result =
+        core::cleanup_orphan_temp_files(&project, core::ApplyOptions { yes: true }).unwrap();
+
+    assert_eq!(result.deleted_file_count, 1);
+    assert_eq!(result.deleted_bytes, 4);
+    assert!(!temp_file.exists());
+}
+
+#[test]
+fn temporary_cleanup_only_deletes_checkpo_owned_temporary_files() {
+    let (_guard, _temp, project, _data) = setup();
+    init_project_for_test(&project).unwrap();
+    let external_temp =
+        project.join("Assets/Avatar/.Foo.prefab.1234567890abcdef1234567890abcdef.tmp");
+    fs::write(&external_temp, "temp").unwrap();
+
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let plan = core::analyze_orphan_temp_files(&project).unwrap();
+
+    assert!(checkpoint
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("temporary CheckPo file was skipped")));
+    assert_eq!(plan.file_count, 0);
+    assert!(external_temp.exists());
 }
 
 #[test]

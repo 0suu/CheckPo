@@ -10,7 +10,6 @@ chrono = { version = "0.4", features = ["serde"] }
 blake3 = "1"
 dirs = "6"
 filetime = "0.2"
-hex = "0.4"
 libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rayon = "1"

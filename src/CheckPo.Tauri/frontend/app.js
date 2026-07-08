@@ -39,6 +39,7 @@ const state = {
   renamingCheckpointId: null,
   storage: null,
   gcPlan: null,
+  tempCleanupPlan: null,
   rollbackPlan: null,
   confirming: false,
   currentDiff: null,
@@ -234,7 +235,7 @@ function errorKind(error) {
 
 function displayError(error) {
   const raw = errorText(error);
-  return { kind: errorKind(error), title: "操作を完了できませんでした", message: raw };
+  return { kind: errorKind(error), message: raw };
 }
 
 function showError(error) {
@@ -461,6 +462,7 @@ function renderSnapshot(snapshot) {
   state.checkpoints = sortCheckpoints(snapshot.checkpoints || []);
   state.storage = snapshot.storage || null;
   state.gcPlan = null;
+  state.tempCleanupPlan = null;
   if (!state.checkpoints.some((checkpoint) => checkpoint.checkpointId === state.selectedCheckpointId)) {
     state.selectedCheckpointId = state.checkpoints[0]?.checkpointId || null;
   }
@@ -939,6 +941,11 @@ function wantsInitialCheckpoint(name) {
   return document.querySelector(`input[name="${name}"]:checked`)?.value !== "no";
 }
 
+function checkpointWarningsText(warnings) {
+  if (!warnings?.length) return "";
+  return `警告 ${warnings.length} 件: ${warnings.join(" / ")}`;
+}
+
 function renderStartedProject(snapshot, successMessage) {
   renderSnapshot(snapshot);
   const initialCheckpointId =
@@ -948,7 +955,16 @@ function renderStartedProject(snapshot, successMessage) {
     renderCheckpoints();
     renderProjectLabels();
     updateControls();
-    setStatus("初回チェックポイントを作成しました。");
+    const warningText = checkpointWarningsText(snapshot.initialCheckpoint?.warnings);
+    if (warningText) {
+      setStatus(`初回チェックポイントを作成しましたが、保存されなかったファイルがあります。${warningText}`);
+      setResult({
+        warning: "初回チェックポイントを作成しましたが、保存されなかったファイルがあります。",
+        details: snapshot.initialCheckpoint.warnings,
+      });
+    } else {
+      setStatus("初回チェックポイントを作成しました。");
+    }
   } else if (snapshot.initialCheckpointError) {
     setStatus(`プロジェクトは開始しましたが、初回チェックポイント作成に失敗しました: ${snapshot.initialCheckpointError}`);
   } else if (snapshot.initialCheckpointCancelled) {
@@ -974,6 +990,12 @@ function renderRollbackPlan(plan) {
   $("rollbackSummary").textContent =
     `復元 ${plan.restoreCount ?? 0} / 置換 ${plan.replaceCount ?? 0} / 削除 ${plan.deleteCount ?? 0} / 一時容量 約${formatBytes(plan.estimatedTemporaryBytes ?? 0)} / 対象 ${operations.length} 件`;
   $("rollbackWarnings").replaceChildren();
+  for (const warning of plan.warnings || []) {
+    const item = document.createElement("p");
+    item.className = "empty-list";
+    item.textContent = `警告: ${warning}`;
+    $("rollbackWarnings").append(item);
+  }
   const list = $("rollbackOperations");
   list.replaceChildren();
   if (!operations.length) {
@@ -1043,7 +1065,12 @@ function updateControls() {
       return;
     }
     if (button.id === "applyRollbackButton") {
-      button.disabled = controlsBlocked || destructiveBlocked || !state.rollbackPlan || !$("rollbackConfirm").checked || !state.rollbackPlan.hasChanges;
+      button.disabled = controlsBlocked
+        || destructiveBlocked
+        || !state.rollbackPlan
+        || Boolean(state.rollbackPlan.warnings?.length)
+        || !$("rollbackConfirm").checked
+        || !state.rollbackPlan.hasChanges;
       return;
     }
     if (button.id === "applyGcButton") {
@@ -1072,6 +1099,10 @@ function updateControls() {
     }
     if (["recoverTransactionsButton", "applyCleanupButton"].includes(button.id)) {
       button.disabled = controlsBlocked || destructiveBlocked || !hasProject;
+      return;
+    }
+    if (button.id === "applyTempCleanupButton") {
+      button.disabled = controlsBlocked || destructiveBlocked || !hasProject || !state.tempCleanupPlan || !state.tempCleanupPlan.fileCount;
       return;
     }
     if (button.dataset.destructive === "true") {
@@ -1145,7 +1176,6 @@ async function handleCopiedProjectRegistrationChoice(projectPath, storageRootPat
           storageRootPath,
           confirmed: true,
           createInitialCheckpoint: decision.createInitialCheckpoint,
-          initialCheckpointName: INITIAL_CHECKPOINT_NAME,
         });
         renderStartedProject(snapshot, "この場所を別プロジェクトとして開始しました。");
         await refreshLatestDiff({ allowBusy: true });
@@ -1400,7 +1430,6 @@ function bindEvents() {
             projectPath,
             storageRootPath,
             createInitialCheckpoint,
-            initialCheckpointName: INITIAL_CHECKPOINT_NAME,
           });
           renderStartedProject(snapshot, "プロジェクトを開始しました。");
         }
@@ -1466,7 +1495,6 @@ function bindEvents() {
         storageRootPath: state.defaultStorageRootPath || "",
         confirmed: true,
         createInitialCheckpoint,
-        initialCheckpointName: INITIAL_CHECKPOINT_NAME,
       });
       renderStartedProject(snapshot, "この場所を別プロジェクトとして開始しました。");
       await refreshLatestDiff({ allowBusy: true });
@@ -1486,7 +1514,16 @@ function bindEvents() {
       updateControls();
       await refreshProject();
       await refreshLatestDiff({ allowBusy: true });
-      setStatus("チェックポイントを作成しました。");
+      const warningText = checkpointWarningsText(created.warnings);
+      if (warningText) {
+        setStatus(`チェックポイントを作成しましたが、保存されなかったファイルがあります。${warningText}`);
+        setResult({
+          warning: "チェックポイントを作成しましたが、保存されなかったファイルがあります。",
+          details: created.warnings,
+        });
+      } else {
+        setStatus("チェックポイントを作成しました。");
+      }
     });
   });
   $("deleteCheckpointButton")?.addEventListener("click", async () => {
@@ -1546,6 +1583,49 @@ function bindEvents() {
     await run("片付け中", async () => {
       const result = await invokeCommand("cleanup_journals", { projectPath: getProjectPath() });
       $("cleanupResult").textContent = `削除 ${result.deletedDirectoryCount ?? 0} 件`;
+    });
+  });
+  $("previewTempCleanupButton").addEventListener("click", async () => {
+    await run("一時ファイルを確認中", async () => {
+      const plan = await invokeCommand("analyze_orphan_temp_files", { projectPath: getProjectPath() });
+      state.tempCleanupPlan = plan;
+      const warnings = plan.warnings?.length ? ` / 警告 ${plan.warnings.length} 件` : "";
+      $("tempCleanupSummary").textContent =
+        `一時ファイル ${plan.fileCount ?? 0} 件 / ${formatBytes(plan.totalBytes ?? 0)}${warnings}`;
+      $("tempCleanupResult").textContent = "削除前の確認が完了しました。";
+      updateControls();
+    });
+  });
+  $("applyTempCleanupButton").addEventListener("click", async () => {
+    if (!state.tempCleanupPlan) {
+      setStatus("先に一時ファイルを確認してください。");
+      return;
+    }
+    state.confirming = true;
+    updateControls();
+    let confirmed = false;
+    try {
+      confirmed = await confirmAction(
+        `${state.tempCleanupPlan.fileCount ?? 0} 件の CheckPo 一時ファイルを削除します。続行しますか？`,
+        "削除",
+      );
+    } finally {
+      state.confirming = false;
+      updateControls();
+    }
+    if (!confirmed) return;
+    await run("一時ファイルを削除中", async () => {
+      const result = await invokeCommand("cleanup_orphan_temp_files", {
+        projectPath: getProjectPath(),
+        confirmed: true,
+      });
+      state.tempCleanupPlan = null;
+      const warningCount = (result.plan?.warnings?.length ?? 0) + (result.warnings?.length ?? 0);
+      $("tempCleanupSummary").textContent =
+        `削除 ${result.deletedFileCount ?? 0} 件 / ${formatBytes(result.deletedBytes ?? 0)}`;
+      $("tempCleanupResult").textContent = warningCount ? `警告 ${warningCount} 件` : "一時ファイルを削除しました。";
+      await refreshLatestDiff({ allowBusy: true });
+      updateControls();
     });
   });
   $("recoverTransactionsButton").addEventListener("click", async () => {

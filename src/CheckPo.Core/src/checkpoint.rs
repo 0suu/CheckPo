@@ -86,8 +86,8 @@ pub fn create_checkpoint(
     let snapshot_id = save_snapshot(&project.repo_root, &snapshot)?;
     write_latest_snapshot_id(&project.repo_root, &snapshot_id)?;
     let mut warnings = scan_warnings
-        .into_iter()
-        .map(|warning| format!("{}: {}", warning.relative_path, warning.reason))
+        .iter()
+        .map(crate::scanner::format_scan_warning)
         .collect::<Vec<_>>();
     match crate::open_index_connection(&project) {
         Ok(index) => {

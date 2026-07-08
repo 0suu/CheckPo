@@ -34,6 +34,12 @@ pub(super) fn apply_plan_inner(
     crate::ensure_project_location_allows_mutation(project)?;
     let _lock = acquire_repository_lock(&project.repo_root, "transaction-apply")?;
     ensure_no_pending_transactions(project)?;
+    if !plan.warnings.is_empty() {
+        return Err(crate::user_error(format!(
+            "operation cannot be applied while scan warnings exist: {}",
+            plan.warnings.join("; ")
+        )));
+    }
     validate_expected_plan(project, &plan)?;
     if !plan.has_changes {
         return Ok(ApplyResult {

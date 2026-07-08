@@ -1,8 +1,9 @@
 use crate::{
     acquire_repository_lock, ensure_no_pending_transactions, io_error, list_snapshot_ids,
-    load_project, load_snapshot, object_path, sync_parent_dir, CheckPoError, InvalidObjectLocation,
-    MissingBlobReference, ObjectId, Result, SkippedSnapshot, StorageGcPlan, StorageGcResult,
-    StorageSummary, UnreferencedBlob,
+    load_project, load_snapshot, object_path, relative_path_from_project, sync_parent_dir,
+    CheckPoError, InvalidObjectLocation, MissingBlobReference, ObjectId, OrphanTempFile, Result,
+    SkippedSnapshot, StorageGcPlan, StorageGcResult, StorageSummary, TempFileCleanupPlan,
+    TempFileCleanupResult, TrackedUnityFilePath, UnreferencedBlob,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -54,6 +55,153 @@ pub fn apply_gc(project_path: impl AsRef<Path>) -> Result<StorageGcResult> {
         deleted_blob_count,
         deleted_bytes,
     })
+}
+
+pub fn analyze_orphan_temp_files(project_path: impl AsRef<Path>) -> Result<TempFileCleanupPlan> {
+    let project = load_project(project_path)?;
+    analyze_orphan_temp_files_for_project(&project)
+}
+
+pub fn cleanup_orphan_temp_files(
+    project_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
+) -> Result<TempFileCleanupResult> {
+    if !options.yes {
+        return Err(crate::user_error("temporary file cleanup requires --yes."));
+    }
+    let project = load_project(project_path)?;
+    crate::ensure_project_location_allows_mutation(&project)?;
+    let _lock = acquire_repository_lock(&project.repo_root, "temporary-file-cleanup")?;
+    ensure_no_pending_transactions(&project)?;
+    let plan = analyze_orphan_temp_files_for_project(&project)?;
+    let mut deleted_file_count = 0_usize;
+    let mut deleted_bytes = 0_u64;
+    let mut warnings = Vec::new();
+    for file in &plan.files {
+        ensure_project_parent_is_safe(&project, &file.path)?;
+        let path = file.path.to_project_path(project.project_root.as_path());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && crate::is_checkpo_owned_temporary_file(&path) =>
+            {
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        sync_parent_dir(&path)?;
+                        deleted_file_count += 1;
+                        deleted_bytes += metadata.len();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io_error(&path, error)),
+                }
+            }
+            Ok(_) => warnings.push(format!(
+                "{} was not deleted because it is no longer a CheckPo temporary file",
+                file.path
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&path, error)),
+        }
+    }
+    Ok(TempFileCleanupResult {
+        plan,
+        deleted_file_count,
+        deleted_bytes,
+        warnings,
+    })
+}
+
+fn analyze_orphan_temp_files_for_project(
+    project: &crate::ProjectContext,
+) -> Result<TempFileCleanupPlan> {
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    for root in ["Assets", "Packages", "ProjectSettings"] {
+        let root_path = project.project_root.as_path().join(root);
+        if !root_path.exists() {
+            continue;
+        }
+        if !root_path.is_dir() {
+            warnings.push(format!("{root}: tracked root is not a directory"));
+            continue;
+        }
+        for entry in WalkDir::new(&root_path).follow_links(false) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let path = error
+                        .path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| root.to_string());
+                    warnings.push(format!("{path}: {error}"));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() || !crate::is_checkpo_owned_temporary_file(entry.path())
+            {
+                continue;
+            }
+            let relative =
+                match relative_path_from_project(project.project_root.as_path(), entry.path()) {
+                    Ok(relative) => relative,
+                    Err(error) => {
+                        warnings.push(format!("{}: {error}", entry.path().display()));
+                        continue;
+                    }
+                };
+            let path = match TrackedUnityFilePath::parse(&relative) {
+                Ok(path) => path,
+                Err(error) => {
+                    warnings.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+            let metadata = match fs::metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warnings.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+            files.push(OrphanTempFile {
+                path,
+                size_bytes: metadata.len(),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let total_bytes = files.iter().map(|file| file.size_bytes).sum();
+    Ok(TempFileCleanupPlan {
+        file_count: files.len(),
+        total_bytes,
+        files,
+        warnings,
+    })
+}
+
+fn ensure_project_parent_is_safe(
+    project: &crate::ProjectContext,
+    path: &TrackedUnityFilePath,
+) -> Result<()> {
+    let mut current = project.project_root.as_path().to_path_buf();
+    let segments = path.as_str().split('/').collect::<Vec<_>>();
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        current.push(segment);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error(&current, error)),
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(CheckPoError::InvalidTrackedPath(format!(
+                "{} contains unsafe parent component: {}",
+                path,
+                current.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn analyze_gc_for_project(project: &crate::ProjectContext) -> Result<StorageGcPlan> {

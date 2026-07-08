@@ -210,6 +210,7 @@ pub struct OperationPlan {
     pub kind: OperationPlanKind,
     pub selected_paths: Option<Vec<TrackedUnityFilePath>>,
     pub operations: Vec<FileOperation>,
+    pub warnings: Vec<String>,
     pub restore_count: usize,
     pub replace_count: usize,
     pub delete_count: usize,
@@ -265,6 +266,7 @@ impl OperationPlan {
             selected_paths,
             has_changes: !operations.is_empty(),
             operations,
+            warnings: Vec::new(),
             restore_count,
             replace_count,
             delete_count,
@@ -272,6 +274,11 @@ impl OperationPlan {
             backup_bytes,
             estimated_temporary_bytes: staged_bytes + backup_bytes,
         }
+    }
+
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
     }
 }
 
@@ -427,6 +434,31 @@ pub struct TransactionRecoveryFailure {
 pub struct TransactionCleanupResult {
     pub deleted_directory_count: usize,
     pub deleted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanTempFile {
+    pub path: TrackedUnityFilePath,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempFileCleanupPlan {
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub files: Vec<OrphanTempFile>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempFileCleanupResult {
+    pub plan: TempFileCleanupPlan,
+    pub deleted_file_count: usize,
+    pub deleted_bytes: u64,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

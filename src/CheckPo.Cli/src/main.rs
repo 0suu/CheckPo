@@ -85,6 +85,12 @@ enum CheckpointCommand {
         #[arg(long)]
         yes: bool,
     },
+    Rename {
+        project_path: PathBuf,
+        checkpoint_id: String,
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -173,7 +179,25 @@ enum TransactionsCommand {
 
 #[derive(Debug, Subcommand)]
 enum MaintenanceCommand {
-    CleanupJournals { project_path: PathBuf },
+    CleanupJournals {
+        project_path: PathBuf,
+    },
+    TempFiles {
+        #[command(subcommand)]
+        command: TempFilesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TempFilesCommand {
+    Analyze {
+        project_path: PathBuf,
+    },
+    Cleanup {
+        project_path: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -300,6 +324,21 @@ fn run() -> Result<u8, String> {
                 print_or_json(cli.json, &result, || {
                     println!("Deleted checkpoint: {}", result.deleted_checkpoint_id);
                     for warning in &result.warnings {
+                        println!("Warning: {warning}");
+                    }
+                })?;
+            }
+            CheckpointCommand::Rename {
+                project_path,
+                checkpoint_id,
+                name,
+            } => {
+                let summary = core::rename_checkpoint(project_path, &checkpoint_id, &name)
+                    .map_err(to_message)?;
+                print_or_json(cli.json, &summary, || {
+                    println!("Renamed checkpoint: {}", summary.checkpoint_id);
+                    println!("Name: {}", summary.name);
+                    for warning in &summary.warnings {
                         println!("Warning: {warning}");
                     }
                 })?;
@@ -481,6 +520,33 @@ fn run() -> Result<u8, String> {
                     println!("Deleted bytes: {}", result.deleted_bytes);
                 })?;
             }
+            MaintenanceCommand::TempFiles { command } => match command {
+                TempFilesCommand::Analyze { project_path } => {
+                    let plan = core::analyze_orphan_temp_files(project_path).map_err(to_message)?;
+                    print_or_json(cli.json, &plan, || {
+                        println!("Temporary files: {}", plan.file_count);
+                        println!("Temporary bytes: {}", plan.total_bytes);
+                        for warning in &plan.warnings {
+                            println!("Warning: {warning}");
+                        }
+                    })?;
+                }
+                TempFilesCommand::Cleanup { project_path, yes } => {
+                    if !yes {
+                        return Err("temporary file cleanup requires --yes.".to_string());
+                    }
+                    let result =
+                        core::cleanup_orphan_temp_files(project_path, core::ApplyOptions { yes })
+                            .map_err(to_message)?;
+                    print_or_json(cli.json, &result, || {
+                        println!("Deleted temporary files: {}", result.deleted_file_count);
+                        println!("Deleted bytes: {}", result.deleted_bytes);
+                        for warning in result.plan.warnings.iter().chain(result.warnings.iter()) {
+                            println!("Warning: {warning}");
+                        }
+                    })?;
+                }
+            },
         },
     }
     Ok(0)
@@ -523,6 +589,9 @@ fn print_plan(plan: &core::OperationPlan) {
     );
     for operation in &plan.operations {
         println!("{:?} {}", operation.operation_type, operation.path);
+    }
+    for warning in &plan.warnings {
+        println!("Warning: {warning}");
     }
 }
 

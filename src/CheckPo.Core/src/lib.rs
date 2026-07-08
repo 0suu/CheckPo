@@ -28,17 +28,20 @@ pub use discard::{
     apply_discard_files_plan, apply_discard_plan_with_progress_and_cancellation,
     preview_discard_files, preview_discard_with_progress_and_cancellation,
 };
-pub use maintenance::{analyze_gc, apply_gc, storage_summary};
+pub use maintenance::{
+    analyze_gc, analyze_orphan_temp_files, apply_gc, cleanup_orphan_temp_files, storage_summary,
+};
 pub use models::CancellationToken;
 pub use models::{
     ApplyOptions, ApplyResult, CheckpointDeleteResult, CheckpointSummary, CreateCheckpointOptions,
     DiffOptions, DiffResult, FileOperation, FileOperationType, InvalidObjectLocation,
-    MissingBlobReference, OperationPlan, OperationPlanKind, OperationProgress, PendingTransaction,
-    ProjectContext, ProjectLocationStatus, ProjectMarkerFile, ProjectView, ProjectWarning,
-    ProjectWarningKind, RebuildIndexResult, RegistryFile, RegistryProjectEntry, RepositoryConfig,
-    ScanWarning, ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry, SnapshotFile,
-    StorageGcPlan, StorageGcResult, StorageSummary, TransactionCleanupResult,
-    TransactionRecoveryFailure, TransactionRecoveryResult, UnreferencedBlob, VerificationResult,
+    MissingBlobReference, OperationPlan, OperationPlanKind, OperationProgress, OrphanTempFile,
+    PendingTransaction, ProjectContext, ProjectLocationStatus, ProjectMarkerFile, ProjectView,
+    ProjectWarning, ProjectWarningKind, RebuildIndexResult, RegistryFile, RegistryProjectEntry,
+    RepositoryConfig, ScanWarning, ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry,
+    SnapshotFile, StorageGcPlan, StorageGcResult, StorageSummary, TempFileCleanupPlan,
+    TempFileCleanupResult, TransactionCleanupResult, TransactionRecoveryFailure,
+    TransactionRecoveryResult, UnreferencedBlob, VerificationResult,
 };
 pub use path::{
     hash_bytes, parse_tracked_paths, ObjectId, ProjectId, ProjectRoot, SnapshotId, StorageRoot,
@@ -78,7 +81,9 @@ pub(crate) use db::{
     rebuild_index_for_project_unlocked, refresh_file_fingerprints_with_index_connection,
 };
 pub(crate) use models::{ensure_not_cancelled, report_operation_progress};
-pub(crate) use path::relative_path_from_project;
+pub(crate) use path::{
+    is_checkpo_owned_temporary_file, is_checkpo_temporary_file, relative_path_from_project,
+};
 pub(crate) use project::{
     acquire_registry_lock, ensure_project_location_allows_mutation,
     ensure_repo_outside_tracked_roots, load_project_marker, load_registry, normalize_existing_dir,

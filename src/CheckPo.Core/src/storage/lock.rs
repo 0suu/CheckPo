@@ -35,7 +35,10 @@ impl FileLock {
                 });
             }
         }
-        Err(CheckPoError::RepositoryLocked(operation.to_string()))
+        Err(CheckPoError::RepositoryLocked(format!(
+            "{operation} ({})",
+            path.display()
+        )))
     }
 }
 
@@ -113,7 +116,8 @@ impl ReclaimLock {
         let token = Uuid::new_v4().simple().to_string();
         if !create_lock_file(path, operation, &token)? {
             return Err(CheckPoError::RepositoryLocked(format!(
-                "{operation}-stale-lock-reclaim"
+                "{operation}-stale-lock-reclaim ({})",
+                path.display()
             )));
         }
         Ok(Self {

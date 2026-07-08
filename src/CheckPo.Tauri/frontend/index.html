@@ -232,6 +232,15 @@
             <p id="cleanupSummary" data-i18n="cleanupEmpty">Cleanup preview has not run.</p>
             <p id="cleanupResult">-</p>
           </article>
+          <article class="storage-widget">
+            <div class="maintenance-actions">
+              <button class="button" id="previewTempCleanupButton" type="button" data-command="preview_temp_cleanup">一時ファイル確認</button>
+              <button class="button danger-secondary" id="applyTempCleanupButton" type="button" data-command="apply_temp_cleanup" data-destructive="true">一時ファイル削除</button>
+            </div>
+            <h4>一時ファイル cleanup</h4>
+            <p id="tempCleanupSummary">未確認</p>
+            <p id="tempCleanupResult">-</p>
+          </article>
         </details>
 
         <details class="inspector-section">
