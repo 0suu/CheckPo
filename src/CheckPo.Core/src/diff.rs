@@ -1,6 +1,6 @@
 use crate::{
-    load_project, load_project_snapshot, scan_project_for_checkpoint, DiffOptions, DiffResult,
-    Result, SnapshotId, TrackedUnityFilePath,
+    load_project, load_project_snapshot, scan_project_for_checkpoint_with_baseline, DiffOptions,
+    DiffResult, Result, SnapshotId, TrackedUnityFilePath,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -18,8 +18,12 @@ pub fn diff_checkpoint_with_options(
     let snapshot_id = SnapshotId::parse(checkpoint_id)?;
     let snapshot = load_project_snapshot(&project, &snapshot_id)?;
     let progress = options.progress.as_deref().map(|f| f as &dyn Fn(_));
-    let (working, warnings, _) =
-        scan_project_for_checkpoint(&project, progress, options.cancellation.as_ref())?;
+    let (working, warnings, _) = scan_project_for_checkpoint_with_baseline(
+        &project,
+        Some(&snapshot),
+        progress,
+        options.cancellation.as_ref(),
+    )?;
     let snapshot_map = snapshot
         .files
         .iter()

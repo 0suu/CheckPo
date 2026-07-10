@@ -1,8 +1,8 @@
 use crate::{
-    list_snapshot_ids, load_project, load_project_snapshot, load_snapshot, object_path,
-    read_latest_snapshot_id, report_operation_progress, snapshots_dir, validate_repository_config,
-    CancellationToken, ObjectId, OperationProgress, Result, SnapshotFile, SnapshotId,
-    TrackedUnityFilePath, VerificationResult,
+    list_snapshot_ids, load_project, object_path, read_latest_snapshot_id,
+    report_operation_progress, snapshots_dir, validate_repository_config, CancellationToken,
+    ObjectId, OperationProgress, Result, SnapshotFile, SnapshotId, TrackedUnityFilePath,
+    VerificationResult,
 };
 use std::fs;
 use std::path::Path;
@@ -36,8 +36,9 @@ pub fn verify_project_with_progress_and_cancellation(
     let snapshot_total = snapshot_ids.len();
     for (index, snapshot_id) in snapshot_ids.into_iter().enumerate() {
         crate::ensure_not_cancelled(cancellation)?;
-        match load_snapshot(&project.repo_root, &snapshot_id) {
-            Ok(snapshot) => {
+        match crate::storage::load_snapshot_with_warnings(&project.repo_root, &snapshot_id) {
+            Ok((snapshot, warnings)) => {
+                result.warnings.extend(warnings);
                 if snapshot.project_id != project.project_id {
                     result.errors.push(format!(
                         "{snapshot_id}: snapshot project id does not match current project"
@@ -101,16 +102,19 @@ pub fn verify_checkpoint_with_progress_and_cancellation(
         errors: Vec::new(),
         warnings: Vec::new(),
     };
-    match load_project_snapshot(&project, &snapshot_id) {
-        Ok(snapshot) => verify_snapshot(
-            &project.repo_root,
-            &snapshot_id,
-            &snapshot,
-            full,
-            progress,
-            cancellation,
-            &mut result,
-        )?,
+    match crate::storage::load_project_snapshot_with_warnings(&project, &snapshot_id) {
+        Ok((snapshot, warnings)) => {
+            result.warnings.extend(warnings);
+            verify_snapshot(
+                &project.repo_root,
+                &snapshot_id,
+                &snapshot,
+                full,
+                progress,
+                cancellation,
+                &mut result,
+            )?
+        }
         Err(error) => result.errors.push(error.to_string()),
     }
     result.is_valid = result.errors.is_empty();

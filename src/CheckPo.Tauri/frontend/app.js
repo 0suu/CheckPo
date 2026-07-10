@@ -41,6 +41,9 @@ const state = {
   gcPlan: null,
   tempCleanupPlan: null,
   rollbackPlan: null,
+  pendingTransactions: [],
+  unresolvedQuarantines: [],
+  failedTransactions: [],
   confirming: false,
   currentDiff: null,
   currentDiffFilter: "all",
@@ -235,7 +238,11 @@ function errorKind(error) {
 
 function displayError(error) {
   const raw = errorText(error);
-  return { kind: errorKind(error), message: raw };
+  return CheckPoFrontendState.localizedErrorDisplay(
+    errorKind(error),
+    raw,
+    typeof error === "object" && error ? error.detail : null,
+  );
 }
 
 function showError(error) {
@@ -499,6 +506,7 @@ function renderSnapshot(snapshot) {
   renderCheckpoints();
   renderStorage();
   renderPending(snapshot.pendingTransactions || []);
+  renderUnresolvedQuarantines(snapshot.unresolvedQuarantines || []);
   renderProjectWarnings(snapshot.project?.warnings || []);
   if (snapshot.warnings?.length) {
     setStatus(snapshot.warnings.join("\n"));
@@ -559,9 +567,15 @@ function renderStorage() {
 }
 
 function renderPending(items) {
+  state.pendingTransactions = Array.isArray(items) ? items : [];
+  state.failedTransactions = CheckPoFrontendState.retainPendingTransactionFailures(
+    state.pendingTransactions,
+    state.failedTransactions,
+  );
   $("pendingTransactionBanner").hidden = items.length === 0;
   if (items.length === 0) {
     $("pendingTransactionText").textContent = "";
+    renderTransactionQuarantineAction();
     return;
   }
   const states = items
@@ -574,6 +588,53 @@ function renderPending(items) {
       count: items.length,
       details: states ? ` (${states}${omitted})` : "",
     });
+  renderTransactionQuarantineAction();
+}
+
+function renderTransactionQuarantineAction() {
+  const banner = $("pendingTransactionBanner");
+  const failed = state.failedTransactions?.[0];
+  let button = $("quarantineTransactionButton");
+  if (!failed) {
+    button?.remove();
+    return;
+  }
+  if (!button) {
+    button = document.createElement("button");
+    button.id = "quarantineTransactionButton";
+    button.type = "button";
+    button.className = "button danger-secondary";
+    button.addEventListener("click", quarantineFailedTransaction);
+    banner.append(button);
+  }
+  button.dataset.transactionId = failed.transactionId;
+  const remaining = state.failedTransactions.length;
+  button.textContent = remaining > 1
+    ? `復旧できない作業を退避（残り ${remaining} 件）`
+    : "復旧できない作業を安全な場所へ退避";
+}
+
+function renderUnresolvedQuarantines(items) {
+  state.unresolvedQuarantines = Array.isArray(items) ? items : [];
+  const banner = $("unresolvedQuarantineBanner");
+  banner.hidden = state.unresolvedQuarantines.length === 0;
+  if (state.unresolvedQuarantines.length === 0) {
+    $("unresolvedQuarantineText").textContent = "";
+    updateControls();
+    return;
+  }
+  const ids = state.unresolvedQuarantines
+    .slice(0, 3)
+    .map((item) => shortId(item.transactionId))
+    .join(" / ");
+  const omitted = state.unresolvedQuarantines.length > 3
+    ? ` / 他 ${state.unresolvedQuarantines.length - 3} 件`
+    : "";
+  $("unresolvedQuarantineText").textContent =
+    `状態を確認できない退避済み作業が ${state.unresolvedQuarantines.length} 件あります（${ids}${omitted}）。`
+    + " 新規チェックポイント作成や削除、選択ファイルだけを戻す操作は停止しています。"
+    + " 既知のチェックポイントを選び「このチェックポイントに戻す」で全体復元してください。";
+  updateControls();
 }
 
 function shortId(value) {
@@ -584,10 +645,7 @@ function recoverySummary(result) {
   const recovered = result?.recoveredTransactionCount ?? 0;
   const failed = result?.failedTransactionCount ?? 0;
   if (failed > 0) {
-    const first = result?.failedTransactions?.[0];
-    const detail = first
-      ? tf("recoveryFailureDetail", { id: shortId(first.transactionId), error: first.error })
-      : "";
+    const detail = "。復旧できない作業は、安全な場所へ退避できます";
     return tf("recoveryFailed", { recovered, failed, detail });
   }
   return tf("recoverySucceeded", { count: recovered });
@@ -595,8 +653,54 @@ function recoverySummary(result) {
 
 function ensureRecoverySucceeded(result) {
   if ((result?.failedTransactionCount ?? 0) > 0) {
-    throw new Error(recoverySummary(result));
+    const error = new Error(recoverySummary(result));
+    error.kind = "transactionRecoveryFailed";
+    error.detail = result.failedTransactions || [];
+    throw error;
   }
+}
+
+async function quarantineFailedTransaction(event) {
+  const transactionId = event?.currentTarget?.dataset.transactionId
+    || state.failedTransactions?.[0]?.transactionId;
+  if (!transactionId || state.busy || state.confirming) return;
+
+  state.confirming = true;
+  updateControls();
+  let confirmed = false;
+  try {
+    confirmed = await confirmAction(
+      `自動復旧に失敗した作業 ${transactionId} を、CheckPoの自動復旧対象から外して安全な場所へ退避します。`
+        + "\n\njournal・backup・stagedは削除せず保存し、Unityプロジェクト内のファイルもこの操作では変更しません。"
+        + "ただし、現在のUnityプロジェクトが処理前の状態へ完全に戻っていない可能性があります。"
+        + "退避後は正常なチェックポイントへ戻して状態を確認してください。続行しますか？",
+      "安全な場所へ退避",
+    );
+  } finally {
+    state.confirming = false;
+    updateControls();
+  }
+  if (!confirmed) return;
+
+  await run("復旧できない作業を退避中", async () => {
+    const result = await invokeCommand("quarantine_transaction", {
+      projectPath: getProjectPath(),
+      transactionId,
+      confirmed: true,
+    });
+    state.failedTransactions = state.failedTransactions
+      .filter((item) => item.transactionId !== transactionId);
+    setBusyIndeterminate("再読み込み中");
+    await refreshProject();
+    if (state.pendingTransactions.length === 0) {
+      await refreshLatestDiff({ allowBusy: true });
+    }
+    const warning = result.warnings?.length
+      ? " Unityプロジェクトが完全に戻っていない可能性があります。正常なチェックポイントへ戻して確認してください。"
+      : "";
+    setStatus(`復旧できない作業を安全な場所へ退避しました。${warning}`);
+    setResult(result);
+  });
 }
 
 function renderProjectWarnings(warnings) {
@@ -724,6 +828,10 @@ function selectCheckpoint(checkpointId, options = {}) {
 
 function beginRenameCheckpoint(checkpointId) {
   if (state.busy || state.confirming) return;
+  if (state.unresolvedQuarantines.length > 0) {
+    setStatus("安全を確認できるまでチェックポイント名は変更できません。既知のチェックポイントへ全体復元してください。");
+    return;
+  }
   state.renamingCheckpointId = checkpointId;
   renderCheckpoints();
 }
@@ -983,9 +1091,9 @@ function renderStartedProject(snapshot, successMessage) {
     updateControls();
     const warningText = checkpointWarningsText(snapshot.initialCheckpoint?.warnings);
     if (warningText) {
-      setStatus(`初回チェックポイントを作成しましたが、保存されなかったファイルがあります。${warningText}`);
+      setStatus(`初回チェックポイントを作成しましたが、警告があります。${warningText}`);
       setResult({
-        warning: "初回チェックポイントを作成しましたが、保存されなかったファイルがあります。",
+        warning: "初回チェックポイントを作成しましたが、警告があります。",
         details: snapshot.initialCheckpoint.warnings,
       });
     } else {
@@ -1058,7 +1166,9 @@ function updateControls() {
   const hasProject = Boolean(state.projectPath);
   const hasCheckpoint = Boolean(state.selectedCheckpointId);
   const hasCheckpointName = Boolean($("checkpointName").value.trim());
-  const destructiveBlocked = state.projectLocationStatus === "copiedSuspected";
+  const locationMutationBlocked = state.projectLocationStatus === "copiedSuspected";
+  const quarantineMutationBlocked = state.unresolvedQuarantines.length > 0;
+  const destructiveBlocked = locationMutationBlocked || quarantineMutationBlocked;
   const controlsBlocked = state.busy || state.confirming;
   document.querySelectorAll("button").forEach((button) => {
     if (["confirmOkButton", "confirmCancelButton"].includes(button.id)) {
@@ -1094,7 +1204,7 @@ function updateControls() {
     }
     if (button.id === "applyRollbackButton") {
       button.disabled = controlsBlocked
-        || destructiveBlocked
+        || locationMutationBlocked
         || !state.rollbackPlan
         || Boolean(state.rollbackPlan.warnings?.length)
         || !$("rollbackConfirm").checked
@@ -1125,8 +1235,8 @@ function updateControls() {
       button.disabled = controlsBlocked || destructiveBlocked || !hasProject;
       return;
     }
-    if (["recoverTransactionsButton", "applyCleanupButton"].includes(button.id)) {
-      button.disabled = controlsBlocked || destructiveBlocked || !hasProject;
+    if (["recoverTransactionsButton", "quarantineTransactionButton", "applyCleanupButton"].includes(button.id)) {
+      button.disabled = controlsBlocked || locationMutationBlocked || !hasProject;
       return;
     }
     if (button.id === "applyTempCleanupButton") {
@@ -1326,6 +1436,12 @@ function bindEvents() {
   $("closeAdvancedButton").addEventListener("click", () => $("advancedOverlay").hidden = true);
   $("closeRollbackDialogButton").addEventListener("click", () => $("rollbackOverlay").hidden = true);
   $("clearLogButton").addEventListener("click", () => $("logList").replaceChildren());
+  $("openDiagnosticLogsButton").addEventListener("click", async () => {
+    await run("診断ログを開いています", async () => {
+      await invokeCommand("open_diagnostic_logs");
+      setStatus("診断ログフォルダを開きました。");
+    });
+  });
   $("clearResultButton").addEventListener("click", () => setResult({}));
   $("checkpointSearch").addEventListener("input", renderCheckpoints);
   $("checkpointName").addEventListener("input", updateControls);
@@ -1544,9 +1660,9 @@ function bindEvents() {
       await refreshLatestDiff({ allowBusy: true });
       const warningText = checkpointWarningsText(created.warnings);
       if (warningText) {
-        setStatus(`チェックポイントを作成しましたが、保存されなかったファイルがあります。${warningText}`);
+        setStatus(`チェックポイントを作成しましたが、警告があります。${warningText}`);
         setResult({
-          warning: "チェックポイントを作成しましたが、保存されなかったファイルがあります。",
+          warning: "チェックポイントを作成しましたが、警告があります。",
           details: created.warnings,
         });
       } else {
@@ -1675,10 +1791,11 @@ function bindEvents() {
   $("recoverTransactionsButton").addEventListener("click", async () => {
     await run("復旧中", async () => {
       const result = await invokeCommand("recover_transactions", { projectPath: getProjectPath() });
+      state.failedTransactions = result.failedTransactions || [];
       setBusyIndeterminate("再読み込み中");
       await refreshProject();
-      await refreshLatestDiff({ allowBusy: true });
       ensureRecoverySucceeded(result);
+      await refreshLatestDiff({ allowBusy: true });
       setStatus(recoverySummary(result));
     });
   });

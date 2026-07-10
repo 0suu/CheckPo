@@ -1,6 +1,14 @@
 use super::*;
 
 pub(super) const JOURNAL_STATE_UNREADABLE: &str = "unreadable";
+pub(super) const JOURNAL_STATE_UNSUPPORTED_SCHEMA: &str = "unsupportedSchema";
+const TRANSACTION_JOURNAL_SCHEMA_VERSION_V1: u32 = 1;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionJournalEnvelope {
+    schema_version: u32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,9 +37,16 @@ pub(super) fn validate_transaction_journal_identity(
     tx_root: &Path,
     journal: &TransactionJournal,
 ) -> Result<()> {
-    if journal.schema_version != 1 {
+    if journal.schema_version > TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
+        return Err(CheckPoError::UnsupportedFormat {
+            artifact: "transaction journal schema".to_string(),
+            found: journal.schema_version,
+            supported: TRANSACTION_JOURNAL_SCHEMA_VERSION_V1,
+        });
+    }
+    if journal.schema_version != TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
         return Err(CheckPoError::Corruption(format!(
-            "unsupported transaction journal schema: {}",
+            "invalid transaction journal schema: {}",
             journal.schema_version
         )));
     }
@@ -46,6 +61,26 @@ pub(super) fn validate_transaction_journal_identity(
         )));
     }
     Ok(())
+}
+
+pub(super) fn read_transaction_journal(path: &Path) -> Result<TransactionJournal> {
+    let bytes = fs::read(path).map_err(|error| crate::io_error(path, error))?;
+    let envelope: TransactionJournalEnvelope =
+        serde_json::from_slice(&bytes).map_err(|error| crate::json_error(path, error))?;
+    if envelope.schema_version > TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
+        return Err(CheckPoError::UnsupportedFormat {
+            artifact: "transaction journal schema".to_string(),
+            found: envelope.schema_version,
+            supported: TRANSACTION_JOURNAL_SCHEMA_VERSION_V1,
+        });
+    }
+    if envelope.schema_version != TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
+        return Err(CheckPoError::Corruption(format!(
+            "invalid transaction journal schema: {}",
+            envelope.schema_version
+        )));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| crate::json_error(path, error))
 }
 
 pub fn pending_transactions(project_path: impl AsRef<Path>) -> Result<Vec<PendingTransaction>> {
@@ -75,8 +110,16 @@ pub fn pending_transactions_for_project(
             });
             continue;
         }
-        let journal: TransactionJournal = match crate::read_json(&journal_path) {
+        let journal = match read_transaction_journal(&journal_path) {
             Ok(journal) => journal,
+            Err(crate::CheckPoError::UnsupportedFormat { found, .. }) => {
+                pending.push(PendingTransaction {
+                    transaction_id: entry.file_name().to_string_lossy().to_string(),
+                    state: format!("{JOURNAL_STATE_UNSUPPORTED_SCHEMA}:{found}"),
+                    journal_path,
+                });
+                continue;
+            }
             Err(crate::CheckPoError::Json { .. }) => {
                 pending.push(PendingTransaction {
                     transaction_id: entry.file_name().to_string_lossy().to_string(),
@@ -136,7 +179,7 @@ pub fn cleanup_journals(
         if !journal_path.is_file() {
             continue;
         }
-        let journal: TransactionJournal = crate::read_json(&journal_path)?;
+        let journal = read_transaction_journal(&journal_path)?;
         validate_transaction_journal_identity(&entry.path(), &journal)?;
         if journal.state == JournalState::Committed || journal.state == JournalState::Recovered {
             let tx_root = entry.path();
@@ -155,7 +198,11 @@ pub fn cleanup_journals(
 }
 
 pub(super) fn write_journal(path: &Path, journal: &TransactionJournal) -> Result<()> {
-    write_json_atomic(path, journal)
+    write_json_atomic(path, journal)?;
+    if let Some(transaction_root) = path.parent() {
+        crate::sync_parent_dir(transaction_root)?;
+    }
+    Ok(())
 }
 
 pub(super) fn journals_dir(repo_root: &Path) -> PathBuf {
@@ -177,9 +224,19 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub(super) fn directory_is_empty_or_missing(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(CheckPoError::Corruption(format!(
+                "transaction payload path is not a regular directory: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(crate::io_error(path, error)),
+    }
     match fs::read_dir(path) {
         Ok(mut entries) => Ok(entries.next().is_none()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
         Err(error) => Err(crate::io_error(path, error)),
     }
 }

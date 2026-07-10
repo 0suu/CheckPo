@@ -2,7 +2,7 @@ use crate::{
     init_repo_layout, load_repo_config, now_utc_string, read_json, repo_root, write_json_atomic,
     CheckPoError, ProjectContext, ProjectId, ProjectLocationStatus, ProjectMarkerFile, ProjectRoot,
     ProjectView, ProjectWarning, ProjectWarningKind, RegistryFile, RegistryProjectEntry, Result,
-    StorageRoot,
+    StorageRoot, TrackedUnityFilePath,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -528,6 +528,31 @@ fn previous_marker_has_same_project_id(path: &Path, project_id: &ProjectId) -> b
 pub fn ensure_project_location_allows_mutation(project: &ProjectContext) -> Result<()> {
     if project.location_status == ProjectLocationStatus::CopiedSuspected {
         return Err(copied_project_error(project.project_root.as_path()));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_project_parent_is_safe(
+    project: &ProjectContext,
+    path: &TrackedUnityFilePath,
+) -> Result<()> {
+    let mut current = project.project_root.as_path().to_path_buf();
+    let segments = path.as_str().split('/').collect::<Vec<_>>();
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        current.push(segment);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(crate::io_error(&current, error)),
+        };
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(CheckPoError::InvalidTrackedPath(format!(
+                "{} contains unsafe parent component: {}",
+                path,
+                current.display()
+            )));
+        }
     }
     Ok(())
 }

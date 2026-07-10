@@ -69,5 +69,7 @@ pub fn apply_restore_plan_with_progress_and_cancellation(
             "restore checkpoint changed after preview".to_string(),
         ));
     }
-    crate::apply_plan(&project, plan, options, progress, cancellation)
+    let result = crate::apply_plan(&project, plan, options, progress, cancellation)?;
+    crate::transaction::resolve_unverified_transaction_quarantines(&project, &snapshot_id)?;
+    Ok(result)
 }

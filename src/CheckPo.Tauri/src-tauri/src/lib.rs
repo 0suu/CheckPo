@@ -266,6 +266,15 @@ async fn open_project_in_file_manager(
 }
 
 #[tauri::command]
+async fn open_diagnostic_logs() -> AppResult {
+    let path = core::diagnostic_log_directory().map_err(to_app_error)?;
+    std::fs::create_dir_all(&path)
+        .map_err(|error| AppError::new("io", format!("{}: {error}", path.display())))?;
+    open_folder_in_file_manager(&path)?;
+    Ok(json!({ "path": path }))
+}
+
+#[tauri::command]
 async fn diff_checkpoint(
     state: tauri::State<'_, OperationState>,
     project_path: String,
@@ -512,6 +521,26 @@ async fn recover_transactions(
 }
 
 #[tauri::command]
+async fn quarantine_transaction(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    transaction_id: String,
+    confirmed: bool,
+) -> AppResult {
+    require_confirmation(confirmed, "transaction quarantine requires confirmation.")?;
+    run_guarded_blocking(state, None, move || {
+        core::quarantine_transaction(
+            &project_path,
+            &transaction_id,
+            core::ApplyOptions { yes: confirmed },
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn cleanup_journals(
     state: tauri::State<'_, OperationState>,
     project_path: String,
@@ -619,6 +648,13 @@ async fn install_update(
 }
 
 pub fn run() {
+    let _diagnostics = match core::init_diagnostics() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("Diagnostic logging is unavailable: {error}");
+            None
+        }
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OperationState::default())
@@ -636,6 +672,7 @@ pub fn run() {
             delete_checkpoint,
             rename_checkpoint,
             open_project_in_file_manager,
+            open_diagnostic_logs,
             diff_checkpoint,
             diff_checkpoint_metadata,
             diff_checkpoint_full,
@@ -649,6 +686,7 @@ pub fn run() {
             apply_gc,
             list_transactions,
             recover_transactions,
+            quarantine_transaction,
             cleanup_journals,
             analyze_orphan_temp_files,
             cleanup_orphan_temp_files,
@@ -708,12 +746,19 @@ fn project_snapshot(project_path: String) -> AppResult {
     let project = core::project_view(&context).map_err(to_app_error)?;
     let pending_transactions =
         core::pending_transactions_for_project(&context).map_err(to_app_error)?;
+    let unresolved_quarantines =
+        core::unresolved_transaction_quarantines_for_project(&context).map_err(to_app_error)?;
     let mut warnings = Vec::new();
-    let checkpoints = match core::list_checkpoints_for_project(&context) {
-        Ok(checkpoints) => checkpoints,
+    let checkpoints = match core::list_checkpoints_with_warnings_for_project(&context) {
+        Ok(result) => {
+            warnings.extend(result.warnings);
+            result.checkpoints
+        }
         Err(error)
             if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                || !pending_transactions.is_empty() =>
+                || !pending_transactions.is_empty()
+                || !unresolved_quarantines.is_empty()
+                || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
         {
             warnings.push(format!("チェックポイント一覧を読み込めません: {error}"));
             Vec::new()
@@ -724,7 +769,8 @@ fn project_snapshot(project_path: String) -> AppResult {
         Ok(storage) => Some(storage),
         Err(error)
             if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                || !pending_transactions.is_empty() =>
+                || !pending_transactions.is_empty()
+                || !unresolved_quarantines.is_empty() =>
         {
             let prefix = if pending_transactions.is_empty() {
                 "保存容量の集計を読み込めません"
@@ -742,6 +788,7 @@ fn project_snapshot(project_path: String) -> AppResult {
         "checkpoints": checkpoints,
         "storage": storage,
         "pendingTransactions": pending_transactions,
+        "unresolvedQuarantines": unresolved_quarantines,
         "warnings": warnings
     }))
 }
@@ -874,6 +921,7 @@ impl Drop for OperationGuard {
 }
 
 fn to_app_error(error: core::CheckPoError) -> AppError {
+    core::log_operation_error("tauri-command", &error.to_string());
     let kind = match &error {
         core::CheckPoError::User(_) => "user",
         core::CheckPoError::InvalidProject(_) => "invalidProject",
@@ -886,7 +934,9 @@ fn to_app_error(error: core::CheckPoError) -> AppError {
         core::CheckPoError::WorkingTreeChanged(_) => "workingTreeChanged",
         core::CheckPoError::RepositoryLocked(_) => "repositoryLocked",
         core::CheckPoError::PendingTransaction(_) => "pendingTransaction",
+        core::CheckPoError::UnresolvedTransactionQuarantine(_) => "unresolvedTransactionQuarantine",
         core::CheckPoError::IndexUnavailable(_) => "indexUnavailable",
+        core::CheckPoError::UnsupportedFormat { .. } => "unsupportedFormat",
         core::CheckPoError::CopiedProjectSuspected(_) => "copiedProjectSuspected",
         core::CheckPoError::Cancelled => "cancelled",
         core::CheckPoError::Io { .. } => "io",
@@ -926,11 +976,18 @@ mod tests {
         let invalid = to_app_error(core::CheckPoError::InvalidProject(
             "missing marker".to_string(),
         ));
+        let unsupported = to_app_error(core::CheckPoError::UnsupportedFormat {
+            artifact: "snapshot schema".to_string(),
+            found: 2,
+            supported: 1,
+        });
 
         assert_eq!(cancelled.kind, "cancelled");
         assert_eq!(cancelled.message, "operation cancelled");
         assert_eq!(invalid.kind, "invalidProject");
         assert_eq!(invalid.message, "invalid Unity project: missing marker");
+        assert_eq!(unsupported.kind, "unsupportedFormat");
+        assert!(unsupported.message.contains("snapshot schema"));
     }
 
     #[test]

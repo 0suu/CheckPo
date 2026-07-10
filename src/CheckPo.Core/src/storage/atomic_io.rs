@@ -10,6 +10,11 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_bytes_atomic(path, &bytes)
 }
 
+pub(crate) fn write_json_atomic_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(|error| json_error(path, error))?;
+    write_bytes_atomic_new(path, &bytes)
+}
+
 pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     write_bytes_atomic(path, text.as_bytes())
 }
@@ -18,15 +23,13 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
     }
-    let temp_path = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("checkpo"),
-        Uuid::new_v4().simple()
-    ));
+    let temp_path = short_temporary_path(path);
     let result = (|| -> Result<()> {
-        let mut file = File::create(&temp_path).map_err(|error| io_error(&temp_path, error))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| io_error(&temp_path, error))?;
         file.write_all(bytes)
             .map_err(|error| io_error(&temp_path, error))?;
         file.sync_all()
@@ -34,6 +37,30 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         replace_file(&temp_path, path)?;
         sync_parent_dir(path)?;
         Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_bytes_atomic_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+    }
+    let temp_path = short_temporary_path(path);
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| io_error(&temp_path, error))?;
+        file.write_all(bytes)
+            .map_err(|error| io_error(&temp_path, error))?;
+        file.sync_all()
+            .map_err(|error| io_error(&temp_path, error))?;
+        move_file_no_replace(&temp_path, path)?;
+        sync_parent_dir(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -55,8 +82,79 @@ pub fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+pub(crate) fn sync_parent_chain(path: &Path, stop_at: &Path) -> Result<()> {
+    if !path.starts_with(stop_at) {
+        return Err(CheckPoError::Unexpected(format!(
+            "cannot sync parent chain outside {}: {}",
+            stop_at.display(),
+            path.display()
+        )));
+    }
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        let handle = File::open(directory).map_err(|error| io_error(directory, error))?;
+        handle
+            .sync_all()
+            .map_err(|error| io_error(directory, error))?;
+        if directory == stop_at {
+            return Ok(());
+        }
+        current = directory.parent();
+    }
+    Err(CheckPoError::Unexpected(format!(
+        "parent chain did not reach {} from {}",
+        stop_at.display(),
+        path.display()
+    )))
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_parent_chain(_path: &Path, _stop_at: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
 pub(super) fn replace_file(temp_path: &Path, destination: &Path) -> Result<()> {
     fs::rename(temp_path, destination).map_err(|error| io_error(destination, error))
+}
+
+#[cfg(windows)]
+pub(super) fn replace_file(temp_path: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn absolute_wide(path: &Path) -> std::io::Result<Vec<u16>> {
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+        })?;
+        let absolute = fs::canonicalize(parent)?.join(file_name);
+        Ok(absolute
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect())
+    }
+
+    let source = absolute_wide(temp_path).map_err(|error| io_error(temp_path, error))?;
+    let destination_wide =
+        absolute_wide(destination).map_err(|error| io_error(destination, error))?;
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(io_error(destination, std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 pub(crate) fn move_file_no_replace(source: &Path, destination: &Path) -> Result<()> {
@@ -138,14 +236,7 @@ fn materialize_file_no_replace(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
     }
-    let temp_path = destination.with_file_name(format!(
-        ".{}.{}.tmp",
-        destination
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("copy"),
-        Uuid::new_v4().simple()
-    ));
+    let temp_path = short_temporary_path(destination);
     let result = (|| -> Result<()> {
         if destination.exists() {
             return Err(io_error(
@@ -199,4 +290,29 @@ fn materialize_file_no_replace(
     }
     let _ = fs::remove_file(&temp_path);
     result
+}
+
+fn short_temporary_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(".checkpo-{}.tmp", Uuid::new_v4().simple()))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn atomic_materialization_uses_short_temp_name_for_long_destination_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let long_name = format!("{}.asset", "a".repeat(220));
+        let atomic_destination = temp.path().join(&long_name);
+
+        write_bytes_atomic(&atomic_destination, b"atomic").unwrap();
+        assert_eq!(fs::read(&atomic_destination).unwrap(), b"atomic");
+
+        let source = temp.path().join("source");
+        let copied_destination = temp.path().join(format!("copy-{long_name}"));
+        fs::write(&source, "copied").unwrap();
+        copy_file_no_replace(&source, &copied_destination, CopySourceDisposition::Keep).unwrap();
+        assert_eq!(fs::read(&copied_destination).unwrap(), b"copied");
+    }
 }

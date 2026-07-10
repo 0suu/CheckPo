@@ -28,8 +28,12 @@ pub fn build_plan_with_progress_and_cancellation(
     let mut warnings = Vec::new();
     match kind {
         OperationPlanKind::Restore => {
-            let (working, scan_warnings, _) =
-                crate::scan_project_for_checkpoint(project, progress, cancellation)?;
+            let (working, scan_warnings, _) = crate::scan_project_for_checkpoint_with_baseline(
+                project,
+                Some(&snapshot),
+                progress,
+                cancellation,
+            )?;
             warnings.extend(
                 scan_warnings
                     .iter()
@@ -208,21 +212,6 @@ fn validate_plan_shape(project: &ProjectContext, plan: &OperationPlan) -> Result
             "operation plan contains scan warnings and cannot be applied".to_string(),
         ));
     }
-    let mut sorted = plan.operations.clone();
-    sorted.sort_by(|a, b| a.path.cmp(&b.path));
-    if sorted != plan.operations {
-        return Err(CheckPoError::Corruption(
-            "operation plan is not sorted".to_string(),
-        ));
-    }
-    if sorted
-        .windows(2)
-        .any(|window| window[0].path == window[1].path)
-    {
-        return Err(CheckPoError::Corruption(
-            "operation plan contains duplicate paths".to_string(),
-        ));
-    }
     if plan.restore_count
         != plan
             .operations
@@ -291,13 +280,37 @@ fn validate_plan_shape(project: &ProjectContext, plan: &OperationPlan) -> Result
         _ => {}
     }
 
-    let snapshot = load_project_snapshot(project, &plan.checkpoint_id)?;
+    validate_journal_operations(project, &plan.checkpoint_id, &plan.operations)
+}
+
+pub(super) fn validate_journal_operations(
+    project: &ProjectContext,
+    checkpoint_id: &SnapshotId,
+    operations: &[FileOperation],
+) -> Result<()> {
+    let mut sorted = operations.to_vec();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    if sorted != operations {
+        return Err(CheckPoError::Corruption(
+            "transaction operations are not sorted".to_string(),
+        ));
+    }
+    if sorted
+        .windows(2)
+        .any(|window| window[0].path == window[1].path)
+    {
+        return Err(CheckPoError::Corruption(
+            "transaction operations contain duplicate paths".to_string(),
+        ));
+    }
+
+    let snapshot = load_project_snapshot(project, checkpoint_id)?;
     let snapshot_files = snapshot
         .files
         .iter()
         .map(|file| (file.path.clone(), file))
         .collect::<BTreeMap<_, _>>();
-    for operation in &plan.operations {
+    for operation in operations {
         match operation.operation_type {
             FileOperationType::Restore => {
                 let file = snapshot_files.get(&operation.path).ok_or_else(|| {

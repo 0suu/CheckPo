@@ -1,4 +1,5 @@
 use super::*;
+use crate::{SnapshotContent, SnapshotEntry, TrackedUnityFilePath};
 
 #[test]
 fn open_db_sets_busy_timeout() {
@@ -61,6 +62,212 @@ fn copy_object_to_file_removes_destination_on_hash_mismatch() {
 
     assert!(matches!(error, CheckPoError::ObjectHashMismatch(_)));
     assert!(!destination.exists());
+}
+
+#[test]
+fn init_repo_layout_does_not_overwrite_invalid_existing_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let repo = init_repo_layout(temp.path(), &project_id).unwrap();
+    let config_path = repo.join("repo.json");
+    let invalid = br#"{"schemaVersion":1,"repoFormatVersion":2}"#;
+    fs::write(&config_path, invalid).unwrap();
+
+    let error = init_repo_layout(temp.path(), &project_id).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckPoError::Json { .. }
+            | CheckPoError::Corruption(_)
+            | CheckPoError::UnsupportedFormat { .. }
+    ));
+    assert_eq!(fs::read(&config_path).unwrap(), invalid);
+}
+
+#[test]
+fn repository_config_future_versions_are_unsupported_and_not_rewritten() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let repo = init_repo_layout(temp.path(), &project_id).unwrap();
+    let config_path = repo.join("repo.json");
+    let mut config = super::layout::default_repository_config(&project_id);
+    config.schema_version = 2;
+    let bytes = serde_json::to_vec(&config).unwrap();
+    fs::write(&config_path, &bytes).unwrap();
+
+    let error = init_repo_layout(temp.path(), &project_id).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckPoError::UnsupportedFormat {
+            artifact,
+            found: 2,
+            supported: 1,
+        } if artifact == "repository config schema"
+    ));
+    assert_eq!(fs::read(&config_path).unwrap(), bytes);
+}
+
+#[test]
+fn repository_config_future_schema_is_detected_before_v1_fields_are_required() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let repo = init_repo_layout(temp.path(), &project_id).unwrap();
+    let config_path = repo.join("repo.json");
+    let bytes = br#"{"schemaVersion":2}"#;
+    fs::write(&config_path, bytes).unwrap();
+
+    let error = init_repo_layout(temp.path(), &project_id).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckPoError::UnsupportedFormat {
+            artifact,
+            found: 2,
+            supported: 1,
+        } if artifact == "repository config schema"
+    ));
+    assert_eq!(fs::read(&config_path).unwrap(), bytes);
+}
+
+#[test]
+fn repository_format_future_version_is_unsupported_and_not_rewritten() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let repo = init_repo_layout(temp.path(), &project_id).unwrap();
+    let config_path = repo.join("repo.json");
+    let mut config = super::layout::default_repository_config(&project_id);
+    config.repo_format_version = 2;
+    let bytes = serde_json::to_vec(&config).unwrap();
+    fs::write(&config_path, &bytes).unwrap();
+
+    let error = init_repo_layout(temp.path(), &project_id).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckPoError::UnsupportedFormat {
+            artifact,
+            found: 2,
+            supported: 1,
+        } if artifact == "repository format"
+    ));
+    assert_eq!(fs::read(&config_path).unwrap(), bytes);
+}
+
+#[test]
+fn snapshot_case_insensitive_path_collisions_are_rejected_on_save_and_load() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let object_id = ObjectId::parse(&"0".repeat(64)).unwrap();
+    let entry = |path: &str| SnapshotEntry {
+        path: TrackedUnityFilePath::parse(path).unwrap(),
+        size_bytes: 0,
+        modified_at_utc: "2026-01-01T00:00:00.000000000Z".to_string(),
+        content: SnapshotContent::Whole {
+            hash: object_id.clone(),
+            size_bytes: 0,
+        },
+    };
+    let snapshot = SnapshotFile {
+        schema_version: 1,
+        project_id,
+        parent_snapshot_id: None,
+        created_at_utc: "2026-01-01T00:00:00.000000000Z".to_string(),
+        name: "collision".to_string(),
+        tool_version: "test".to_string(),
+        tracked_roots: vec![
+            "Assets".to_string(),
+            "Packages".to_string(),
+            "ProjectSettings".to_string(),
+        ],
+        files: vec![entry("Assets/Foo.asset"), entry("Assets/foo.asset")],
+    };
+
+    let error = save_snapshot(temp.path(), &snapshot).unwrap_err();
+    assert!(
+        matches!(error, CheckPoError::Corruption(message) if message.contains("case/Unicode-normalization-insensitive"))
+    );
+
+    let bytes = canonical_snapshot_bytes(&snapshot).unwrap();
+    let snapshot_id = snapshot_id_from_bytes(&bytes);
+    let path = snapshot_path(temp.path(), &snapshot_id);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    let error = load_snapshot(temp.path(), &snapshot_id).unwrap_err();
+    assert!(
+        matches!(error, CheckPoError::Corruption(message) if message.contains("case/Unicode-normalization-insensitive"))
+    );
+}
+
+#[test]
+fn snapshot_unicode_normalization_path_collisions_are_rejected_without_rewriting_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let object_id = ObjectId::parse(&"0".repeat(64)).unwrap();
+    let entry = |path: &str| SnapshotEntry {
+        path: TrackedUnityFilePath::parse(path).unwrap(),
+        size_bytes: 0,
+        modified_at_utc: "2026-01-01T00:00:00.000000000Z".to_string(),
+        content: SnapshotContent::Whole {
+            hash: object_id.clone(),
+            size_bytes: 0,
+        },
+    };
+    let decomposed = "Assets/cafe\u{301}.asset";
+    let composed = "Assets/caf\u{e9}.asset";
+    let mut files = vec![entry(composed), entry(decomposed)];
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let snapshot = SnapshotFile {
+        schema_version: 1,
+        project_id,
+        parent_snapshot_id: None,
+        created_at_utc: "2026-01-01T00:00:00.000000000Z".to_string(),
+        name: "unicode collision".to_string(),
+        tool_version: "test".to_string(),
+        tracked_roots: vec![
+            "Assets".to_string(),
+            "Packages".to_string(),
+            "ProjectSettings".to_string(),
+        ],
+        files,
+    };
+
+    let error = save_snapshot(temp.path(), &snapshot).unwrap_err();
+    assert!(matches!(
+        error,
+        CheckPoError::Corruption(message) if message.contains("Unicode-normalization-insensitive")
+    ));
+
+    let single = SnapshotFile {
+        files: vec![entry(decomposed)],
+        name: "single decomposed path".to_string(),
+        ..snapshot
+    };
+    let id = save_snapshot(temp.path(), &single).unwrap();
+    let loaded = load_snapshot(temp.path(), &id).unwrap();
+    assert_eq!(loaded.files[0].path.as_str(), decomposed);
+}
+
+#[test]
+fn init_repo_layout_leaves_valid_existing_config_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let repo = init_repo_layout(temp.path(), &project_id).unwrap();
+    let config_path = repo.join("repo.json");
+    let pretty =
+        serde_json::to_vec_pretty(&super::layout::default_repository_config(&project_id)).unwrap();
+    fs::write(&config_path, &pretty).unwrap();
+    let original_mtime = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    filetime::set_file_mtime(&config_path, original_mtime).unwrap();
+
+    let reopened = init_repo_layout(temp.path(), &project_id).unwrap();
+
+    assert_eq!(reopened, repo);
+    assert_eq!(fs::read(&config_path).unwrap(), pretty);
+    assert_eq!(
+        filetime::FileTime::from_last_modification_time(&fs::metadata(config_path).unwrap()),
+        original_mtime
+    );
 }
 
 #[cfg(unix)]

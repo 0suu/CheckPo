@@ -190,16 +190,14 @@ fn load_file_fingerprints_with_connection(
         let Ok(object_id) = ObjectId::parse(&object_id) else {
             continue;
         };
-        if object_path(&project.repo_root, &object_id).is_file() {
-            records.insert(
-                path,
-                CachedFileFingerprint {
-                    size_bytes,
-                    fingerprint,
-                    object_id,
-                },
-            );
-        }
+        records.insert(
+            path,
+            CachedFileFingerprint {
+                size_bytes,
+                fingerprint,
+                object_id,
+            },
+        );
     }
     Ok(records)
 }
@@ -454,7 +452,13 @@ fn ensure_index_current(project: &ProjectContext) -> Result<()> {
     crate::ensure_project_location_allows_mutation(project)?;
     let _lock = acquire_repository_lock(&project.repo_root, "index-rebuild")?;
     ensure_no_pending_transactions(project)?;
-    rebuild_index_for_project_unlocked(project, None, None)?;
+    let rebuilt = rebuild_index_for_project_unlocked(project, None, None)?;
+    if !rebuilt.errors.is_empty() {
+        return Err(crate::CheckPoError::IndexUnavailable(format!(
+            "index rebuild skipped unreadable or unsupported snapshots: {}",
+            rebuilt.errors.join("; ")
+        )));
+    }
     Ok(())
 }
 

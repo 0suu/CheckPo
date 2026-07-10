@@ -17,6 +17,10 @@ reflink-copy = "0.1.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 

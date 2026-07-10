@@ -291,6 +291,106 @@ fn checkpoint_reuses_existing_object_without_full_rehash() {
 }
 
 #[test]
+fn checkpoint_does_not_trust_cached_object_id_without_latest_snapshot_anchor() {
+    let (_guard, _temp, project, _data) = setup();
+    let foo = project.join("Assets/Avatar/Foo.prefab");
+    let bar = project.join("Assets/Avatar/Bar.prefab");
+    fs::write(&foo, "one").unwrap();
+    fs::write(&bar, "two").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let repo = repo_path(&view);
+    let first = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let first_snapshot = core::load_snapshot(&repo, &first.checkpoint_id).unwrap();
+    let foo_hash = first_snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path.as_str() == "Assets/Avatar/Foo.prefab")
+        .unwrap()
+        .content_hash()
+        .clone();
+    let bar_hash = first_snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path.as_str() == "Assets/Avatar/Bar.prefab")
+        .unwrap()
+        .content_hash()
+        .clone();
+    let conn = core::open_db(&repo).unwrap();
+    conn.execute(
+        "UPDATE file_fingerprints SET object_id = ?1 WHERE path = ?2",
+        rusqlite::params![bar_hash.as_str(), "Assets/Avatar/Foo.prefab"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let second = core::create_checkpoint(&project, "Anchored", Default::default()).unwrap();
+    let second_snapshot = core::load_snapshot(&repo, &second.checkpoint_id).unwrap();
+    let second_foo_hash = second_snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path.as_str() == "Assets/Avatar/Foo.prefab")
+        .unwrap()
+        .content_hash();
+
+    assert_eq!(second_foo_hash, &foo_hash);
+    assert_ne!(second_foo_hash, &bar_hash);
+}
+
+#[test]
+fn cached_checkpoint_captures_scan_state_when_file_changes_before_store() {
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let repo = repo_path(&view);
+    let first = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let first_snapshot = core::load_snapshot(&repo, &first.checkpoint_id).unwrap();
+    let expected = first_snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path.as_str() == "Assets/Avatar/Foo.prefab")
+        .unwrap()
+        .content_hash()
+        .clone();
+    let changed = Arc::new(AtomicBool::new(false));
+    let changed_for_progress = Arc::clone(&changed);
+    let file_for_progress = file.clone();
+
+    let second = core::create_checkpoint(
+        &project,
+        "Fuzzy scan",
+        core::CreateCheckpointOptions {
+            progress: Some(Arc::new(move |progress| {
+                if progress.phase == "storeCheckpoint"
+                    && progress.completed == 0
+                    && !changed_for_progress.swap(true, Ordering::SeqCst)
+                {
+                    fs::write(&file_for_progress, "two").unwrap();
+                }
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let second_snapshot = core::load_snapshot(&repo, &second.checkpoint_id).unwrap();
+    let captured = second_snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path.as_str() == "Assets/Avatar/Foo.prefab")
+        .unwrap()
+        .content_hash();
+
+    assert_eq!(captured, &expected);
+    assert!(
+        core::diff_checkpoint(&project, second.checkpoint_id.as_str())
+            .unwrap()
+            .modified
+            .iter()
+            .any(|path| path == "Assets/Avatar/Foo.prefab")
+    );
+}
+
+#[test]
 fn full_verify_detects_same_size_object_tampering() {
     let (_guard, _temp, project, _data) = setup();
     let source = project.join("Assets/Avatar/Foo.prefab");
@@ -621,7 +721,7 @@ fn corrupt_checkpoint_display_names_do_not_block_checkpoint_list() {
 }
 
 #[test]
-fn list_checkpoints_propagates_unreadable_sqlite_index_for_current_project() {
+fn list_checkpoints_falls_back_when_sqlite_index_is_unreadable() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -631,9 +731,14 @@ fn list_checkpoints_propagates_unreadable_sqlite_index_for_current_project() {
     fs::remove_file(&db_path).unwrap();
     fs::create_dir_all(&db_path).unwrap();
 
-    let error = core::list_checkpoints(&project).unwrap_err();
+    let context = core::load_project(&project).unwrap();
+    let result = core::list_checkpoints_with_warnings_for_project(&context).unwrap();
 
-    assert!(matches!(error, core::CheckPoError::Io { .. }));
+    assert_eq!(result.checkpoints.len(), 1);
+    assert!(result
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("SQLite index was not used")));
 }
 
 #[test]
@@ -987,10 +1092,9 @@ fn tampered_snapshot_object_id_is_reported_without_panic() {
 
     let result = core::verify_project(&project, false).unwrap();
     assert!(!result.is_valid);
-    assert!(result
-        .errors
-        .iter()
-        .any(|error| error.contains("object id") || error.contains("short")));
+    assert!(result.errors.iter().any(|error| error.contains("object id")
+        || error.contains("short")
+        || error.contains("filename digest mismatch")));
 }
 
 #[test]
@@ -1021,15 +1125,13 @@ fn snapshot_validation_rejects_duplicate_paths_invalid_roots_and_times() {
         ],
         files: vec![entry.clone(), entry.clone()],
     };
-    let duplicate_id = core::save_snapshot(&repo, &duplicate).unwrap();
-    let duplicate_error = core::load_snapshot(&repo, &duplicate_id).unwrap_err();
+    let duplicate_error = core::save_snapshot(&repo, &duplicate).unwrap_err();
     assert!(duplicate_error.to_string().contains("duplicate"));
 
     let mut invalid_roots = duplicate;
     invalid_roots.files = vec![entry.clone()];
     invalid_roots.tracked_roots = vec!["Assets".to_string()];
-    let invalid_roots_id = core::save_snapshot(&repo, &invalid_roots).unwrap();
-    let invalid_roots_error = core::load_snapshot(&repo, &invalid_roots_id).unwrap_err();
+    let invalid_roots_error = core::save_snapshot(&repo, &invalid_roots).unwrap_err();
     assert!(invalid_roots_error.to_string().contains("tracked roots"));
 
     let mut invalid_time = invalid_roots;
@@ -1039,9 +1141,245 @@ fn snapshot_validation_rejects_duplicate_paths_invalid_roots_and_times() {
         "ProjectSettings".to_string(),
     ];
     invalid_time.files[0].modified_at_utc = "not-a-time".to_string();
-    let invalid_time_id = core::save_snapshot(&repo, &invalid_time).unwrap();
-    let invalid_time_error = core::load_snapshot(&repo, &invalid_time_id).unwrap_err();
+    let invalid_time_error = core::save_snapshot(&repo, &invalid_time).unwrap_err();
     assert!(invalid_time_error.to_string().contains("modifiedAtUtc"));
+}
+
+#[test]
+fn snapshot_load_accepts_noncanonical_raw_bytes_when_digest_and_v1_content_are_valid() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let original_path = repo
+        .join("snapshots")
+        .join(format!("{}.json", checkpoint.checkpoint_id));
+    let original = core::load_snapshot(&repo, &checkpoint.checkpoint_id).unwrap();
+    let mut noncanonical = fs::read(&original_path).unwrap();
+    noncanonical.push(b' ');
+    let noncanonical_id = core::snapshot_id_from_bytes(&noncanonical);
+    fs::write(
+        repo.join("snapshots")
+            .join(format!("{noncanonical_id}.json")),
+        noncanonical,
+    )
+    .unwrap();
+
+    let loaded = core::load_snapshot(&repo, &noncanonical_id).unwrap();
+
+    assert_eq!(loaded.name, "Initial");
+    assert_eq!(loaded.files.len(), original.files.len());
+    let verification = core::verify_checkpoint(&project, noncanonical_id.as_str(), false).unwrap();
+    assert!(verification.is_valid);
+    assert!(verification
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("canonical JSON output")));
+}
+
+#[test]
+fn snapshot_load_rejects_unknown_field_even_when_filename_digest_matches() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let original_path = repo
+        .join("snapshots")
+        .join(format!("{}.json", checkpoint.checkpoint_id));
+    let mut with_unknown = fs::read(&original_path).unwrap();
+    assert_eq!(with_unknown.pop(), Some(b'}'));
+    with_unknown.extend_from_slice(br#","unknownField":true}"#);
+    let unknown_id = core::snapshot_id_from_bytes(&with_unknown);
+    fs::write(
+        repo.join("snapshots").join(format!("{unknown_id}.json")),
+        with_unknown,
+    )
+    .unwrap();
+
+    let error = core::load_snapshot(&repo, &unknown_id).unwrap_err();
+
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn diff_and_restore_preview_use_the_requested_snapshot_when_latest_is_corrupt() {
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let first = core::create_checkpoint(&project, "First", Default::default()).unwrap();
+    fs::write(&file, "two").unwrap();
+    let latest = core::create_checkpoint(&project, "Latest", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let latest_path = repo
+        .join("snapshots")
+        .join(format!("{}.json", latest.checkpoint_id));
+    let mut corrupt = fs::read(&latest_path).unwrap();
+    corrupt.push(b' ');
+    fs::write(&latest_path, corrupt).unwrap();
+
+    let diff = core::diff_checkpoint(&project, first.checkpoint_id.as_str()).unwrap();
+    let plan = core::preview_restore(&project, first.checkpoint_id.as_str()).unwrap();
+
+    assert_eq!(diff.modified, vec!["Assets/Avatar/Foo.prefab"]);
+    assert_eq!(plan.replace_count, 1);
+    assert_eq!(plan.operations[0].path.as_str(), "Assets/Avatar/Foo.prefab");
+}
+
+#[test]
+fn checkpoint_falls_back_to_a_new_root_when_latest_snapshot_is_corrupt() {
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let first = core::create_checkpoint(&project, "First", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let first_path = repo
+        .join("snapshots")
+        .join(format!("{}.json", first.checkpoint_id));
+    let mut corrupt = fs::read(&first_path).unwrap();
+    corrupt.push(b' ');
+    fs::write(&first_path, corrupt).unwrap();
+    fs::write(&file, "two").unwrap();
+
+    let second = core::create_checkpoint(&project, "Second", Default::default()).unwrap();
+    let snapshot = core::load_snapshot(&repo, &second.checkpoint_id).unwrap();
+
+    assert!(snapshot.parent_snapshot_id.is_none());
+    assert_eq!(snapshot.files[0].content_hash(), &core::hash_bytes(b"two"));
+    assert!(second
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("new history root")));
+    assert!(first_path.is_file());
+    assert_eq!(
+        fs::read_to_string(repo.join("refs/latest")).unwrap(),
+        second.checkpoint_id.to_string()
+    );
+}
+
+#[test]
+fn checkpoint_falls_back_to_a_new_root_when_latest_ref_is_malformed() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "First", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    fs::write(repo.join("refs/latest"), "not-a-snapshot-id").unwrap();
+
+    let second = core::create_checkpoint(&project, "Second", Default::default()).unwrap();
+    let snapshot = core::load_snapshot(&repo, &second.checkpoint_id).unwrap();
+
+    assert!(snapshot.parent_snapshot_id.is_none());
+    assert!(second
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("refs/latest is malformed")));
+}
+
+#[test]
+fn checkpoint_falls_back_to_a_new_root_when_latest_snapshot_is_missing() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let first = core::create_checkpoint(&project, "First", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    fs::remove_file(
+        repo.join("snapshots")
+            .join(format!("{}.json", first.checkpoint_id)),
+    )
+    .unwrap();
+
+    let second = core::create_checkpoint(&project, "Second", Default::default()).unwrap();
+    let snapshot = core::load_snapshot(&repo, &second.checkpoint_id).unwrap();
+
+    assert!(snapshot.parent_snapshot_id.is_none());
+    assert!(second
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("snapshot not found")));
+}
+
+#[test]
+fn future_latest_snapshot_schema_blocks_checkpoint_creation() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let first = core::create_checkpoint(&project, "First", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let first_path = repo
+        .join("snapshots")
+        .join(format!("{}.json", first.checkpoint_id));
+    let future = fs::read_to_string(first_path)
+        .unwrap()
+        .replacen("\"schemaVersion\":1", "\"schemaVersion\":2", 1)
+        .into_bytes();
+    let future_id = core::snapshot_id_from_bytes(&future);
+    fs::write(
+        repo.join("snapshots").join(format!("{future_id}.json")),
+        future,
+    )
+    .unwrap();
+    fs::write(repo.join("refs/latest"), future_id.as_str()).unwrap();
+    let snapshot_count_before = fs::read_dir(repo.join("snapshots")).unwrap().count();
+
+    let error = core::create_checkpoint(&project, "Blocked", Default::default()).unwrap_err();
+
+    assert!(matches!(
+        error,
+        core::CheckPoError::UnsupportedFormat {
+            artifact,
+            found: 2,
+            supported: 1,
+        } if artifact == "snapshot schema"
+    ));
+    assert_eq!(
+        fs::read_to_string(repo.join("refs/latest")).unwrap(),
+        future_id.to_string()
+    );
+    assert_eq!(
+        fs::read_dir(repo.join("snapshots")).unwrap().count(),
+        snapshot_count_before
+    );
+}
+
+#[test]
+fn future_snapshot_schema_is_listed_as_a_warning_and_blocks_gc_deletion() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let first = core::create_checkpoint(&project, "First", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let first_path = repo
+        .join("snapshots")
+        .join(format!("{}.json", first.checkpoint_id));
+    let future = fs::read_to_string(first_path)
+        .unwrap()
+        .replacen("\"schemaVersion\":1", "\"schemaVersion\":2", 1)
+        .into_bytes();
+    let future_id = core::snapshot_id_from_bytes(&future);
+    fs::write(
+        repo.join("snapshots").join(format!("{future_id}.json")),
+        future,
+    )
+    .unwrap();
+
+    let context = core::load_project(&project).unwrap();
+    let listed = core::list_checkpoints_with_warnings_for_project(&context).unwrap();
+    assert_eq!(listed.checkpoints.len(), 1);
+    assert!(listed
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("unsupported snapshot schema version 2")));
+    let plan = core::analyze_gc(&project).unwrap();
+    assert!(plan.has_integrity_problems);
+    assert!(plan
+        .skipped_snapshots
+        .iter()
+        .any(|snapshot| snapshot.checkpoint_id == future_id));
+    assert!(core::apply_gc(&project).is_err());
 }
 
 #[test]
@@ -1216,6 +1554,40 @@ fn restore_restores_deleted_tracked_file_and_mtime() {
     assert_eq!(fs::read_to_string(&file).unwrap(), "one");
     let restored = fs::metadata(&file).unwrap().modified().unwrap();
     assert!(restored.duration_since(original_time).unwrap_or_default() < Duration::from_secs(2));
+}
+
+#[cfg(windows)]
+#[test]
+fn checkpoint_and_discard_support_windows_paths_longer_than_260_characters() {
+    let (_guard, _temp, project, _data) = setup();
+    let segment = "long-directory-segment-abcdefghijklmnopqrstuvwxyz0123456789";
+    let relative = format!("Assets/{segment}/{segment}/{segment}/{segment}/LongAsset.prefab");
+    let file = project.join(&relative);
+    assert!(file.as_os_str().to_string_lossy().encode_utf16().count() > 260);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "before").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "long-path", Default::default())
+        .unwrap()
+        .checkpoint_id;
+
+    fs::write(&file, "after").unwrap();
+    let plan = core::preview_discard_files(
+        &project,
+        std::slice::from_ref(&relative),
+        Some(checkpoint.as_str()),
+    )
+    .unwrap();
+    core::apply_discard_files_plan(
+        &project,
+        std::slice::from_ref(&relative),
+        Some(checkpoint.as_str()),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read_to_string(file).unwrap(), "before");
 }
 
 #[test]
@@ -1679,6 +2051,58 @@ fn recovery_rejects_unknown_journal_schema_without_touching_project() {
 }
 
 #[test]
+fn future_journal_with_unknown_state_is_never_treated_as_unreadable_or_deleted() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "keep").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let transaction_id = "2".repeat(32);
+    let tx = repo_path(&view).join("journals").join(&transaction_id);
+    fs::create_dir_all(tx.join("backup")).unwrap();
+    fs::create_dir_all(tx.join("staged")).unwrap();
+    fs::write(
+        tx.join("journal.json"),
+        br#"{"schemaVersion":2,"state":"pausedByNewClient"}"#,
+    )
+    .unwrap();
+
+    let pending = core::pending_transactions(&project).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].transaction_id, transaction_id);
+    assert_eq!(pending[0].state, "unsupportedSchema:2");
+
+    let recovery = core::recover_transactions(&project).unwrap();
+    assert_eq!(recovery.recovered_transaction_count, 0);
+    assert_eq!(recovery.failed_transaction_count, 1);
+    assert!(recovery.failed_transactions[0]
+        .error
+        .contains("transaction journal schema"));
+    assert!(tx.exists());
+
+    let cleanup = core::cleanup_journals(&project, core::ApplyOptions { yes: true }).unwrap_err();
+    assert!(matches!(
+        cleanup,
+        core::CheckPoError::UnsupportedFormat { found: 2, .. }
+    ));
+    assert!(tx.exists());
+    assert_eq!(
+        fs::read_to_string(project.join("Assets/Avatar/Foo.prefab")).unwrap(),
+        "keep"
+    );
+
+    let quarantined =
+        core::quarantine_transaction(&project, &transaction_id, core::ApplyOptions { yes: true })
+            .unwrap();
+    assert!(quarantined.quarantine_path.join("journal.json").is_file());
+    assert!(!tx.exists());
+    assert_eq!(
+        core::unresolved_transaction_quarantines(&project)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn recovery_rejects_journal_transaction_id_mismatch_without_touching_project() {
     let (_guard, _temp, project, _data) = setup();
     let file = project.join("Assets/Avatar/Foo.prefab");
@@ -1744,7 +2168,9 @@ fn recovery_does_not_restore_untracked_backup_path() {
     .unwrap();
 
     let result = core::recover_transactions(&project).unwrap();
-    assert_eq!(result.recovered_transaction_count, 1);
+    assert_eq!(result.recovered_transaction_count, 0);
+    assert_eq!(result.failed_transaction_count, 1);
+    assert!(tx.exists());
     assert_eq!(
         fs::read_to_string(project.join("README.md")).unwrap(),
         "keep"
@@ -2133,7 +2559,7 @@ fn copied_project_blocks_mutating_operations_until_decided() {
 
 #[cfg(unix)]
 #[test]
-fn stale_repository_lock_is_removed_when_pid_is_not_running() {
+fn stale_repository_lock_metadata_does_not_block_or_get_modified_by_an_os_lock() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -2147,11 +2573,15 @@ fn stale_repository_lock_is_removed_when_pid_is_not_running() {
 
     core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
 
-    assert!(!lock.exists());
+    let metadata = fs::read_to_string(lock).unwrap();
+    assert_eq!(
+        metadata,
+        "operation=test\npid=99999999\ncreatedAtUtc=2026-01-01T00:00:00Z\n"
+    );
 }
 
 #[test]
-fn fresh_malformed_repository_lock_is_not_reclaimed() {
+fn malformed_repository_lock_metadata_is_ignored_without_being_modified() {
     let (_guard, _temp, project, _data) = setup();
     let view = init_project_for_test(&project).unwrap();
     let repo = repo_path(&view);
@@ -2159,14 +2589,13 @@ fn fresh_malformed_repository_lock_is_not_reclaimed() {
     fs::write(&lock, "not a valid lock").unwrap();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
 
-    let error = core::create_checkpoint(&project, "Initial", Default::default()).unwrap_err();
+    core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
 
-    assert!(matches!(error, core::CheckPoError::RepositoryLocked(_)));
-    assert!(lock.exists());
+    assert_eq!(fs::read_to_string(lock).unwrap(), "not a valid lock");
 }
 
 #[test]
-fn malformed_repository_lock_older_than_grace_period_is_reclaimed() {
+fn old_malformed_repository_lock_metadata_is_ignored_without_age_heuristics() {
     let (_guard, _temp, project, _data) = setup();
     let view = init_project_for_test(&project).unwrap();
     let repo = repo_path(&view);
@@ -2181,5 +2610,5 @@ fn malformed_repository_lock_older_than_grace_period_is_reclaimed() {
 
     core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
 
-    assert!(!lock.exists());
+    assert_eq!(fs::read_to_string(lock).unwrap(), "not a valid lock");
 }

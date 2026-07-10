@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) use crate::project::ensure_project_parent_is_safe;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BackupCopyMode {
     Copy,
@@ -61,7 +63,7 @@ pub(super) fn backup_project_file(
 ) -> Result<()> {
     ensure_project_parent_is_safe(project, &operation.path)?;
     if let Some(parent) = backup_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| crate::io_error(parent, error))?;
+        create_dir_all_durable(parent, &project.repo_root)?;
     }
     let expected_hash = required_before_hash(operation)?;
     backup_project_file_inner(
@@ -124,6 +126,7 @@ fn backup_project_file_inner(
         .open(backup_path)
         .and_then(|file| file.sync_all())
         .map_err(|error| crate::io_error(backup_path, error))?;
+    crate::sync_parent_dir(backup_path)?;
     finish_created_backup(operation, source, backup_path, expected_hash)?;
     ensure_project_parent_is_safe(project, &operation.path)
 }
@@ -160,19 +163,14 @@ fn finish_created_backup(
         return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
     }
     fs::remove_file(&quarantine_path).map_err(|error| crate::io_error(&quarantine_path, error))?;
-    crate::sync_parent_dir(backup_path)?;
     crate::sync_parent_dir(source)
 }
 
 fn temporary_project_backup_path(source: &Path) -> Result<PathBuf> {
-    let file_name = source.file_name().ok_or_else(|| {
+    source.file_name().ok_or_else(|| {
         CheckPoError::InvalidTrackedPath(format!("invalid path: {}", source.display()))
     })?;
-    Ok(source.with_file_name(format!(
-        ".checkpo-{}-{}.tmp",
-        file_name.to_string_lossy(),
-        Uuid::new_v4().simple()
-    )))
+    Ok(source.with_file_name(format!(".checkpo-{}.tmp", Uuid::new_v4().simple())))
 }
 
 fn restore_quarantined_project_file(source: &Path, quarantine_path: &Path) -> Result<()> {
@@ -217,7 +215,9 @@ pub(super) fn restore_backup_file_to_project(
         required_before_hash(operation)?,
     )?;
     filetime::set_file_mtime(destination, FileTime::from_system_time(modified))
-        .map_err(|error| crate::io_error(destination, error))
+        .map_err(|error| crate::io_error(destination, error))?;
+    sync_project_file(destination)?;
+    crate::sync_parent_dir(destination)
 }
 
 fn restore_file_to_project(
@@ -229,13 +229,8 @@ fn restore_file_to_project(
 ) -> Result<()> {
     ensure_project_parent_for_write(project, path)?;
     verify_path_hash(source, expected_hash)?;
-    match move_file_no_replace(source, destination) {
-        Ok(()) => {
-            crate::sync_parent_dir(destination)?;
-            crate::sync_parent_dir(source)
-        }
-        Err(error) => Err(map_destination_exists_to_working_tree_changed(error, path)),
-    }
+    move_file_no_replace(source, destination)
+        .map_err(|error| map_destination_exists_to_working_tree_changed(error, path))
 }
 
 pub(super) fn map_destination_exists_to_working_tree_changed(
@@ -267,31 +262,45 @@ fn ensure_project_parent_for_write(
     ensure_project_parent_is_safe(project, path)?;
     let destination = path.to_project_path(project.project_root.as_path());
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|error| crate::io_error(parent, error))?;
+        create_dir_all_durable(parent, project.project_root.as_path())?;
     }
     ensure_project_parent_is_safe(project, path)
 }
 
-pub(super) fn ensure_project_parent_is_safe(
-    project: &ProjectContext,
-    path: &TrackedUnityFilePath,
-) -> Result<()> {
-    let mut current = project.project_root.as_path().to_path_buf();
-    let segments = path.as_str().split('/').collect::<Vec<_>>();
-    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
-        current.push(segment);
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+fn create_dir_all_durable(directory: &Path, stop_at: &Path) -> Result<()> {
+    let relative = directory.strip_prefix(stop_at).map_err(|_| {
+        CheckPoError::Unexpected(format!(
+            "cannot create durable directory outside {}: {}",
+            stop_at.display(),
+            directory.display()
+        ))
+    })?;
+    let mut current = stop_at.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => continue,
+            Ok(_) => {
+                return Err(CheckPoError::InvalidTrackedPath(format!(
+                    "unsafe directory component: {}",
+                    current.display()
+                )))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => match fs::create_dir(&current) {
+                Ok(()) => crate::sync_parent_dir(&current)?,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&current)
+                        .map_err(|error| crate::io_error(&current, error))?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(CheckPoError::InvalidTrackedPath(format!(
+                            "unsafe directory component: {}",
+                            current.display()
+                        )));
+                    }
+                }
+                Err(error) => return Err(crate::io_error(&current, error)),
+            },
             Err(error) => return Err(crate::io_error(&current, error)),
-        };
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() || !file_type.is_dir() {
-            return Err(CheckPoError::InvalidTrackedPath(format!(
-                "{} contains unsafe parent component: {}",
-                path,
-                current.display()
-            )));
         }
     }
     Ok(())
@@ -358,5 +367,14 @@ pub(super) fn restore_mtime(path: &Path, modified_at_utc: Option<&str>) -> Resul
         .map_err(|error| CheckPoError::Unexpected(error.to_string()))?
         .with_timezone(&chrono::Utc);
     filetime::set_file_mtime(path, FileTime::from_system_time(time.into()))
+        .map_err(|error| crate::io_error(path, error))
+}
+
+pub(super) fn sync_project_file(path: &Path) -> Result<()> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
         .map_err(|error| crate::io_error(path, error))
 }

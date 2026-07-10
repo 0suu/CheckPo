@@ -77,6 +77,135 @@ fn recovery_after_fault_immediately_after_applying_journal_keeps_original_file()
 }
 
 #[test]
+fn corrupt_snapshot_transaction_can_be_quarantined_without_deleting_payload() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+    let checkpoint_id = plan.checkpoint_id.clone();
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+
+    fs::write(
+        crate::snapshot_path(&context.repo_root, &checkpoint_id),
+        b"corrupt",
+    )
+    .unwrap();
+    let recovery = crate::recover_transactions(&project).unwrap();
+    assert_eq!(recovery.failed_transaction_count, 1);
+    let pending = crate::pending_transactions(&project).unwrap();
+    assert_eq!(pending.len(), 1);
+
+    let denied = crate::quarantine_transaction(
+        &project,
+        &pending[0].transaction_id,
+        ApplyOptions { yes: false },
+    )
+    .unwrap_err();
+    assert!(matches!(denied, CheckPoError::User(_)));
+
+    let result = crate::quarantine_transaction(
+        &project,
+        &pending[0].transaction_id,
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert!(result.quarantine_path.is_dir());
+    assert!(result.quarantine_path.join("journal.json").is_file());
+    assert!(result.quarantine_path.join("staged").is_dir());
+    assert!(crate::pending_transactions(&project).unwrap().is_empty());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+}
+
+#[test]
+fn unverified_quarantine_blocks_mutation_until_full_restore_succeeds() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+    let checkpoint_id = plan.checkpoint_id.clone();
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileBackedUp {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    assert!(!file.exists());
+
+    let pending = crate::pending_transactions(&project).unwrap();
+    assert_eq!(pending.len(), 1);
+    crate::quarantine_transaction(
+        &project,
+        &pending[0].transaction_id,
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    let unresolved = crate::unresolved_transaction_quarantines(&project).unwrap();
+    assert_eq!(unresolved.len(), 1);
+    let blocked = crate::create_checkpoint(
+        &project,
+        "must be blocked",
+        CreateCheckpointOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        blocked,
+        CheckPoError::UnresolvedTransactionQuarantine(_)
+    ));
+
+    let record_path = fs::read_dir(context.repo_root.join("quarantined-journals"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .unwrap();
+    fs::write(&record_path, "corrupt quarantine record").unwrap();
+    assert_eq!(
+        crate::unresolved_transaction_quarantines(&project)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let restore_plan = crate::preview_restore(&project, checkpoint_id.as_str()).unwrap();
+    crate::apply_restore_plan(
+        &project,
+        checkpoint_id.as_str(),
+        restore_plan,
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read_to_string(&file).unwrap(), "one");
+    assert!(crate::unresolved_transaction_quarantines(&project)
+        .unwrap()
+        .is_empty());
+    crate::create_checkpoint(&project, "unblocked", CreateCheckpointOptions::default()).unwrap();
+}
+
+#[test]
 fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
     let (_guard, _temp, project, _view) = setup_project();
     let file = project.join("Assets/Avatar/Foo.prefab");
@@ -110,6 +239,119 @@ fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
         FileTime::from_last_modification_time(&fs::metadata(&file).unwrap()),
         original_mtime
     );
+}
+
+#[test]
+fn recovery_rolls_back_when_staged_journal_has_a_durable_backup() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileBackedUp {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    let journal_path = pending_transactions_for_project(&context).unwrap()[0]
+        .journal_path
+        .clone();
+    let mut journal: TransactionJournal = crate::read_json(&journal_path).unwrap();
+    journal.state = JournalState::Staged;
+    write_journal(&journal_path, &journal).unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert_eq!(fs::read_to_string(file).unwrap(), "two");
+}
+
+#[test]
+fn recovery_rejects_journal_operation_tampering_before_project_mutation() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    let journal_path = pending_transactions_for_project(&context).unwrap()[0]
+        .journal_path
+        .clone();
+    let mut journal: TransactionJournal = crate::read_json(&journal_path).unwrap();
+    journal.operations[0].operation_type = FileOperationType::Delete;
+    write_journal(&journal_path, &journal).unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 0);
+    assert_eq!(recovered.failed_transaction_count, 1);
+    assert_eq!(fs::read_to_string(file).unwrap(), "two");
+    assert!(journal_path.exists());
+}
+
+#[test]
+fn recovery_rolls_back_staged_restore_when_staged_file_was_moved() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Initial", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::remove_file(&file).unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "one");
+    let journal_path = pending_transactions_for_project(&context).unwrap()[0]
+        .journal_path
+        .clone();
+    let mut journal: TransactionJournal = crate::read_json(&journal_path).unwrap();
+    journal.state = JournalState::Staged;
+    write_journal(&journal_path, &journal).unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert!(!file.exists());
 }
 
 #[test]

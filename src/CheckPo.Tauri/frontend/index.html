@@ -90,6 +90,13 @@
             <button class="button danger-secondary" id="recoverTransactionsButton" type="button" data-i18n="recoverTransactions">Recover</button>
           </section>
 
+          <section class="quarantine-banner" id="unresolvedQuarantineBanner" hidden>
+            <div>
+              <strong data-i18n="unresolvedQuarantineTitle">プロジェクトの状態を確認できません</strong>
+              <span id="unresolvedQuarantineText"></span>
+            </div>
+          </section>
+
           <section class="project-warning-banner" id="projectWarningBanner" hidden>
             <div>
               <strong data-i18n="projectWarningTitle">Project path warning</strong>
@@ -248,7 +255,10 @@
           <article class="log-panel">
             <div class="section-heading compact">
               <h3 data-i18n="operationLog">Operation log</h3>
-              <button class="ghost-button" id="clearLogButton" type="button" data-i18n="clear">Clear</button>
+              <span>
+                <button class="ghost-button" id="openDiagnosticLogsButton" type="button">診断ログフォルダ</button>
+                <button class="ghost-button" id="clearLogButton" type="button" data-i18n="clear">Clear</button>
+              </span>
             </div>
             <ol class="log-list" id="logList"></ol>
           </article>

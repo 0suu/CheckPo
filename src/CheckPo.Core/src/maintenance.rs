@@ -25,6 +25,7 @@ pub fn apply_gc(project_path: impl AsRef<Path>) -> Result<StorageGcResult> {
     crate::ensure_project_location_allows_mutation(&project)?;
     let _lock = acquire_repository_lock(&project.repo_root, "storage-gc")?;
     ensure_no_pending_transactions(&project)?;
+    crate::ensure_no_unresolved_transaction_quarantines(&project)?;
     let plan = analyze_gc_for_project(&project)?;
     if plan.has_integrity_problems {
         return Err(crate::user_error(
@@ -73,12 +74,13 @@ pub fn cleanup_orphan_temp_files(
     crate::ensure_project_location_allows_mutation(&project)?;
     let _lock = acquire_repository_lock(&project.repo_root, "temporary-file-cleanup")?;
     ensure_no_pending_transactions(&project)?;
+    crate::ensure_no_unresolved_transaction_quarantines(&project)?;
     let plan = analyze_orphan_temp_files_for_project(&project)?;
     let mut deleted_file_count = 0_usize;
     let mut deleted_bytes = 0_u64;
     let mut warnings = Vec::new();
     for file in &plan.files {
-        ensure_project_parent_is_safe(&project, &file.path)?;
+        crate::project::ensure_project_parent_is_safe(&project, &file.path)?;
         let path = file.path.to_project_path(project.project_root.as_path());
         match fs::symlink_metadata(&path) {
             Ok(metadata)
@@ -177,31 +179,6 @@ fn analyze_orphan_temp_files_for_project(
         files,
         warnings,
     })
-}
-
-fn ensure_project_parent_is_safe(
-    project: &crate::ProjectContext,
-    path: &TrackedUnityFilePath,
-) -> Result<()> {
-    let mut current = project.project_root.as_path().to_path_buf();
-    let segments = path.as_str().split('/').collect::<Vec<_>>();
-    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
-        current.push(segment);
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(io_error(&current, error)),
-        };
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() || !file_type.is_dir() {
-            return Err(CheckPoError::InvalidTrackedPath(format!(
-                "{} contains unsafe parent component: {}",
-                path,
-                current.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn analyze_gc_for_project(project: &crate::ProjectContext) -> Result<StorageGcPlan> {

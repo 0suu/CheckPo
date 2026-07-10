@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 use atomic_io::replace_file;
 pub(crate) use atomic_io::{
-    copy_file_no_replace, move_file_no_replace, reflink_or_copy_file_no_replace, write_text_atomic,
-    CopySourceDisposition,
+    copy_file_no_replace, move_file_no_replace, reflink_or_copy_file_no_replace, sync_parent_chain,
+    write_json_atomic_new, write_text_atomic, CopySourceDisposition,
 };
 pub use atomic_io::{read_json, sync_parent_dir, write_bytes_atomic, write_json_atomic};
 pub use db_file::{db_path, open_db};
@@ -43,3 +43,4 @@ pub use snapshot_store::{
     canonical_snapshot_bytes, list_snapshot_ids, load_project_snapshot, load_snapshot,
     read_latest_snapshot_id, save_snapshot, snapshot_id_from_bytes, write_latest_snapshot_id,
 };
+pub(crate) use snapshot_store::{load_project_snapshot_with_warnings, load_snapshot_with_warnings};

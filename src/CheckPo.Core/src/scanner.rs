@@ -1,9 +1,10 @@
 use crate::{
     canonical_utc, hash_file, is_checkpo_temporary_file, relative_path_from_project,
     report_operation_progress, CancellationToken, CheckPoError, OperationProgress, Result,
-    ScanWarning, ScannedFile, TrackedUnityFilePath,
+    ScanWarning, ScannedFile, SnapshotEntry, SnapshotFile, TrackedUnityFilePath,
 };
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -31,14 +32,34 @@ pub fn scan_project_for_checkpoint(
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
+    // Callers that can prove a snapshot is an appropriate cache baseline pass it
+    // explicitly. With no baseline every source file is hashed, so an unrelated
+    // or unreadable refs/latest can never affect a scan.
+    scan_project_for_checkpoint_with_baseline(project, None, progress, cancellation)
+}
+
+pub(crate) fn scan_project_for_checkpoint_with_baseline(
+    project: &crate::ProjectContext,
+    baseline: Option<&SnapshotFile>,
+    progress: Option<&dyn Fn(OperationProgress)>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
     let cached = if platform_fingerprint_is_strong_enough_for_hash_reuse() {
         crate::load_file_fingerprints(project).unwrap_or_default()
     } else {
         Default::default()
     };
+    let baseline_files = baseline.map(|snapshot| {
+        snapshot
+            .files
+            .iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<BTreeMap<_, _>>()
+    });
     scan_project_internal(
         project.project_root.as_path(),
         Some(&cached),
+        baseline_files.as_ref(),
         progress,
         cancellation,
     )
@@ -68,38 +89,74 @@ pub(crate) fn format_scan_warning(warning: &ScanWarning) -> String {
 fn scan_project_internal(
     project_root: &Path,
     cached: Option<&std::collections::BTreeMap<TrackedUnityFilePath, crate::CachedFileFingerprint>>,
+    baseline: Option<&BTreeMap<TrackedUnityFilePath, &SnapshotEntry>>,
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
     let (files, mut warnings, mut incomplete) = collect_project_files(project_root, cancellation)?;
-    let mut valid_files = Vec::with_capacity(files.len());
-    for mut file in files {
-        let metadata = match fs::metadata(&file.full_path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
+    // Windows needs an opened handle for the strong file id/change-time
+    // fingerprint. Doing that serially made large Unity projects spend minutes
+    // in handle opens even when no content needed hashing, so assess independent
+    // files in parallel while keeping the same cache acceptance conditions.
+    let assessed = files
+        .into_par_iter()
+        .map(
+            |mut file| -> Result<(Option<PendingScannedFile>, Option<ScanWarning>)> {
+                crate::ensure_not_cancelled(cancellation)?;
+                let metadata = match fs::metadata(&file.full_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let relative_path = file.path.to_string();
+                        return Ok((
+                            None,
+                            Some(ScanWarning {
+                                relative_path,
+                                reason: format!("file metadata could not be read: {error}"),
+                            }),
+                        ));
+                    }
+                };
+                let fingerprint_warning = match file_fingerprint(&file.full_path, &metadata) {
+                    Ok(fingerprint) => {
+                        file.fingerprint = fingerprint;
+                        None
+                    }
+                    Err(error) => Some(ScanWarning {
+                        relative_path: file.path.to_string(),
+                        reason: format!("file fingerprint could not be read: {error}"),
+                    }),
+                };
+                file.hash = match (
+                    cached.and_then(|records| records.get(&file.path)),
+                    baseline.and_then(|entries| entries.get(&file.path)),
+                ) {
+                    (Some(record), Some(entry))
+                        if Some(record.fingerprint.as_str()) == file.fingerprint.as_deref()
+                            && record.size_bytes == file.size_bytes
+                            && entry.size_bytes == file.size_bytes
+                            && entry.content_size_bytes() == file.size_bytes
+                            && entry.content_hash() == &record.object_id
+                            && entry.modified_at_utc == file.modified_at_utc =>
+                    {
+                        Some(record.object_id.clone())
+                    }
+                    _ => None,
+                };
+                Ok((Some(file), fingerprint_warning))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let mut valid_files = Vec::with_capacity(assessed.len());
+    for (file, warning) in assessed {
+        if let Some(warning) = warning {
+            if file.is_none() {
                 incomplete = true;
-                warnings.push(ScanWarning {
-                    relative_path: file.path.to_string(),
-                    reason: format!("file metadata could not be read: {error}"),
-                });
-                continue;
             }
-        };
-        match file_fingerprint(&file.full_path, &metadata) {
-            Ok(fingerprint) => file.fingerprint = fingerprint,
-            Err(error) => warnings.push(ScanWarning {
-                relative_path: file.path.to_string(),
-                reason: format!("file fingerprint could not be read: {error}"),
-            }),
+            warnings.push(warning);
         }
-        file.hash = cached
-            .and_then(|records| records.get(&file.path))
-            .filter(|record| {
-                Some(record.fingerprint.as_str()) == file.fingerprint.as_deref()
-                    && record.size_bytes == file.size_bytes
-            })
-            .map(|record| record.object_id.clone());
-        valid_files.push(file);
+        if let Some(file) = file {
+            valid_files.push(file);
+        }
     }
     let mut files = valid_files;
     let total = files.len();
@@ -379,4 +436,108 @@ pub(crate) fn file_fingerprint(path: &Path, metadata: &fs::Metadata) -> Result<O
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn file_fingerprint(_path: &Path, _metadata: &fs::Metadata) -> Result<Option<String>> {
     Ok(None)
+}
+
+#[cfg(all(test, windows))]
+mod windows_benchmarks {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "requires CHECKPO_BENCH_PROJECT"]
+    fn strong_fingerprint_parallel_benchmark() {
+        let project = std::env::var_os("CHECKPO_BENCH_PROJECT")
+            .map(std::path::PathBuf::from)
+            .expect("CHECKPO_BENCH_PROJECT is required");
+        let enumerate_started = Instant::now();
+        let (files, warnings, incomplete) = collect_project_files(&project, None).unwrap();
+        let enumerate_elapsed = enumerate_started.elapsed();
+        assert!(!incomplete, "scan warnings: {warnings:?}");
+
+        let fingerprint_started = Instant::now();
+        let fingerprints = files
+            .par_iter()
+            .map(|file| {
+                let metadata = fs::metadata(&file.full_path)
+                    .map_err(|error| crate::io_error(&file.full_path, error))?;
+                file_fingerprint(&file.full_path, &metadata)
+            })
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let fingerprint_elapsed = fingerprint_started.elapsed();
+        assert_eq!(fingerprints.len(), files.len());
+        println!(
+            "files={} enumerate_ms={:.1} fingerprint_ms={:.1}",
+            files.len(),
+            enumerate_elapsed.as_secs_f64() * 1000.0,
+            fingerprint_elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CHECKPO_BENCH_PROJECT and CHECKPO_BENCH_REPO"]
+    fn cached_checkpoint_scan_benchmark() {
+        let project = std::env::var_os("CHECKPO_BENCH_PROJECT")
+            .map(std::path::PathBuf::from)
+            .expect("CHECKPO_BENCH_PROJECT is required");
+        let repo = std::env::var_os("CHECKPO_BENCH_REPO")
+            .map(std::path::PathBuf::from)
+            .expect("CHECKPO_BENCH_REPO is required");
+        let project_id = crate::ProjectId::parse(
+            repo.file_name()
+                .and_then(|value| value.to_str())
+                .expect("repo directory must be the project id"),
+        )
+        .unwrap();
+        let storage_root = repo
+            .parent()
+            .and_then(|repos| repos.parent())
+            .expect("repo must be under <storage>/repos")
+            .to_path_buf();
+        let context = crate::ProjectContext {
+            project_id,
+            project_root: crate::ProjectRoot::new(project),
+            storage_root: crate::StorageRoot::new(storage_root),
+            repo_root: repo,
+            location_status: crate::ProjectLocationStatus::Current,
+            warnings: Vec::new(),
+        };
+        let latest = crate::read_latest_snapshot_id(&context.repo_root)
+            .unwrap()
+            .expect("latest snapshot is required");
+        let baseline = crate::load_project_snapshot(&context, &latest).unwrap();
+
+        let started = Instant::now();
+        let (files, warnings, incomplete) =
+            scan_project_for_checkpoint_with_baseline(&context, Some(&baseline), None, None)
+                .unwrap();
+        let elapsed = started.elapsed();
+        assert!(!incomplete, "scan warnings: {warnings:?}");
+        let object_check_started = Instant::now();
+        let mut unique_objects = std::collections::BTreeMap::new();
+        for file in &baseline.files {
+            unique_objects.insert(file.content_hash().clone(), file.content_size_bytes());
+        }
+        let checked_objects = unique_objects
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(object_id, size_bytes)| {
+                let path = crate::object_path(&context.repo_root, &object_id);
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert!(metadata.is_file());
+                assert_eq!(metadata.len(), size_bytes);
+                object_id
+            })
+            .collect::<Vec<_>>();
+        let object_check_elapsed = object_check_started.elapsed();
+        println!(
+            "files={} warnings={} cached_scan_ms={:.1} unique_objects={} object_check_ms={:.1}",
+            files.len(),
+            warnings.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            checked_objects.len(),
+            object_check_elapsed.as_secs_f64() * 1000.0
+        );
+    }
 }

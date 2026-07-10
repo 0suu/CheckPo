@@ -583,6 +583,7 @@ p {
 
 .update-banner,
 .pending-banner,
+.quarantine-banner,
 .project-warning-banner {
   display: flex;
   align-items: center;
@@ -600,12 +601,17 @@ p {
   background: var(--warning-soft);
 }
 
+.quarantine-banner {
+  background: var(--danger-soft);
+}
+
 .project-warning-banner {
   background: var(--warning-soft);
 }
 
 .update-banner div,
 .pending-banner div,
+.quarantine-banner div,
 .project-warning-banner div {
   display: grid;
   gap: 2px;
@@ -622,6 +628,11 @@ p {
   font-size: 13px;
 }
 
+.quarantine-banner strong {
+  color: var(--danger);
+  font-size: 13px;
+}
+
 .project-warning-banner strong {
   color: var(--warning);
   font-size: 13px;
@@ -629,6 +640,7 @@ p {
 
 .update-banner span,
 .pending-banner span,
+.quarantine-banner span,
 .project-warning-banner span {
   color: var(--muted);
   font-size: 12px;
@@ -2446,6 +2458,7 @@ input[type="text"] {
 
 .update-banner,
 .pending-banner,
+.quarantine-banner,
 .project-warning-banner {
   min-height: 44px;
 }
@@ -2744,6 +2757,7 @@ input[type="text"] {
   .rollback-confirm,
   .toolbar-actions,
   .update-banner,
+  .quarantine-banner,
   .project-warning-banner {
     align-items: stretch;
     flex-direction: column;

@@ -175,8 +175,18 @@ enum StorageGcCommand {
 
 #[derive(Debug, Subcommand)]
 enum TransactionsCommand {
-    List { project_path: PathBuf },
-    Recover { project_path: PathBuf },
+    List {
+        project_path: PathBuf,
+    },
+    Recover {
+        project_path: PathBuf,
+    },
+    Quarantine {
+        project_path: PathBuf,
+        transaction_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -205,9 +215,17 @@ enum TempFilesCommand {
 }
 
 fn main() -> ExitCode {
+    let _diagnostics = match core::init_diagnostics() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("Warning: diagnostic logging is unavailable: {error}");
+            None
+        }
+    };
     match run() {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
+            core::log_operation_error("cli", &error);
             eprintln!("{error}");
             ExitCode::from(1)
         }
@@ -238,12 +256,20 @@ fn run() -> Result<u8, String> {
             let project = core::project_view(&context).map_err(to_message)?;
             let pending_transactions =
                 core::pending_transactions_for_project(&context).map_err(to_message)?;
+            let unresolved_quarantines =
+                core::unresolved_transaction_quarantines_for_project(&context)
+                    .map_err(to_message)?;
             let mut warnings = Vec::new();
-            let checkpoints = match core::list_checkpoints_for_project(&context) {
-                Ok(checkpoints) => checkpoints,
+            let checkpoints = match core::list_checkpoints_with_warnings_for_project(&context) {
+                Ok(result) => {
+                    warnings.extend(result.warnings);
+                    result.checkpoints
+                }
                 Err(error)
                     if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                        || !pending_transactions.is_empty() =>
+                        || !pending_transactions.is_empty()
+                        || !unresolved_quarantines.is_empty()
+                        || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
                 {
                     warnings.push(format!("Failed to load checkpoints: {error}"));
                     Vec::new()
@@ -254,7 +280,8 @@ fn run() -> Result<u8, String> {
                 Ok(storage) => Some(storage),
                 Err(error)
                     if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                        || !pending_transactions.is_empty() =>
+                        || !pending_transactions.is_empty()
+                        || !unresolved_quarantines.is_empty() =>
                 {
                     warnings.push(format!("Failed to load storage summary: {error}"));
                     None
@@ -265,6 +292,8 @@ fn run() -> Result<u8, String> {
                 "project": project,
                 "checkpoints": checkpoints,
                 "storage": storage,
+                "pendingTransactions": pending_transactions,
+                "unresolvedQuarantines": unresolved_quarantines,
                 "warnings": warnings
             });
             print_or_json(cli.json, &value, || {
@@ -276,6 +305,12 @@ fn run() -> Result<u8, String> {
                 }
                 for warning in &warnings {
                     println!("Warning: {warning}");
+                }
+                for quarantine in &unresolved_quarantines {
+                    println!(
+                        "Warning: unresolved quarantined transaction {}. Restore a known good checkpoint before making changes.",
+                        quarantine.transaction_id
+                    );
                 }
             })?;
         }
@@ -516,6 +551,29 @@ fn run() -> Result<u8, String> {
                 })?;
                 return Ok(if ok { 0 } else { 1 });
             }
+            TransactionsCommand::Quarantine {
+                project_path,
+                transaction_id,
+                yes,
+            } => {
+                if !yes {
+                    return Err("transaction quarantine requires --yes.".to_string());
+                }
+                let result = core::quarantine_transaction(
+                    project_path,
+                    &transaction_id,
+                    core::ApplyOptions { yes },
+                )
+                .map_err(to_message)?;
+                print_or_json(cli.json, &result, || {
+                    println!("Quarantined transaction: {}", result.transaction_id);
+                    println!("Preserved at: {}", result.quarantine_path.display());
+                    println!("Preserved bytes: {}", result.preserved_bytes);
+                    for warning in &result.warnings {
+                        println!("Warning: {warning}");
+                    }
+                })?;
+            }
         },
         Command::Maintenance { command } => match command {
             MaintenanceCommand::CleanupJournals { project_path, yes } => {
@@ -671,6 +729,33 @@ mod tests {
         else {
             panic!("expected cleanup-journals command");
         };
+        assert!(yes);
+    }
+
+    #[test]
+    fn transaction_quarantine_accepts_id_and_explicit_confirmation() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "transactions",
+            "quarantine",
+            "project",
+            "0123456789abcdef0123456789abcdef",
+            "--yes",
+        ])
+        .unwrap();
+
+        let Command::Transactions {
+            command:
+                TransactionsCommand::Quarantine {
+                    transaction_id,
+                    yes,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected transaction quarantine command");
+        };
+        assert_eq!(transaction_id, "0123456789abcdef0123456789abcdef");
         assert!(yes);
     }
 }

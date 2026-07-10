@@ -96,6 +96,7 @@ const messages = {
     anotherOperationInProgress: "別の処理中です。完了してからもう一度実行してください。",
     starting: "開始中",
     pendingTransactionTitle: "中断された作業があります",
+    unresolvedQuarantineTitle: "プロジェクトの状態を確認できません",
     recoverTransactions: "復旧する",
     pendingTransactionsMessage: "{count} 件の中断された書き戻しがあります。復旧してください。{details}",
     recoveryFailed: "復旧に失敗した transaction があります（成功 {recovered} / 失敗 {failed}）{detail}",

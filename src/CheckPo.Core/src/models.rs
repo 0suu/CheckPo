@@ -282,6 +282,13 @@ impl OperationPlan {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointListResult {
+    pub checkpoints: Vec<CheckpointSummary>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationPlanKind {
@@ -434,6 +441,24 @@ pub struct TransactionRecoveryFailure {
 pub struct TransactionCleanupResult {
     pub deleted_directory_count: usize,
     pub deleted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionQuarantineResult {
+    pub transaction_id: String,
+    pub quarantine_path: PathBuf,
+    pub preserved_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnresolvedTransactionQuarantine {
+    pub transaction_id: String,
+    pub quarantined_at_utc: Option<String>,
+    pub quarantine_path: PathBuf,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

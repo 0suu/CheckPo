@@ -57,6 +57,12 @@ impl TrackedUnityFilePath {
                     "segments ending with space or dot are not allowed",
                 ));
             }
+            if segment.chars().any(is_windows_forbidden_character) {
+                return Err(invalid_path(
+                    input,
+                    "Windows-forbidden characters are not allowed",
+                ));
+            }
             if is_windows_reserved_name(segment) {
                 return Err(invalid_path(
                     input,
@@ -303,19 +309,26 @@ fn invalid_path(input: &str, reason: &str) -> CheckPoError {
 fn is_windows_reserved_name(segment: &str) -> bool {
     let stem = segment.split('.').next().unwrap_or(segment);
     let upper = stem.to_ascii_uppercase();
-    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || upper
-            .strip_prefix("COM")
-            .and_then(single_reserved_digit)
-            .is_some()
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || upper
+        .strip_prefix("COM")
+        .is_some_and(is_reserved_device_digit)
         || upper
             .strip_prefix("LPT")
-            .and_then(single_reserved_digit)
-            .is_some()
+            .is_some_and(is_reserved_device_digit)
 }
 
-fn single_reserved_digit(value: &str) -> Option<()> {
-    (value.len() == 1 && value.as_bytes()[0].is_ascii_digit() && value != "0").then_some(())
+fn is_reserved_device_digit(value: &str) -> bool {
+    matches!(
+        value,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+    )
+}
+
+fn is_windows_forbidden_character(value: char) -> bool {
+    value <= '\u{1f}' || matches!(value, '<' | '>' | '"' | '|' | '?' | '*')
 }
 
 #[cfg(test)]
@@ -330,9 +343,30 @@ mod tests {
             "Assets/Aux.asset",
             "Assets/COM1.prefab",
             "Assets/LPT9.meta",
+            "Assets/COM¹.prefab",
+            "Assets/com².asset",
+            "Assets/LPT³.meta",
+            "Assets/CONIN$",
+            "Assets/conout$.txt",
             "ProjectSettings/NUL",
         ] {
             assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_windows_forbidden_characters_and_controls() {
+        for path in [
+            "Assets/Foo<Bar.prefab",
+            "Assets/Foo>Bar.prefab",
+            "Assets/Foo\"Bar.prefab",
+            "Assets/Foo|Bar.prefab",
+            "Assets/Foo?Bar.prefab",
+            "Assets/Foo*Bar.prefab",
+            "Assets/Foo\u{0}Bar.prefab",
+            "Assets/Foo\u{1f}Bar.prefab",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path:?}");
         }
     }
 

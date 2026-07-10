@@ -74,8 +74,10 @@ pub fn set_project_storage_root(
             warnings: Vec::new(),
         };
         crate::ensure_no_pending_transactions(&old_context)?;
+        crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
     }
     crate::ensure_no_pending_transactions(&context)?;
+    crate::ensure_no_unresolved_transaction_quarantines(&context)?;
     update_registry_locked(
         &registry_lock,
         registry,

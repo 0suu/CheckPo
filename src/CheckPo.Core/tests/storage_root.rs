@@ -1,5 +1,5 @@
 use checkpo_core as core;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn setup() -> (
@@ -23,6 +23,33 @@ fn setup() -> (
     )
     .unwrap();
     (guard, temp, project, data)
+}
+
+#[cfg(windows)]
+fn hold_os_lock(path: &std::path::Path) -> File {
+    use std::os::windows::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn hold_os_lock(path: &std::path::Path) -> File {
+    use std::os::fd::AsRawFd;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+    file
 }
 
 #[test]
@@ -61,14 +88,7 @@ fn set_project_storage_root_locks_old_repository_when_copy_exists() {
     copy_dir(&old_repo, &new_repo);
     let lock_dir = old_repo.join("locks");
     fs::create_dir_all(&lock_dir).unwrap();
-    fs::write(
-        lock_dir.join("repository.lock"),
-        format!(
-            "operation=test-lock\npid={}\ntoken=held\ncreatedAtUtc=2026-01-01T00:00:00Z\n",
-            std::process::id()
-        ),
-    )
-    .unwrap();
+    let _held_lock = hold_os_lock(&lock_dir.join("repository.lock"));
 
     let error = core::set_project_storage_root(&project, &new_storage).unwrap_err();
 
