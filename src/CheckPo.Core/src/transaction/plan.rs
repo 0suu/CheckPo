@@ -28,7 +28,7 @@ pub fn build_plan_with_progress_and_cancellation(
     let mut warnings = Vec::new();
     match kind {
         OperationPlanKind::Restore => {
-            let (working, scan_warnings) =
+            let (working, scan_warnings, _) =
                 crate::scan_project_for_checkpoint(project, progress, cancellation)?;
             warnings.extend(
                 scan_warnings

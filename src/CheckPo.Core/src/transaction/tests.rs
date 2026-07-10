@@ -82,6 +82,8 @@ fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
     let file = project.join("Assets/Avatar/Foo.prefab");
     fs::write(&file, "one").unwrap();
     let (context, plan) = replace_plan(&project);
+    let original_mtime = FileTime::from_unix_time(1_600_000_000, 123_000_000);
+    filetime::set_file_mtime(&file, original_mtime).unwrap();
 
     let error = apply_plan_inner(
         &context,
@@ -104,6 +106,10 @@ fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
     assert_eq!(recovered.recovered_transaction_count, 1);
     assert_eq!(recovered.failed_transaction_count, 0);
     assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+    assert_eq!(
+        FileTime::from_last_modification_time(&fs::metadata(&file).unwrap()),
+        original_mtime
+    );
 }
 
 #[test]
@@ -256,33 +262,36 @@ fn apply_rejects_corrupt_snapshot_object_during_staging_without_touching_project
 }
 
 #[test]
-fn hardlink_backup_rechecks_quarantine_before_deleting_original() {
+fn backup_is_an_independent_copy_of_the_project_file() {
+    use std::io::{Seek, SeekFrom, Write};
+
     let (_guard, _temp, project, view) = setup_project();
     let file = project.join("Assets/Avatar/Foo.prefab");
     fs::write(&file, "one").unwrap();
-    let (_context, plan) = replace_plan(&project);
+    let (context, plan) = replace_plan(&project);
     let operation = plan.operations.first().unwrap();
     let backup = view
         .storage_root_path
         .join("repos")
         .join(view.project_id)
-        .join("journals/hardlink/backup/Assets/Avatar/Foo.prefab");
+        .join("journals/copy/backup/Assets/Avatar/Foo.prefab");
     fs::create_dir_all(backup.parent().unwrap()).unwrap();
-    fs::hard_link(&file, &backup).unwrap();
-    fs::remove_file(&file).unwrap();
-    fs::write(&file, "mutated").unwrap();
+    let mut open_handle = fs::OpenOptions::new().write(true).open(&file).unwrap();
 
-    let error = finish_linked_backup(
+    backup_project_file_by_copy(
+        &context,
         operation,
         &file,
         &backup,
         required_before_hash(operation).unwrap(),
     )
-    .unwrap_err();
+    .unwrap();
+    open_handle.seek(SeekFrom::Start(0)).unwrap();
+    open_handle.write_all(b"mutated").unwrap();
+    open_handle.flush().unwrap();
 
-    assert!(matches!(error, CheckPoError::WorkingTreeChanged(_)));
-    assert_eq!(fs::read_to_string(&file).unwrap(), "mutated");
-    assert!(!backup.exists());
+    assert_eq!(fs::read_to_string(&backup).unwrap(), "two");
+    assert!(!file.exists());
     assert!(fs::read_dir(file.parent().unwrap())
         .unwrap()
         .all(|entry| !entry

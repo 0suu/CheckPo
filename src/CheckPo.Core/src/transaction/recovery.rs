@@ -42,6 +42,7 @@ fn recover_one(project: &ProjectContext, pending: &PendingTransaction) -> Result
         return recover_missing_journal(tx_root, &pending.journal_path);
     }
     let mut journal: TransactionJournal = crate::read_json(&pending.journal_path)?;
+    validate_transaction_journal_identity(tx_root, &journal)?;
     let backup_root = tx_root.join("backup");
 
     if journal.state == JournalState::Applying {

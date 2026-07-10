@@ -436,11 +436,25 @@ async function refreshLatestDiff(options = {}) {
       setStatus(`高速確認で一部確認できませんでした:\n${diff.warnings.join("\n")}`);
     }
   } catch (error) {
+    clearCurrentDiff();
     if (!options.silent) setStatus(errorText(error));
   } finally {
     state.autoRefreshInFlight = false;
     updateAutoRefreshStatus();
   }
+}
+
+function clearCurrentDiff() {
+  state.currentDiff = null;
+  state.rollbackPlan = null;
+  state.currentDiffSelectedPaths.clear();
+  state.lastSelectedChangePath = null;
+  $("diffSummary").textContent = t("diffEmpty");
+  $("diffGroups").replaceChildren();
+  $("pendingFileCount").textContent = `0${t("fileUnit")}`;
+  updateFilterChips(0, 0, 0);
+  updateSelectedDiffButton();
+  updateControls();
 }
 
 function scheduleFocusRefresh() {
@@ -456,8 +470,20 @@ function queueFocusRefresh() {
 }
 
 function renderSnapshot(snapshot) {
-  state.projectPath = snapshot.projectPath || snapshot.project?.projectRootPath || state.projectPath;
-  state.project = snapshot.project || state.project;
+  const nextProjectPath = snapshot.projectPath || snapshot.project?.projectRootPath || state.projectPath;
+  const nextProject = snapshot.project
+    || (nextProjectPath === state.projectPath ? state.project : null);
+  if (CheckPoFrontendState.projectChanged(
+    state.projectPath,
+    state.project,
+    nextProjectPath,
+    nextProject,
+  )) {
+    Object.assign(state, CheckPoFrontendState.projectScopedStateReset());
+    clearCurrentDiff();
+  }
+  state.projectPath = nextProjectPath;
+  state.project = nextProject;
   state.projectLocationStatus = state.project?.locationStatus || "current";
   state.checkpoints = sortCheckpoints(snapshot.checkpoints || []);
   state.storage = snapshot.storage || null;
@@ -966,7 +992,7 @@ function renderStartedProject(snapshot, successMessage) {
       setStatus("初回チェックポイントを作成しました。");
     }
   } else if (snapshot.initialCheckpointError) {
-    setStatus(`プロジェクトは開始しましたが、初回チェックポイント作成に失敗しました: ${snapshot.initialCheckpointError}`);
+    setStatus(`プロジェクトは開始しましたが、初回チェックポイント作成に失敗しました: ${errorText(snapshot.initialCheckpointError)}`);
   } else if (snapshot.initialCheckpointCancelled) {
     setStatus("初回チェックポイントの作成を中止しました。");
   } else if (successMessage) {
@@ -976,6 +1002,8 @@ function renderStartedProject(snapshot, successMessage) {
 
 async function runExactDiff() {
   await run(t("runDiff"), async () => {
+    clearCurrentDiff();
+    $("diffSummary").textContent = t("diffLoading");
     renderDiff(await invokeCommand("diff_checkpoint_full", {
       projectPath: getProjectPath(),
       checkpointId: latestCheckpointId() || getCheckpointId(),
@@ -1580,8 +1608,24 @@ function bindEvents() {
     });
   });
   $("applyCleanupButton").addEventListener("click", async () => {
+    state.confirming = true;
+    updateControls();
+    let confirmed = false;
+    try {
+      confirmed = await confirmAction(
+        "完了・復旧済み transaction の journal と backup を削除します。削除後は参照できません。続行しますか？",
+        "削除",
+      );
+    } finally {
+      state.confirming = false;
+      updateControls();
+    }
+    if (!confirmed) return;
     await run("片付け中", async () => {
-      const result = await invokeCommand("cleanup_journals", { projectPath: getProjectPath() });
+      const result = await invokeCommand("cleanup_journals", {
+        projectPath: getProjectPath(),
+        confirmed: true,
+      });
       $("cleanupResult").textContent = `削除 ${result.deletedDirectoryCount ?? 0} 件`;
     });
   });

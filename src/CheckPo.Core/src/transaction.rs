@@ -33,8 +33,8 @@ pub use journal::{
     pending_transactions_for_project,
 };
 use journal::{
-    directory_is_empty_or_missing, journals_dir, write_journal, JournalState, TransactionJournal,
-    JOURNAL_STATE_UNREADABLE,
+    directory_is_empty_or_missing, journals_dir, validate_transaction_journal_identity,
+    write_journal, JournalState, TransactionJournal, JOURNAL_STATE_UNREADABLE,
 };
 pub use plan::build_plan_with_progress_and_cancellation;
 use plan::validate_expected_plan;

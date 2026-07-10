@@ -30,7 +30,7 @@ pub fn scan_project_for_checkpoint(
     project: &crate::ProjectContext,
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
-) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>)> {
+) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
     let cached = if platform_fingerprint_is_strong_enough_for_hash_reuse() {
         crate::load_file_fingerprints(project).unwrap_or_default()
     } else {
@@ -47,7 +47,7 @@ pub fn scan_project_for_checkpoint(
 pub(crate) fn scan_project_metadata(
     project_root: &Path,
 ) -> Result<(Vec<ScannedMetadataFile>, Vec<ScanWarning>)> {
-    let (files, warnings) = collect_project_files(project_root, None)?;
+    let (files, warnings, _) = collect_project_files(project_root, None)?;
     Ok((
         files
             .into_iter()
@@ -70,12 +70,14 @@ fn scan_project_internal(
     cached: Option<&std::collections::BTreeMap<TrackedUnityFilePath, crate::CachedFileFingerprint>>,
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
-) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>)> {
-    let (mut files, mut warnings) = collect_project_files(project_root, cancellation)?;
-    for file in &mut files {
+) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
+    let (files, mut warnings, mut incomplete) = collect_project_files(project_root, cancellation)?;
+    let mut valid_files = Vec::with_capacity(files.len());
+    for mut file in files {
         let metadata = match fs::metadata(&file.full_path) {
             Ok(metadata) => metadata,
             Err(error) => {
+                incomplete = true;
                 warnings.push(ScanWarning {
                     relative_path: file.path.to_string(),
                     reason: format!("file metadata could not be read: {error}"),
@@ -97,7 +99,9 @@ fn scan_project_internal(
                     && record.size_bytes == file.size_bytes
             })
             .map(|record| record.object_id.clone());
+        valid_files.push(file);
     }
+    let mut files = valid_files;
     let total = files.len();
     let mut completed = 0_usize;
     for chunk in files.chunks_mut(PARALLEL_HASH_CHUNK_SIZE) {
@@ -121,6 +125,9 @@ fn scan_project_internal(
                 }
             })
             .collect::<Result<Vec<_>>>()?;
+        if chunk_warnings.iter().any(Option::is_some) {
+            incomplete = true;
+        }
         warnings.extend(chunk_warnings.into_iter().flatten());
         completed += chunk.len();
         report_operation_progress(
@@ -157,15 +164,16 @@ fn scan_project_internal(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((files, warnings))
+    Ok((files, warnings, incomplete))
 }
 
 fn collect_project_files(
     project_root: &Path,
     cancellation: Option<&CancellationToken>,
-) -> Result<(Vec<PendingScannedFile>, Vec<ScanWarning>)> {
+) -> Result<(Vec<PendingScannedFile>, Vec<ScanWarning>, bool)> {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
+    let mut incomplete = false;
     for root in ["Assets", "Packages", "ProjectSettings"] {
         crate::ensure_not_cancelled(cancellation)?;
         let root_path = project_root.join(root);
@@ -173,6 +181,7 @@ fn collect_project_files(
             continue;
         }
         if !root_path.is_dir() {
+            incomplete = true;
             warnings.push(ScanWarning {
                 relative_path: root.to_string(),
                 reason: "tracked root is not a directory".to_string(),
@@ -184,6 +193,7 @@ fn collect_project_files(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
+                    incomplete = true;
                     warnings.push(ScanWarning {
                         relative_path: root.to_string(),
                         reason: error.to_string(),
@@ -201,6 +211,7 @@ fn collect_project_files(
             let relative = match relative_path_from_project(project_root, &full_path) {
                 Ok(relative) => relative,
                 Err(error) => {
+                    incomplete = true;
                     warnings.push(ScanWarning {
                         relative_path: full_path.display().to_string(),
                         reason: error.to_string(),
@@ -218,6 +229,7 @@ fn collect_project_files(
             let path = match TrackedUnityFilePath::parse(&relative) {
                 Ok(path) => path,
                 Err(error) => {
+                    incomplete = true;
                     warnings.push(ScanWarning {
                         relative_path: relative,
                         reason: error.to_string(),
@@ -228,6 +240,7 @@ fn collect_project_files(
             let leaf_metadata = match fs::symlink_metadata(&full_path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
+                    incomplete = true;
                     warnings.push(ScanWarning {
                         relative_path: path.to_string(),
                         reason: error.to_string(),
@@ -236,6 +249,7 @@ fn collect_project_files(
                 }
             };
             if leaf_metadata.file_type().is_symlink() {
+                incomplete = true;
                 warnings.push(ScanWarning {
                     relative_path: path.to_string(),
                     reason: "symlink files are not supported".to_string(),
@@ -245,6 +259,7 @@ fn collect_project_files(
             let metadata = match fs::metadata(&full_path) {
                 Ok(metadata) => metadata,
                 Err(error) => {
+                    incomplete = true;
                     warnings.push(ScanWarning {
                         relative_path: path.to_string(),
                         reason: error.to_string(),
@@ -258,6 +273,7 @@ fn collect_project_files(
             let modified = match metadata.modified() {
                 Ok(modified) => modified,
                 Err(error) => {
+                    incomplete = true;
                     warnings.push(ScanWarning {
                         relative_path: path.to_string(),
                         reason: error.to_string(),
@@ -284,7 +300,7 @@ fn collect_project_files(
             project_root.display().to_string(),
         ));
     }
-    Ok((files, warnings))
+    Ok((files, warnings, incomplete))
 }
 
 #[cfg(unix)]

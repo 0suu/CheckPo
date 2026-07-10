@@ -62,7 +62,7 @@ snapshot id と object id は BLAKE3 の 64 文字 lowercase hex です。snapsh
 
 ```bash
 checkpo init <project-path> [--json]
-checkpo init <project-path> --start-as-separate [--json]
+checkpo init <project-path> --start-as-separate --yes [--json]
 checkpo status <project-path> [--json]
 
 checkpo checkpoint create <project-path> --name <name> [--init-if-needed] [--json]
@@ -85,7 +85,7 @@ checkpo storage gc apply <project-path> --yes [--json]
 checkpo storage set-root <project-path> --storage-root <path> --yes [--json]
 checkpo transactions list <project-path> [--json]
 checkpo transactions recover <project-path> [--json]
-checkpo maintenance cleanup-journals <project-path> [--json]
+checkpo maintenance cleanup-journals <project-path> --yes [--json]
 checkpo maintenance temp-files analyze <project-path> [--json]
 checkpo maintenance temp-files cleanup <project-path> --yes [--json]
 ```

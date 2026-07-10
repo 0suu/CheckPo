@@ -36,7 +36,6 @@ function renderChangeGroups(groups) {
   container.replaceChildren();
   const allChanges = groups.flatMap(([, paths, type]) => paths.map((path) => ({ path, type })));
   const allChangePathSet = new Set(allChanges.map((change) => change.path));
-  const pathToIndex = new Map(allChanges.map((change, index) => [change.path, index]));
   const changes = state.currentDiffFilter === "all"
     ? allChanges
     : allChanges.filter((change) => change.type === state.currentDiffFilter);
@@ -66,17 +65,17 @@ function renderChangeGroups(groups) {
   if (!state.diffTreeTouched && state.diffTreeOpenPaths.size === 0) {
     collectFolderPaths(root).forEach((path) => state.diffTreeOpenPaths.add(path));
   }
-  const renderContext = { allChanges, pathToIndex, groups };
+  const renderContext = { groups };
   for (const folder of [...root.children.values()].sort(compareTreeNode)) {
     renderFolderNode(container, folder, 0, renderContext);
   }
   for (const file of root.files.sort(compareTreeFile)) {
-    container.append(changeFileRow(file, allChanges, pathToIndex.get(file.path) ?? -1, renderContext, 0));
+    container.append(changeFileRow(file, renderContext, 0));
   }
   updateControls();
 }
 
-function changeFileRow(change, changes, index, renderContext, depth = 0) {
+function changeFileRow(change, renderContext, depth = 0) {
   const row = document.createElement("div");
   row.className = `tree-row file ${change.type === "deleted" ? "is-deleted" : ""}`;
   row.dataset.path = change.path;
@@ -103,7 +102,7 @@ function changeFileRow(change, changes, index, renderContext, depth = 0) {
   });
   row.append(mark, label, meta, action);
   const select = (event) => {
-    selectChangeFile(change.path, changes, index, event);
+    selectChangeFile(change.path, event);
     renderChangeGroups(renderContext.groups);
   };
   row.addEventListener("click", select);
@@ -114,28 +113,19 @@ function changeFileRow(change, changes, index, renderContext, depth = 0) {
   return row;
 }
 
-function selectChangeFile(path, changes, index, event) {
-  const selected = new Set(state.currentDiffSelectedPaths);
-  if (event.shiftKey && state.lastSelectedChangePath) {
-    const anchorIndex = changes.findIndex((change) => change.path === state.lastSelectedChangePath);
-    if (anchorIndex >= 0) {
-      const start = Math.min(anchorIndex, index);
-      const end = Math.max(anchorIndex, index);
-      for (const change of changes.slice(start, end + 1)) selected.add(change.path);
-      state.currentDiffSelectedPaths = selected;
-      updateSelectedDiffButton();
-      return;
-    }
-  }
-  if (event.metaKey || event.ctrlKey) {
-    if (selected.has(path)) selected.delete(path);
-    else selected.add(path);
-  } else {
-    selected.clear();
-    selected.add(path);
-  }
-  state.currentDiffSelectedPaths = selected;
-  state.lastSelectedChangePath = path;
+function selectChangeFile(path, event) {
+  const visiblePaths = [...$("diffGroups").querySelectorAll(".tree-row.file")]
+    .map((row) => row.dataset.path);
+  const result = CheckPoFrontendState.selectChangePaths({
+    selectedPaths: state.currentDiffSelectedPaths,
+    anchorPath: state.lastSelectedChangePath,
+    targetPath: path,
+    visiblePaths,
+    shiftKey: event.shiftKey,
+    toggleKey: event.metaKey || event.ctrlKey,
+  });
+  state.currentDiffSelectedPaths = result.selectedPaths;
+  state.lastSelectedChangePath = result.anchorPath;
   updateSelectedDiffButton();
 }
 
@@ -273,8 +263,6 @@ function renderFolderNode(container, sourceNode, depth, renderContext) {
   for (const file of node.files.sort(compareTreeFile)) {
     children.append(changeFileRow(
       file,
-      renderContext.allChanges,
-      renderContext.pathToIndex.get(file.path) ?? -1,
       renderContext,
       depth + 1,
     ));

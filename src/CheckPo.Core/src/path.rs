@@ -265,20 +265,7 @@ pub fn relative_path_from_project(project_root: &Path, full_path: &Path) -> Resu
 }
 
 pub(crate) fn is_checkpo_temporary_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    if is_checkpo_owned_temporary_file_name(name) {
-        return true;
-    }
-    if !name.starts_with('.') || !name.ends_with(".tmp") {
-        return false;
-    }
-    let body = &name[1..name.len() - ".tmp".len()];
-    let Some((_, suffix)) = body.rsplit_once('.') else {
-        return false;
-    };
-    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    is_checkpo_owned_temporary_file(path)
 }
 
 pub(crate) fn is_checkpo_owned_temporary_file(path: &Path) -> bool {
@@ -288,7 +275,25 @@ pub(crate) fn is_checkpo_owned_temporary_file(path: &Path) -> bool {
 }
 
 fn is_checkpo_owned_temporary_file_name(name: &str) -> bool {
-    name.starts_with(".checkpo-") && name.ends_with(".tmp")
+    if !name.starts_with('.') || !name.ends_with(".tmp") {
+        return false;
+    }
+    let body = &name[1..name.len() - ".tmp".len()];
+    if let Some(body) = body.strip_prefix("checkpo-") {
+        return has_generated_suffix(body, '-');
+    }
+    has_generated_suffix(body, '.')
+}
+
+fn has_generated_suffix(body: &str, separator: char) -> bool {
+    let Some((prefix, suffix)) = body.rsplit_once(separator) else {
+        return false;
+    };
+    !prefix.is_empty()
+        && suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn invalid_path(input: &str, reason: &str) -> CheckPoError {

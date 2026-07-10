@@ -57,27 +57,9 @@ pub(super) fn backup_project_file(
         fs::create_dir_all(parent).map_err(|error| crate::io_error(parent, error))?;
     }
     let expected_hash = required_before_hash(operation)?;
-    match fs::hard_link(source, backup_path) {
-        Ok(()) => finish_linked_backup(operation, source, backup_path, expected_hash),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            Err(crate::io_error(backup_path, error))
-        }
-        Err(_) => {
-            backup_project_file_by_copy(project, operation, source, backup_path, expected_hash)
-        }
-    }
-    .map_err(|error| {
-        map_destination_exists_to_working_tree_changed(error, operation.path.to_string())
-    })
-}
-
-pub(super) fn finish_linked_backup(
-    operation: &FileOperation,
-    source: &Path,
-    backup_path: &Path,
-    expected_hash: &ObjectId,
-) -> Result<()> {
-    finish_created_backup(operation, source, backup_path, expected_hash)
+    backup_project_file_by_copy(project, operation, source, backup_path, expected_hash).map_err(
+        |error| map_destination_exists_to_working_tree_changed(error, operation.path.to_string()),
+    )
 }
 
 pub(super) fn backup_project_file_by_copy(
@@ -87,7 +69,12 @@ pub(super) fn backup_project_file_by_copy(
     backup_path: &Path,
     expected_hash: &ObjectId,
 ) -> Result<()> {
+    let modified = fs::metadata(source)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| crate::io_error(source, error))?;
     crate::copy_file_no_replace(source, backup_path, crate::CopySourceDisposition::Keep)?;
+    filetime::set_file_mtime(backup_path, FileTime::from_system_time(modified))
+        .map_err(|error| crate::io_error(backup_path, error))?;
     finish_created_backup(operation, source, backup_path, expected_hash)?;
     ensure_project_parent_is_safe(project, &operation.path)
 }
@@ -156,13 +143,18 @@ pub(super) fn restore_backup_file_to_project(
     backup_path: &Path,
     destination: &Path,
 ) -> Result<()> {
+    let modified = fs::metadata(backup_path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| crate::io_error(backup_path, error))?;
     restore_file_to_project(
         project,
         &operation.path,
         backup_path,
         destination,
         required_before_hash(operation)?,
-    )
+    )?;
+    filetime::set_file_mtime(destination, FileTime::from_system_time(modified))
+        .map_err(|error| crate::io_error(destination, error))
 }
 
 fn restore_file_to_project(

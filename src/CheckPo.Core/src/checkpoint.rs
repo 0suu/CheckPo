@@ -31,8 +31,18 @@ pub fn create_checkpoint(
     ensure_no_pending_transactions(&project)?;
     crate::ensure_not_cancelled(options.cancellation.as_ref())?;
     let progress = options.progress.as_deref().map(|f| f as &dyn Fn(_));
-    let (scanned, scan_warnings) =
+    let (scanned, scan_warnings, incomplete) =
         scan_project_for_checkpoint(&project, progress, options.cancellation.as_ref())?;
+    if incomplete {
+        return Err(crate::user_error(format!(
+            "checkpoint was not created because some tracked files could not be read: {}",
+            scan_warnings
+                .iter()
+                .map(crate::scanner::format_scan_warning)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
     report_operation_progress(progress, "storeCheckpoint", 0, scanned.len(), None);
     let mut newly_stored_bytes = 0_u64;
     let mut files = Vec::with_capacity(scanned.len());

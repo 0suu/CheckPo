@@ -27,19 +27,38 @@ pub fn init_project_with_storage_root(
     )
 }
 
-pub fn start_as_separate_project(project_path: impl AsRef<Path>) -> Result<ProjectView> {
+pub fn start_as_separate_project(
+    project_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
+) -> Result<ProjectView> {
+    require_start_as_separate_confirmation(project_path.as_ref(), options)?;
     init_project_internal(project_path.as_ref(), InitMode::ForceNewProject, None)
 }
 
 pub fn start_as_separate_project_with_storage_root(
     project_path: impl AsRef<Path>,
     storage_root_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
 ) -> Result<ProjectView> {
+    require_start_as_separate_confirmation(project_path.as_ref(), options)?;
     init_project_internal(
         project_path.as_ref(),
         InitMode::ForceNewProject,
         Some(storage_root_path.as_ref()),
     )
+}
+
+fn require_start_as_separate_confirmation(
+    project_path: &Path,
+    options: crate::ApplyOptions,
+) -> Result<()> {
+    if !options.yes {
+        return Err(crate::user_error(
+            "starting as a separate project requires --yes.",
+        ));
+    }
+    normalize_existing_dir(project_path)?;
+    Ok(())
 }
 
 pub fn load_project(project_path: impl AsRef<Path>) -> Result<ProjectContext> {
@@ -217,15 +236,46 @@ fn init_project_internal(
     let project_root = normalize_existing_dir(project_path)?;
     validate_unity_project_root(&project_root)?;
     let marker_path = marker_path(&project_root);
+    let existing_marker = if marker_path.is_file() {
+        Some(load_project_marker(&marker_path)?)
+    } else {
+        None
+    };
     let marker = if mode == InitMode::ForceNewProject {
         new_project_marker()
-    } else if marker_path.is_file() {
-        load_project_marker(&marker_path)?
+    } else if let Some(existing_marker) = existing_marker.as_ref() {
+        existing_marker.clone()
     } else {
         new_project_marker()
     };
     let registry_lock = acquire_registry_lock()?;
     let registry = load_registry()?;
+    if mode == InitMode::ForceNewProject {
+        let existing_marker = load_project_marker(&marker_path).map_err(|error| match error {
+            CheckPoError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+                crate::user_error(
+                    "starting as a separate project requires an existing CheckPo marker.",
+                )
+            }
+            error => error,
+        })?;
+        let entry = registry
+            .projects
+            .get(existing_marker.project_id.as_str())
+            .ok_or_else(|| {
+                CheckPoError::InvalidProject(
+                    "Storage registry entry was not found for this project. Run init again."
+                        .to_string(),
+                )
+            })?;
+        let (status, _) =
+            project_location_status_and_warnings(&project_root, &existing_marker.project_id, entry);
+        if status != ProjectLocationStatus::CopiedSuspected {
+            return Err(crate::user_error(
+                "starting as a separate project is only allowed for a copied project.",
+            ));
+        }
+    }
     if mode == InitMode::Normal
         && registered_project_root_conflict(
             &project_root,

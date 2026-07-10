@@ -21,6 +21,8 @@ enum Command {
         project_path: PathBuf,
         #[arg(long)]
         start_as_separate: bool,
+        #[arg(long)]
+        yes: bool,
     },
     Status {
         project_path: PathBuf,
@@ -181,6 +183,8 @@ enum TransactionsCommand {
 enum MaintenanceCommand {
     CleanupJournals {
         project_path: PathBuf,
+        #[arg(long)]
+        yes: bool,
     },
     TempFiles {
         #[command(subcommand)]
@@ -216,9 +220,10 @@ fn run() -> Result<u8, String> {
         Command::Init {
             project_path,
             start_as_separate,
+            yes,
         } => {
             let value = if start_as_separate {
-                core::start_as_separate_project(project_path)
+                core::start_as_separate_project(project_path, core::ApplyOptions { yes })
             } else {
                 core::init_project(project_path)
             }
@@ -513,8 +518,9 @@ fn run() -> Result<u8, String> {
             }
         },
         Command::Maintenance { command } => match command {
-            MaintenanceCommand::CleanupJournals { project_path } => {
-                let result = core::cleanup_journals(project_path).map_err(to_message)?;
+            MaintenanceCommand::CleanupJournals { project_path, yes } => {
+                let result = core::cleanup_journals(project_path, core::ApplyOptions { yes })
+                    .map_err(to_message)?;
                 print_or_json(cli.json, &result, || {
                     println!("Deleted journals: {}", result.deleted_directory_count);
                     println!("Deleted bytes: {}", result.deleted_bytes);
@@ -624,4 +630,47 @@ fn read_operation_plan(path: &PathBuf) -> Result<core::OperationPlan, String> {
 
 fn to_message(error: core::CheckPoError) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_start_as_separate_accepts_explicit_confirmation() {
+        let cli =
+            Cli::try_parse_from(["checkpo", "init", "project", "--start-as-separate", "--yes"])
+                .unwrap();
+
+        let Command::Init {
+            start_as_separate,
+            yes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert!(start_as_separate);
+        assert!(yes);
+    }
+
+    #[test]
+    fn cleanup_journals_accepts_explicit_confirmation() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "maintenance",
+            "cleanup-journals",
+            "project",
+            "--yes",
+        ])
+        .unwrap();
+
+        let Command::Maintenance {
+            command: MaintenanceCommand::CleanupJournals { yes, .. },
+        } = cli.command
+        else {
+            panic!("expected cleanup-journals command");
+        };
+        assert!(yes);
+    }
 }

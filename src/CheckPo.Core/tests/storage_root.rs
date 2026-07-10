@@ -139,14 +139,58 @@ fn init_project_uses_custom_storage_root_for_new_project() {
 
 #[test]
 fn start_as_separate_project_uses_custom_storage_root() {
-    let (_guard, _temp, project, data) = setup();
+    let (_guard, temp, project, data) = setup();
+    let original = core::init_project(&project).unwrap();
+    let copied = temp.path().join("UnityProjectCopy");
+    copy_dir(&project, &copied);
+    assert_eq!(
+        core::load_project_view(&copied).unwrap().location_status,
+        core::ProjectLocationStatus::CopiedSuspected
+    );
     let custom_storage = data.join("separate-store");
 
-    let view =
-        core::start_as_separate_project_with_storage_root(&project, &custom_storage).unwrap();
+    let view = core::start_as_separate_project_with_storage_root(
+        &copied,
+        &custom_storage,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
 
+    assert_ne!(view.project_id, original.project_id);
     assert_eq!(view.storage_root_path, custom_storage);
     assert!(custom_storage.join("repos").join(&view.project_id).is_dir());
+}
+
+#[test]
+fn start_as_separate_requires_copied_project_and_confirmation_without_side_effects() {
+    let (_guard, temp, project, _data) = setup();
+    let original = core::init_project(&project).unwrap();
+    let original_marker = fs::read(project.join(".checkpo/project.json")).unwrap();
+
+    let error =
+        core::start_as_separate_project(&project, core::ApplyOptions { yes: true }).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("only allowed for a copied project"));
+    assert_eq!(
+        fs::read(project.join(".checkpo/project.json")).unwrap(),
+        original_marker
+    );
+
+    let copied = temp.path().join("UnityProjectCopy");
+    copy_dir(&project, &copied);
+    let copied_marker = fs::read(copied.join(".checkpo/project.json")).unwrap();
+    let error =
+        core::start_as_separate_project(&copied, core::ApplyOptions { yes: false }).unwrap_err();
+    assert!(error.to_string().contains("requires --yes"));
+    assert_eq!(
+        fs::read(copied.join(".checkpo/project.json")).unwrap(),
+        copied_marker
+    );
+    assert_eq!(
+        core::load_project_view(&copied).unwrap().project_id,
+        original.project_id
+    );
 }
 
 #[test]

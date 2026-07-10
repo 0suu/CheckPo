@@ -1,4 +1,7 @@
 use super::*;
+use std::time::{Duration, SystemTime};
+
+const MALFORMED_LOCK_GRACE_PERIOD: Duration = Duration::from_secs(60);
 
 pub struct FileLock {
     path: PathBuf,
@@ -142,7 +145,13 @@ fn stale_lock_text(path: &Path) -> Result<Option<String>> {
         line.strip_prefix("pid=")
             .and_then(|value| value.trim().parse::<u32>().ok())
     }) else {
-        return Ok(Some(text));
+        let modified = fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|error| io_error(path, error))?;
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or(Duration::ZERO);
+        return Ok((age >= MALFORMED_LOCK_GRACE_PERIOD).then_some(text));
     };
     Ok((!process_is_running(pid)).then_some(text))
 }

@@ -132,10 +132,15 @@ async fn start_as_separate_project(
             .as_deref()
             .filter(|path| !path.trim().is_empty())
         {
-            Some(storage_root_path) => {
-                core::start_as_separate_project_with_storage_root(&project_path, storage_root_path)
-            }
-            None => core::start_as_separate_project(&project_path),
+            Some(storage_root_path) => core::start_as_separate_project_with_storage_root(
+                &project_path,
+                storage_root_path,
+                core::ApplyOptions { yes: confirmed },
+            ),
+            None => core::start_as_separate_project(
+                &project_path,
+                core::ApplyOptions { yes: confirmed },
+            ),
         }
         .map_err(to_app_error)?;
         project_snapshot_after_start(
@@ -510,9 +515,11 @@ async fn recover_transactions(
 async fn cleanup_journals(
     state: tauri::State<'_, OperationState>,
     project_path: String,
+    confirmed: bool,
 ) -> AppResult {
+    require_confirmation(confirmed, "journal cleanup requires confirmation.")?;
     run_guarded_blocking(state, None, move || {
-        core::cleanup_journals(&project_path)
+        core::cleanup_journals(&project_path, core::ApplyOptions { yes: confirmed })
             .map(|result| json!(result))
             .map_err(to_app_error)
     })
@@ -924,6 +931,16 @@ mod tests {
         assert_eq!(cancelled.message, "operation cancelled");
         assert_eq!(invalid.kind, "invalidProject");
         assert_eq!(invalid.message, "invalid Unity project: missing marker");
+    }
+
+    #[test]
+    fn confirmation_is_required_before_destructive_commands() {
+        let error = require_confirmation(false, "journal cleanup requires confirmation.")
+            .expect_err("missing confirmation must be rejected");
+
+        assert_eq!(error.kind, "confirmationRequired");
+        assert_eq!(error.message, "journal cleanup requires confirmation.");
+        assert!(require_confirmation(true, "ignored").is_ok());
     }
 
     #[test]

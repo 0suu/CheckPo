@@ -25,6 +25,29 @@ pub(super) enum JournalState {
     Recovered,
 }
 
+pub(super) fn validate_transaction_journal_identity(
+    tx_root: &Path,
+    journal: &TransactionJournal,
+) -> Result<()> {
+    if journal.schema_version != 1 {
+        return Err(CheckPoError::Corruption(format!(
+            "unsupported transaction journal schema: {}",
+            journal.schema_version
+        )));
+    }
+    let directory_id = tx_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| CheckPoError::Corruption("invalid transaction directory name".into()))?;
+    if directory_id != journal.transaction_id {
+        return Err(CheckPoError::Corruption(format!(
+            "transaction id does not match journal directory: {} != {}",
+            journal.transaction_id, directory_id
+        )));
+    }
+    Ok(())
+}
+
 pub fn pending_transactions(project_path: impl AsRef<Path>) -> Result<Vec<PendingTransaction>> {
     let project = crate::load_project(project_path)?;
     pending_transactions_for_project(&project)
@@ -87,7 +110,13 @@ pub fn ensure_no_pending_transactions(project: &ProjectContext) -> Result<()> {
     }
 }
 
-pub fn cleanup_journals(project_path: impl AsRef<Path>) -> Result<TransactionCleanupResult> {
+pub fn cleanup_journals(
+    project_path: impl AsRef<Path>,
+    options: ApplyOptions,
+) -> Result<TransactionCleanupResult> {
+    if !options.yes {
+        return Err(crate::user_error("journal cleanup requires --yes."));
+    }
     let project = crate::load_project(project_path)?;
     crate::ensure_project_location_allows_mutation(&project)?;
     let _lock = acquire_repository_lock(&project.repo_root, "transaction-cleanup")?;
@@ -100,6 +129,7 @@ pub fn cleanup_journals(project_path: impl AsRef<Path>) -> Result<TransactionCle
             deleted_bytes,
         });
     }
+    let mut candidates = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|error| crate::io_error(&dir, error))? {
         let entry = entry.map_err(|error| crate::io_error(&dir, error))?;
         let journal_path = entry.path().join("journal.json");
@@ -107,12 +137,16 @@ pub fn cleanup_journals(project_path: impl AsRef<Path>) -> Result<TransactionCle
             continue;
         }
         let journal: TransactionJournal = crate::read_json(&journal_path)?;
+        validate_transaction_journal_identity(&entry.path(), &journal)?;
         if journal.state == JournalState::Committed || journal.state == JournalState::Recovered {
             let tx_root = entry.path();
-            deleted_bytes += dir_size(&tx_root)?;
-            fs::remove_dir_all(&tx_root).map_err(|error| crate::io_error(&tx_root, error))?;
-            deleted_directory_count += 1;
+            candidates.push((tx_root.clone(), dir_size(&tx_root)?));
         }
+    }
+    for (tx_root, size_bytes) in candidates {
+        fs::remove_dir_all(&tx_root).map_err(|error| crate::io_error(&tx_root, error))?;
+        deleted_bytes += size_bytes;
+        deleted_directory_count += 1;
     }
     Ok(TransactionCleanupResult {
         deleted_directory_count,

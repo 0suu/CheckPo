@@ -424,8 +424,7 @@ pub(crate) fn delete_snapshot_from_index(
         .map_err(|error| db_error(&db_path, error))?;
     if deleted_snapshots != 1 {
         return Err(crate::CheckPoError::IndexUnavailable(format!(
-            "SQLite index did not contain checkpoint {}",
-            snapshot_id
+            "SQLite index did not contain checkpoint {snapshot_id}"
         )));
     }
     tx.commit().map_err(|error| db_error(&db_path, error))?;
