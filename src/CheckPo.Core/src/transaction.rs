@@ -39,7 +39,7 @@ use journal::{
 pub use plan::build_plan_with_progress_and_cancellation;
 use plan::validate_expected_plan;
 #[cfg(test)]
-use project_file_ops::backup_project_file_by_copy;
+use project_file_ops::backup_project_file_by_reflink_or_copy;
 use project_file_ops::*;
 use recovery::invalidate_operation_fingerprints;
 pub use recovery::recover_transactions;

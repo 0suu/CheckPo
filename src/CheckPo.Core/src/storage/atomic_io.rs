@@ -83,6 +83,57 @@ pub(crate) fn copy_file_no_replace(
     destination: &Path,
     source_disposition: CopySourceDisposition,
 ) -> Result<()> {
+    materialize_file_no_replace(
+        source,
+        destination,
+        source_disposition,
+        |source, temp_path| fs::copy(source, temp_path).map(|_| ()),
+    )
+}
+
+pub(crate) fn reflink_or_copy_file_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    materialize_file_no_replace(
+        source,
+        destination,
+        CopySourceDisposition::Keep,
+        reflink_or_copy_to_new_file,
+    )
+}
+
+fn reflink_or_copy_to_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    match reflink_copy::reflink(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            match fs::symlink_metadata(destination) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    fs::remove_file(destination)?;
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::other(
+                        "reflink left a non-regular destination",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+
+            let mut input = File::open(source)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            std::io::copy(&mut input, &mut output)?;
+            Ok(())
+        }
+    }
+}
+
+fn materialize_file_no_replace(
+    source: &Path,
+    destination: &Path,
+    source_disposition: CopySourceDisposition,
+    materialize: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     let mut created_destination = false;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
@@ -105,7 +156,7 @@ pub(crate) fn copy_file_no_replace(
                 ),
             ));
         }
-        fs::copy(source, &temp_path).map_err(|error| io_error(&temp_path, error))?;
+        materialize(source, &temp_path).map_err(|error| io_error(&temp_path, error))?;
         let output = OpenOptions::new()
             .read(true)
             .write(true)

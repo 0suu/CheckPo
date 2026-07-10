@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackupCopyMode {
+    Copy,
+    ReflinkOrCopy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CurrentFileState {
     pub(super) hash: ObjectId,
@@ -51,32 +57,89 @@ pub(super) fn backup_project_file(
     operation: &FileOperation,
     source: &Path,
     backup_path: &Path,
+    copy_mode: BackupCopyMode,
 ) -> Result<()> {
     ensure_project_parent_is_safe(project, &operation.path)?;
     if let Some(parent) = backup_path.parent() {
         fs::create_dir_all(parent).map_err(|error| crate::io_error(parent, error))?;
     }
     let expected_hash = required_before_hash(operation)?;
-    backup_project_file_by_copy(project, operation, source, backup_path, expected_hash).map_err(
-        |error| map_destination_exists_to_working_tree_changed(error, operation.path.to_string()),
+    backup_project_file_inner(
+        project,
+        operation,
+        source,
+        backup_path,
+        expected_hash,
+        copy_mode,
     )
+    .map_err(|error| {
+        map_destination_exists_to_working_tree_changed(error, operation.path.to_string())
+    })
 }
 
-pub(super) fn backup_project_file_by_copy(
+#[cfg(test)]
+pub(super) fn backup_project_file_by_reflink_or_copy(
     project: &ProjectContext,
     operation: &FileOperation,
     source: &Path,
     backup_path: &Path,
     expected_hash: &ObjectId,
 ) -> Result<()> {
+    backup_project_file_inner(
+        project,
+        operation,
+        source,
+        backup_path,
+        expected_hash,
+        BackupCopyMode::ReflinkOrCopy,
+    )
+}
+
+fn backup_project_file_inner(
+    project: &ProjectContext,
+    operation: &FileOperation,
+    source: &Path,
+    backup_path: &Path,
+    expected_hash: &ObjectId,
+    copy_mode: BackupCopyMode,
+) -> Result<()> {
     let modified = fs::metadata(source)
         .and_then(|metadata| metadata.modified())
         .map_err(|error| crate::io_error(source, error))?;
-    crate::copy_file_no_replace(source, backup_path, crate::CopySourceDisposition::Keep)?;
+    match copy_mode {
+        BackupCopyMode::Copy => crate::storage::copy_file_no_replace(
+            source,
+            backup_path,
+            crate::storage::CopySourceDisposition::Keep,
+        )?,
+        BackupCopyMode::ReflinkOrCopy => {
+            crate::storage::reflink_or_copy_file_no_replace(source, backup_path)?;
+        }
+    }
     filetime::set_file_mtime(backup_path, FileTime::from_system_time(modified))
+        .map_err(|error| crate::io_error(backup_path, error))?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(backup_path)
+        .and_then(|file| file.sync_all())
         .map_err(|error| crate::io_error(backup_path, error))?;
     finish_created_backup(operation, source, backup_path, expected_hash)?;
     ensure_project_parent_is_safe(project, &operation.path)
+}
+
+#[cfg(not(windows))]
+pub(super) fn backup_copy_mode(_project: &ProjectContext) -> BackupCopyMode {
+    BackupCopyMode::ReflinkOrCopy
+}
+
+#[cfg(windows)]
+pub(super) fn backup_copy_mode(project: &ProjectContext) -> BackupCopyMode {
+    match reflink_copy::check_reflink_support(project.project_root.as_path(), &project.repo_root) {
+        Ok(reflink_copy::ReflinkSupport::Supported) => BackupCopyMode::ReflinkOrCopy,
+        Ok(reflink_copy::ReflinkSupport::NotSupported | reflink_copy::ReflinkSupport::Unknown)
+        | Err(_) => BackupCopyMode::Copy,
+    }
 }
 
 fn finish_created_backup(

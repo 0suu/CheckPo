@@ -148,7 +148,7 @@ fn backup_move_refuses_existing_backup_path_without_removing_project_file() {
 }
 
 #[test]
-fn backup_copy_fallback_keeps_project_file_when_backup_hash_mismatches() {
+fn backup_reflink_or_copy_keeps_project_file_when_backup_hash_mismatches() {
     let (_guard, _temp, project, view) = setup_project();
     let file = project.join("Assets/Avatar/Foo.prefab");
     fs::write(&file, "one").unwrap();
@@ -162,7 +162,7 @@ fn backup_copy_fallback_keeps_project_file_when_backup_hash_mismatches() {
         .join("journals/copyfallback/backup/Assets/Avatar/Foo.prefab");
     fs::create_dir_all(backup.parent().unwrap()).unwrap();
 
-    let error = backup_project_file_by_copy(
+    let error = backup_project_file_by_reflink_or_copy(
         &context,
         operation,
         &file,
@@ -278,7 +278,7 @@ fn backup_is_an_independent_copy_of_the_project_file() {
     fs::create_dir_all(backup.parent().unwrap()).unwrap();
     let mut open_handle = fs::OpenOptions::new().write(true).open(&file).unwrap();
 
-    backup_project_file_by_copy(
+    backup_project_file_by_reflink_or_copy(
         &context,
         operation,
         &file,

@@ -28,6 +28,25 @@ fn move_file_no_replace_preserves_existing_destination() {
 }
 
 #[test]
+fn reflink_or_copy_file_no_replace_preserves_existing_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    fs::write(&source, "source").unwrap();
+    fs::write(&destination, "destination").unwrap();
+
+    let error = reflink_or_copy_file_no_replace(&source, &destination).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckPoError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "destination");
+}
+
+#[test]
 fn copy_object_to_file_removes_destination_on_hash_mismatch() {
     let temp = tempfile::tempdir().unwrap();
     let expected = temp.path().join("expected");

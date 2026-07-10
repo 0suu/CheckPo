@@ -70,6 +70,7 @@ pub(super) fn apply_plan_inner(
     write_journal(&journal_path, &journal)?;
     fs::create_dir_all(&staged_root).map_err(|error| crate::io_error(&staged_root, error))?;
     fs::create_dir_all(&backup_root).map_err(|error| crate::io_error(&backup_root, error))?;
+    let backup_copy_mode = backup_copy_mode(project);
     let snapshot = load_project_snapshot(project, &plan.checkpoint_id)?;
     let snapshot_files = snapshot
         .files
@@ -119,7 +120,13 @@ pub(super) fn apply_plan_inner(
             FileOperationType::Delete => {
                 ensure_project_parent_is_safe(project, &operation.path)?;
                 if destination.exists() {
-                    backup_project_file(project, operation, &destination, &backup_path)?;
+                    backup_project_file(
+                        project,
+                        operation,
+                        &destination,
+                        &backup_path,
+                        backup_copy_mode,
+                    )?;
                     inject_transaction_fault(
                         fault_hook,
                         TransactionFaultPoint::ProjectFileBackedUp,
@@ -135,7 +142,13 @@ pub(super) fn apply_plan_inner(
             FileOperationType::Replace => {
                 ensure_project_parent_is_safe(project, &operation.path)?;
                 if destination.exists() {
-                    backup_project_file(project, operation, &destination, &backup_path)?;
+                    backup_project_file(
+                        project,
+                        operation,
+                        &destination,
+                        &backup_path,
+                        backup_copy_mode,
+                    )?;
                     inject_transaction_fault(
                         fault_hook,
                         TransactionFaultPoint::ProjectFileBackedUp,
