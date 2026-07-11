@@ -272,7 +272,8 @@ fn plan_directory_topology_changes(
                     path
                 )))
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
             Err(error) => return Err(crate::io_error(&destination, error)),
         }
 
