@@ -298,7 +298,7 @@ fn checkpoint_rejects_symlinked_object_shard_without_touching_outside() {
     fs::write(&file, "content").unwrap();
     let view = init_project_for_test(&project).unwrap();
     let repo = repo_path(&view);
-    let object_id = core::hash_file(&file).unwrap();
+    let object_id = core::hash_bytes(b"content");
     let first = &object_id.as_str()[..2];
     let second = &object_id.as_str()[2..4];
     let outside = temp.path().join("outside");
@@ -311,7 +311,7 @@ fn checkpoint_rejects_symlinked_object_shard_without_touching_outside() {
 
     assert!(matches!(error, core::CheckPoError::Corruption(_)));
     assert_eq!(fs::read_to_string(outside_object).unwrap(), "changed");
-    assert!(core::list_snapshot_ids(&repo).unwrap().is_empty());
+    assert!(core::list_checkpoints(&project).unwrap().is_empty());
 }
 
 #[test]

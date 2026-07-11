@@ -153,7 +153,10 @@ fn init_project_uses_custom_storage_root_for_new_project() {
 
     let view = core::init_project_with_storage_root(&project, &custom_storage).unwrap();
 
-    assert_eq!(view.storage_root_path, custom_storage);
+    assert_eq!(
+        view.storage_root_path.canonicalize().unwrap(),
+        custom_storage.canonicalize().unwrap()
+    );
     assert!(custom_storage.join("repos").join(&view.project_id).is_dir());
 }
 
@@ -177,7 +180,10 @@ fn start_as_separate_project_uses_custom_storage_root() {
     .unwrap();
 
     assert_ne!(view.project_id, original.project_id);
-    assert_eq!(view.storage_root_path, custom_storage);
+    assert_eq!(
+        view.storage_root_path.canonicalize().unwrap(),
+        custom_storage.canonicalize().unwrap()
+    );
     assert!(custom_storage.join("repos").join(&view.project_id).is_dir());
 }
 

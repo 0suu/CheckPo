@@ -79,6 +79,7 @@ pub(crate) fn create_dir_all_no_follow(base: &Path, target: &Path) -> Result<()>
     Ok(())
 }
 
+#[cfg(windows)]
 pub(crate) fn create_absolute_dir_all_no_follow(target: &Path) -> Result<PathBuf> {
     if !target.is_absolute() {
         return Err(CheckPoError::Corruption(format!(
@@ -120,16 +121,67 @@ pub(crate) fn create_absolute_dir_all_no_follow(target: &Path) -> Result<PathBuf
         }
     }
     ensure_regular_directory_no_follow(target)?;
-    #[cfg(windows)]
+    Ok(target.to_path_buf())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn create_absolute_dir_all_no_follow(target: &Path) -> Result<PathBuf> {
+    if !target.is_absolute()
+        || target.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir | Component::ParentDir | Component::Prefix(_)
+            )
+        })
     {
-        Ok(target.to_path_buf())
+        return Err(CheckPoError::Corruption(format!(
+            "directory path is not a safe absolute path: {}",
+            target.display()
+        )));
     }
-    #[cfg(not(windows))]
-    {
-        target
-            .canonicalize()
-            .map_err(|error| io_error(target, error))
+
+    let mut existing_prefix = target.to_path_buf();
+    let mut missing_components = Vec::new();
+    loop {
+        match fs::symlink_metadata(&existing_prefix) {
+            Ok(metadata) if metadata.is_dir() && !metadata_is_link_or_reparse(&metadata) => {
+                break;
+            }
+            Ok(_) => {
+                return Err(CheckPoError::Corruption(format!(
+                    "unsafe existing directory prefix: {}",
+                    existing_prefix.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = existing_prefix.file_name().ok_or_else(|| {
+                    CheckPoError::Corruption(format!(
+                        "no existing directory prefix for {}",
+                        target.display()
+                    ))
+                })?;
+                missing_components.push(component.to_os_string());
+                if !existing_prefix.pop() {
+                    return Err(CheckPoError::Corruption(format!(
+                        "no existing directory prefix for {}",
+                        target.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(io_error(&existing_prefix, error)),
+        }
     }
+
+    let canonical_prefix = existing_prefix
+        .canonicalize()
+        .map_err(|error| io_error(&existing_prefix, error))?;
+    ensure_regular_directory_no_follow(&canonical_prefix)?;
+    let mut canonical_target = canonical_prefix.clone();
+    for component in missing_components.into_iter().rev() {
+        canonical_target.push(component);
+    }
+    create_dir_all_no_follow(&canonical_prefix, &canonical_target)?;
+    Ok(canonical_target)
 }
 
 pub(crate) fn validate_repository_layout_no_follow(repo_root: &Path) -> Result<()> {
@@ -206,5 +258,35 @@ mod tests {
 
         assert!(create_absolute_dir_all_no_follow(&linked.join("created")).is_err());
         assert!(!outside.join("created").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_directory_creation_canonicalizes_existing_prefix_with_symlink_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        let existing = outside.join("existing");
+        let linked = temp.path().join("linked");
+        fs::create_dir_all(&existing).unwrap();
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+        let created = create_absolute_dir_all_no_follow(&linked.join("existing/created")).unwrap();
+
+        assert_eq!(created, existing.canonicalize().unwrap().join("created"));
+        assert!(created.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_directory_creation_rejects_dangling_symlink_file_and_parent_component() {
+        let temp = tempfile::tempdir().unwrap();
+        let dangling = temp.path().join("dangling");
+        let file = temp.path().join("file");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &dangling).unwrap();
+        fs::write(&file, "not a directory").unwrap();
+
+        assert!(create_absolute_dir_all_no_follow(&dangling.join("created")).is_err());
+        assert!(create_absolute_dir_all_no_follow(&file.join("created")).is_err());
+        assert!(create_absolute_dir_all_no_follow(&temp.path().join("safe/../created")).is_err());
     }
 }

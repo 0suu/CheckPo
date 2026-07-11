@@ -21,11 +21,9 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 use atomic_io::replace_file;
-#[cfg(windows)]
-pub(crate) use atomic_io::{copy_file_no_replace, CopySourceDisposition};
 pub(crate) use atomic_io::{
-    move_file_no_replace, reflink_or_copy_file_no_replace, sync_parent_chain,
-    write_json_atomic_new, write_text_atomic,
+    copy_file_no_replace, move_file_no_replace, reflink_or_copy_file_no_replace, sync_parent_chain,
+    write_json_atomic_new, write_text_atomic, CopySourceDisposition,
 };
 pub use atomic_io::{read_json, sync_parent_dir, write_bytes_atomic, write_json_atomic};
 pub use db_file::{db_path, open_db};
