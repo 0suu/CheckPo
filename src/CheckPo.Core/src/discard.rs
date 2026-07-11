@@ -3,7 +3,6 @@ use crate::{
     read_latest_snapshot_id, ApplyOptions, ApplyResult, CancellationToken, CheckPoError,
     OperationPlan, OperationPlanKind, OperationProgress, Result, SnapshotId, TrackedUnityFilePath,
 };
-use std::collections::BTreeSet;
 use std::path::Path;
 
 pub fn preview_discard(
@@ -92,12 +91,7 @@ pub fn apply_discard_plan_with_progress_and_cancellation(
             "discard checkpoint changed after preview".to_string(),
         ));
     }
-    let selected = paths
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let selected = crate::transaction::normalize_discard_selection(&project, &snapshot_id, paths)?;
     if plan.selected_paths.as_deref() != Some(selected.as_slice()) {
         return Err(CheckPoError::WorkingTreeChanged(
             "discard path set changed after preview".to_string(),

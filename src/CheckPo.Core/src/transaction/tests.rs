@@ -647,7 +647,29 @@ fn apply_rejects_staged_symlink_injected_before_restore() {
     assert!(!file.exists());
     assert_eq!(fs::read_to_string(&outside).unwrap(), "one");
     let recovered = crate::recover_transactions(&project).unwrap();
-    assert_eq!(recovered.recovered_transaction_count, 1);
-    assert_eq!(recovered.failed_transaction_count, 0);
+    assert_eq!(recovered.recovered_transaction_count, 0);
+    assert_eq!(recovered.failed_transaction_count, 1);
+    assert_eq!(recovered.failed_transactions.len(), 1);
+    assert!(recovered.failed_transactions[0]
+        .error
+        .contains("transaction payload contains a symlink"));
+
+    let pending = crate::pending_transactions(&project).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].transaction_id,
+        recovered.failed_transactions[0].transaction_id
+    );
+
+    let quarantine = crate::quarantine_transaction(
+        &project,
+        &pending[0].transaction_id,
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert!(quarantine.quarantine_path.is_dir());
+    assert!(quarantine.quarantine_path.join("journal.json").is_file());
+    assert!(quarantine.quarantine_path.join("staged").is_dir());
+    assert!(crate::pending_transactions(&project).unwrap().is_empty());
     assert!(!file.exists());
 }

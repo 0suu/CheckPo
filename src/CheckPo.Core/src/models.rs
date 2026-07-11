@@ -470,10 +470,18 @@ pub struct OrphanTempFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RepositoryTempFile {
+    pub file_name: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TempFileCleanupPlan {
     pub file_count: usize,
     pub total_bytes: u64,
     pub files: Vec<OrphanTempFile>,
+    pub repository_files: Vec<RepositoryTempFile>,
     pub warnings: Vec<String>,
 }
 

@@ -4,6 +4,7 @@ pub(super) use crate::project::ensure_project_parent_is_safe;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BackupCopyMode {
+    #[cfg(windows)]
     Copy,
     ReflinkOrCopy,
 }
@@ -109,6 +110,7 @@ fn backup_project_file_inner(
         .and_then(|metadata| metadata.modified())
         .map_err(|error| crate::io_error(source, error))?;
     match copy_mode {
+        #[cfg(windows)]
         BackupCopyMode::Copy => crate::storage::copy_file_no_replace(
             source,
             backup_path,

@@ -1,11 +1,18 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  buildChangeTreeModel,
+  collectChangeTreeFolderPaths,
+  flattenChangeTreeRows,
   localizedErrorDisplay,
+  mergeDiffRefreshOptions,
   projectChanged,
   projectScopedStateReset,
+  removeProjectFromHistory,
   retainPendingTransactionFailures,
+  retainVisibleChangeSelection,
   selectChangePaths,
+  virtualTreeWindowRange,
 } = require("./frontend-state.js");
 
 test("project identity changes when either id or path changes", () => {
@@ -88,6 +95,20 @@ test("shift selection follows visible tree order", () => {
   assert.equal(result.anchorPath, "Assets/A.prefab");
 });
 
+test("shift selection can cross rows outside the virtual DOM window", () => {
+  const visiblePaths = Array.from({ length: 200 }, (_, index) => `Assets/File${index}.asset`);
+  const result = selectChangePaths({
+    selectedPaths: new Set([visiblePaths[5]]),
+    anchorPath: visiblePaths[5],
+    targetPath: visiblePaths[150],
+    visiblePaths,
+    shiftKey: true,
+  });
+
+  assert.equal(result.selectedPaths.size, 146);
+  assert.ok(result.selectedPaths.has(visiblePaths[100]));
+});
+
 test("shift selection becomes a single selection when anchor is hidden", () => {
   const result = selectChangePaths({
     selectedPaths: new Set(["Assets/Hidden.prefab", "Assets/Old.prefab"]),
@@ -110,4 +131,91 @@ test("ctrl selection toggles only the target", () => {
   });
   assert.deepEqual([...result.selectedPaths], ["Assets/B.prefab"]);
   assert.equal(result.anchorPath, "Assets/A.prefab");
+});
+
+test("filter changes remove selections that are no longer visible", () => {
+  const result = retainVisibleChangeSelection(
+    new Set(["Assets/Added.asset", "Assets/Deleted.asset"]),
+    "Assets/Added.asset",
+    ["Assets/Deleted.asset"],
+  );
+
+  assert.deepEqual([...result.selectedPaths], ["Assets/Deleted.asset"]);
+  assert.equal(result.anchorPath, null);
+});
+
+test("removing a project from history does not alter the other entries", () => {
+  const history = [
+    { path: "C:/AvatarA", name: "A" },
+    { path: "D:/AvatarB", name: "B" },
+  ];
+
+  assert.deepEqual(removeProjectFromHistory(history, "C:/AvatarA"), [history[1]]);
+  assert.equal(history.length, 2);
+});
+
+test("queued diff refresh never weakens an exact request to metadata-only", () => {
+  const queued = mergeDiffRefreshOptions(
+    { refreshProject: true },
+    { silent: true, metadataOnly: true },
+  );
+
+  assert.equal(queued.refreshProject, true);
+  assert.equal(queued.metadataOnly, false);
+  assert.equal(queued.silent, false);
+});
+
+test("queued metadata refresh stays metadata-only only when every request is metadata-only", () => {
+  const queued = mergeDiffRefreshOptions(
+    { silent: true, metadataOnly: true },
+    { silent: true, metadataOnly: true, allowBusy: true },
+  );
+
+  assert.equal(queued.metadataOnly, true);
+  assert.equal(queued.silent, true);
+  assert.equal(queued.allowBusy, true);
+});
+
+test("large change trees flatten without requiring one DOM node per row", () => {
+  const changes = [];
+  for (let folder = 0; folder < 100; folder += 1) {
+    for (let file = 0; file < 100; file += 1) {
+      changes.push({
+        path: `Assets/Folder${String(folder).padStart(3, "0")}/File${String(file).padStart(3, "0")}.asset`,
+        type: "modified",
+      });
+    }
+  }
+  const root = buildChangeTreeModel(changes);
+  const collapsedRows = flattenChangeTreeRows(root, new Set());
+  const openPaths = new Set(collectChangeTreeFolderPaths(root));
+  const rows = flattenChangeTreeRows(root, openPaths);
+  const range = virtualTreeWindowRange(rows.length, 160000, 640, 32, 8);
+
+  assert.equal(collapsedRows.length, 1);
+  assert.equal(rows.length, 10101);
+  assert.ok(range.end - range.start <= 36);
+  assert.equal(rows[0].kind, "folder");
+  assert.equal(rows[0].depth, 0);
+  assert.equal(rows[1].depth, 1);
+  assert.equal(rows[2].depth, 2);
+});
+
+test("virtual window clamps stale scroll positions after collapsing rows", () => {
+  const range = virtualTreeWindowRange(3, 100000, 640, 36, 10);
+
+  assert.deepEqual(range, { start: 0, end: 3 });
+});
+
+test("change trees start collapsed and expose sibling positions for ARIA", () => {
+  const root = buildChangeTreeModel([
+    { path: "Assets/A.asset", type: "added" },
+    { path: "Packages/B.json", type: "modified" },
+  ]);
+  const rows = flattenChangeTreeRows(root, new Set());
+
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((row) => row.posInSet), [1, 2]);
+  assert.deepEqual(rows.map((row) => row.setSize), [2, 2]);
+  assert.ok(rows.every((row) => row.depth === 0));
 });

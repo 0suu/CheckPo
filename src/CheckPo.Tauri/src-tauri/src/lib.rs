@@ -1043,32 +1043,24 @@ struct ProgressEmitState {
     last_emit_at: Option<Instant>,
     last_phase: Option<String>,
     last_total: usize,
-    last_percent: Option<usize>,
 }
 
 impl ProgressEmitState {
     fn should_emit(&mut self, progress: &core::OperationProgress) -> bool {
         let now = Instant::now();
-        let percent =
-            (progress.total > 0).then(|| progress.completed.saturating_mul(100) / progress.total);
         let phase_changed = self.last_phase.as_deref() != Some(progress.phase.as_str());
         let total_changed = progress.total != self.last_total;
         let completed = progress.phase == "complete"
             || (progress.total > 0 && progress.completed >= progress.total);
-        let percent_advanced = percent
-            .zip(self.last_percent)
-            .is_some_and(|(current, previous)| current > previous);
         let elapsed = self
             .last_emit_at
             .map(|last| now.duration_since(last) >= Duration::from_millis(80))
             .unwrap_or(true);
-        let should_emit =
-            phase_changed || total_changed || completed || percent_advanced || elapsed;
+        let should_emit = phase_changed || total_changed || completed || elapsed;
         if should_emit {
             self.last_emit_at = Some(now);
             self.last_phase = Some(progress.phase.clone());
             self.last_total = progress.total;
-            self.last_percent = percent;
         }
         should_emit
     }

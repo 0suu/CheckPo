@@ -47,10 +47,14 @@
       gcPlan: null,
       tempCleanupPlan: null,
       rollbackPlan: null,
+      rollbackPlanContext: null,
+      rollbackRequestSerial: 0,
       pendingTransactions: [],
       unresolvedQuarantines: [],
       failedTransactions: [],
       currentDiff: null,
+      diffRequestSerial: 0,
+      queuedDiffRefreshOptions: null,
       currentDiffFilter: "all",
       diffTreeOpenPaths: new Set(),
       diffTreeTouched: false,
@@ -114,12 +118,174 @@
     return { selectedPaths: selected, anchorPath: targetPath };
   }
 
+  function retainVisibleChangeSelection(selectedPaths, anchorPath, visiblePaths) {
+    const visible = new Set(visiblePaths);
+    return {
+      selectedPaths: new Set([...selectedPaths].filter((path) => visible.has(path))),
+      anchorPath: visible.has(anchorPath) ? anchorPath : null,
+    };
+  }
+
+  function removeProjectFromHistory(projectHistory, projectPath) {
+    return (Array.isArray(projectHistory) ? projectHistory : [])
+      .filter((item) => item?.path !== projectPath);
+  }
+
+  function mergeDiffRefreshOptions(previous, next) {
+    if (!previous) return { ...next };
+    return {
+      ...previous,
+      ...next,
+      refreshProject: Boolean(previous.refreshProject || next.refreshProject),
+      allowBusy: Boolean(previous.allowBusy || next.allowBusy),
+      metadataOnly: previous.metadataOnly === true && next.metadataOnly === true,
+      silent: previous.silent === true && next.silent === true,
+    };
+  }
+
+  function buildChangeTreeModel(changes) {
+    const root = createChangeTreeNode("", "");
+    for (const change of changes) {
+      const parts = String(change.path).split(/[\\/]/).filter(Boolean);
+      const fileName = parts.pop() || change.path;
+      let node = root;
+      for (const part of parts) {
+        const path = node.path ? `${node.path}/${part}` : part;
+        if (!node.children.has(part)) {
+          node.children.set(part, createChangeTreeNode(part, path));
+        }
+        node = node.children.get(part);
+        node.counts[change.type] += 1;
+      }
+      node.files.push({ ...change, name: fileName });
+    }
+    return root;
+  }
+
+  function createChangeTreeNode(name, path) {
+    return {
+      name,
+      path,
+      children: new Map(),
+      files: [],
+      counts: { added: 0, modified: 0, deleted: 0 },
+    };
+  }
+
+  function compressedChangeFolder(node) {
+    const names = [node.name];
+    let current = node;
+    while (current.files.length === 0 && current.children.size === 1) {
+      const next = [...current.children.values()][0];
+      names.push(next.name);
+      current = next;
+    }
+    return { node: current, names };
+  }
+
+  function flattenChangeTreeRows(root, openPaths) {
+    const rows = [];
+    const appendChildren = (parent, depth, parentKey) => {
+      const folders = [...parent.children.values()]
+        .sort(compareChangeTreeNode)
+        .map(compressedChangeFolder);
+      const files = [...parent.files].sort(compareChangeTreeFile);
+      const setSize = folders.length + files.length;
+      let position = 1;
+      for (const folder of folders) {
+        const key = `folder:${folder.node.path}`;
+        const isOpen = openPaths.has(folder.node.path);
+        rows.push({
+          kind: "folder",
+          key,
+          parentKey,
+          depth,
+          posInSet: position,
+          setSize,
+          isOpen,
+          node: folder.node,
+          names: folder.names,
+        });
+        position += 1;
+        if (isOpen) appendChildren(folder.node, depth + 1, key);
+      }
+      for (const file of files) {
+        rows.push({
+          kind: "file",
+          key: `file:${file.path}`,
+          parentKey,
+          depth,
+          posInSet: position,
+          setSize,
+          change: file,
+        });
+        position += 1;
+      }
+    };
+    appendChildren(root, 0, null);
+    return rows;
+  }
+
+  function collectChangeTreeFolderPaths(root, paths = []) {
+    for (const child of root.children.values()) {
+      const compressed = compressedChangeFolder(child);
+      paths.push(compressed.node.path);
+      collectChangeTreeFolderPaths(compressed.node, paths);
+    }
+    return paths;
+  }
+
+  function collectChangeTreeFilePaths(node, paths = []) {
+    for (const file of node.files) paths.push(file.path);
+    for (const child of node.children.values()) collectChangeTreeFilePaths(child, paths);
+    return paths;
+  }
+
+  function virtualTreeWindowRange(rowCount, scrollTop, viewportHeight, rowHeight, overscan) {
+    if (rowCount <= 0) return { start: 0, end: 0 };
+    const safeRowHeight = Math.max(1, rowHeight);
+    const firstVisible = Math.min(
+      rowCount - 1,
+      Math.max(0, Math.floor(Math.max(0, scrollTop) / safeRowHeight)),
+    );
+    const visibleEnd = Math.max(
+      firstVisible + 1,
+      Math.ceil((Math.max(0, scrollTop) + Math.max(0, viewportHeight)) / safeRowHeight),
+    );
+    const start = Math.max(0, firstVisible - overscan);
+    const end = Math.min(rowCount, visibleEnd + overscan);
+    return { start, end };
+  }
+
+  function compareChangeTreeNode(a, b) {
+    return a.name.localeCompare(b.name, "ja");
+  }
+
+  function compareChangeTreeFile(a, b) {
+    if (a.type !== b.type) return changeTypeOrder(a.type) - changeTypeOrder(b.type);
+    return a.name.localeCompare(b.name, "ja");
+  }
+
+  function changeTypeOrder(type) {
+    if (type === "added") return 0;
+    if (type === "modified") return 1;
+    return 2;
+  }
+
   return {
+    buildChangeTreeModel,
+    collectChangeTreeFilePaths,
+    collectChangeTreeFolderPaths,
+    flattenChangeTreeRows,
     projectChanged,
     projectIdentity,
     projectScopedStateReset,
+    mergeDiffRefreshOptions,
+    removeProjectFromHistory,
     localizedErrorDisplay,
     retainPendingTransactionFailures,
+    retainVisibleChangeSelection,
     selectChangePaths,
+    virtualTreeWindowRange,
   };
 });

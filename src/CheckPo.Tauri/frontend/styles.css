@@ -582,6 +582,7 @@ p {
 }
 
 .update-banner,
+.error-banner,
 .pending-banner,
 .quarantine-banner,
 .project-warning-banner {
@@ -597,6 +598,10 @@ p {
   background: var(--success-soft);
 }
 
+.error-banner {
+  background: var(--danger-soft);
+}
+
 .pending-banner {
   background: var(--warning-soft);
 }
@@ -610,6 +615,7 @@ p {
 }
 
 .update-banner div,
+.error-banner div,
 .pending-banner div,
 .quarantine-banner div,
 .project-warning-banner div {
@@ -628,6 +634,11 @@ p {
   font-size: 13px;
 }
 
+.error-banner strong {
+  color: var(--danger);
+  font-size: 13px;
+}
+
 .quarantine-banner strong {
   color: var(--danger);
   font-size: 13px;
@@ -639,12 +650,20 @@ p {
 }
 
 .update-banner span,
+.error-banner span,
 .pending-banner span,
 .quarantine-banner span,
 .project-warning-banner span {
   color: var(--muted);
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.dialog-error {
+  margin: 8px 0 0;
+  color: var(--danger);
+  font-weight: 700;
+  white-space: pre-wrap;
 }
 
 .work-surface {
@@ -2227,27 +2246,36 @@ input[type="text"] {
 }
 
 .diff-tree {
+  --diff-tree-row-height: 36px;
+
+  position: relative;
   height: 100%;
   min-height: 0;
   max-height: 100%;
   overflow-y: auto;
   overscroll-behavior: contain;
   background: var(--surface);
-  padding: 4px 0 14px;
+  padding: 0;
 }
 
-.tree-children {
+.diff-tree:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.diff-tree-spacer {
   position: relative;
+  min-width: 100%;
 }
 
-.tree-children::before {
+.tree-row.virtual-row {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: calc(var(--ind) + 7px);
-  width: 1px;
-  background: var(--border-soft);
-  content: "";
+  right: 0;
+  left: 0;
+  box-sizing: border-box;
+  height: var(--diff-tree-row-height);
+  min-height: var(--diff-tree-row-height);
+  overflow: hidden;
 }
 
 .tree-row {
@@ -2261,6 +2289,10 @@ input[type="text"] {
 
 .tree-row:hover {
   background: var(--control-hover);
+}
+
+.tree-row.is-active {
+  box-shadow: inset 2px 0 0 var(--muted);
 }
 
 .tree-row.folder {
@@ -2395,9 +2427,12 @@ input[type="text"] {
   color: var(--primary);
   padding: 2.5px 9px;
   font-size: 10.5px;
+  white-space: nowrap;
 }
 
-.tree-row:hover .tree-op {
+.tree-row:hover .tree-op,
+.tree-row:focus-within .tree-op,
+.tree-row.is-active .tree-op {
   visibility: visible;
 }
 
@@ -2457,6 +2492,7 @@ input[type="text"] {
 }
 
 .update-banner,
+.error-banner,
 .pending-banner,
 .quarantine-banner,
 .project-warning-banner {
@@ -2757,6 +2793,7 @@ input[type="text"] {
   .rollback-confirm,
   .toolbar-actions,
   .update-banner,
+  .error-banner,
   .quarantine-banner,
   .project-warning-banner {
     align-items: stretch;

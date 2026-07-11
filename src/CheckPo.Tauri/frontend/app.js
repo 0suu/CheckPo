@@ -34,6 +34,7 @@ const state = {
   projectLocationStatus: "current",
   projectWarnings: [],
   projectHistory: readProjectHistory(),
+  hiddenProjectPaths: new Set(),
   checkpoints: [],
   selectedCheckpointId: null,
   renamingCheckpointId: null,
@@ -41,11 +42,14 @@ const state = {
   gcPlan: null,
   tempCleanupPlan: null,
   rollbackPlan: null,
+  rollbackPlanContext: null,
+  rollbackRequestSerial: 0,
   pendingTransactions: [],
   unresolvedQuarantines: [],
   failedTransactions: [],
   confirming: false,
   currentDiff: null,
+  diffRequestSerial: 0,
   currentDiffFilter: "all",
   diffTreeOpenPaths: new Set(),
   diffTreeTouched: false,
@@ -53,11 +57,14 @@ const state = {
   lastSelectedChangePath: null,
   busy: false,
   autoRefreshInFlight: false,
+  queuedDiffRefreshOptions: null,
   lastAutoRefreshAt: 0,
   userOperationSerial: 0,
   activeCommand: null,
   cancelRequested: false,
   currentOperationCancellable: false,
+  pendingProgress: null,
+  progressFrame: null,
   availableUpdate: null,
 };
 
@@ -74,6 +81,17 @@ function readProjectHistory() {
 
 function writeProjectHistory() {
   writeLocalSetting("projects", JSON.stringify(state.projectHistory.slice(0, 12)));
+}
+
+function forgetProjectFromHistory(projectPath) {
+  state.projectHistory = CheckPoFrontendState.removeProjectFromHistory(
+    state.projectHistory,
+    projectPath,
+  );
+  state.hiddenProjectPaths.add(projectPath);
+  writeProjectHistory();
+  renderProjectHistory();
+  setStatus("プロジェクトを一覧から消しました。チェックポイントやプロジェクトのファイルは削除していません。");
 }
 
 function setDefaultStorageRootPath(path) {
@@ -145,6 +163,9 @@ async function invokeCommand(command, args = {}, options = {}) {
     while (true) {
       try {
         const result = await tauriInvoke(command, args);
+        if (trackOperation && state.activeCommand === command) {
+          renderProgressImmediately({ phase: "complete", completed: 1, total: 1 });
+        }
         setResult(result);
         return result;
       } catch (error) {
@@ -188,6 +209,7 @@ async function run(title, task, options = {}) {
   }
   state.busy = true;
   state.userOperationSerial += 1;
+  clearVisibleError();
   $("busyOverlay").hidden = false;
   $("busyTitle").textContent = title;
   resetBusyProgress();
@@ -249,6 +271,32 @@ function showError(error) {
   const display = displayError(error);
   setStatus(display.message);
   setResult(display.detail ? { error: display.message, detail: display.detail } : { error: display.message });
+  showVisibleError(display.message);
+  if (!$('rollbackOverlay')?.hidden) {
+    $("rollbackError").textContent = display.message;
+    $("rollbackError").hidden = false;
+  }
+  if (["workingTreeChanged", "pendingTransaction"].includes(display.kind)) {
+    state.rollbackPlan = null;
+    state.rollbackPlanContext = null;
+    state.rollbackRequestSerial += 1;
+    if ($("rollbackConfirm")) $("rollbackConfirm").checked = false;
+    updateControls();
+  }
+}
+
+function showVisibleError(message) {
+  $("errorBannerText").textContent = message;
+  $("errorBanner").hidden = false;
+}
+
+function clearVisibleError() {
+  if ($("errorBanner")) $("errorBanner").hidden = true;
+  if ($("errorBannerText")) $("errorBannerText").textContent = "";
+  if ($("rollbackError")) {
+    $("rollbackError").hidden = true;
+    $("rollbackError").textContent = "";
+  }
 }
 
 function shouldStartProjectAfterLoadError(error) {
@@ -258,6 +306,11 @@ function shouldStartProjectAfterLoadError(error) {
 }
 
 function resetBusyProgress() {
+  if (state.progressFrame !== null) {
+    cancelAnimationFrame(state.progressFrame);
+    state.progressFrame = null;
+  }
+  state.pendingProgress = null;
   $("busyCommand").textContent = "";
   const progress = $("busyProgress");
   progress.max = 100;
@@ -387,6 +440,10 @@ function latestCheckpointId() {
   return sortCheckpoints(state.checkpoints)[0]?.checkpointId || null;
 }
 
+function diffBaselineCheckpointId() {
+  return state.selectedCheckpointId || latestCheckpointId();
+}
+
 function getCheckpointId() {
   if (!state.selectedCheckpointId) throw new Error("チェックポイントを選択してください。");
   return state.selectedCheckpointId;
@@ -403,7 +460,14 @@ async function refreshProject(options = {}) {
 }
 
 async function refreshLatestDiff(options = {}) {
-  if ((state.busy && !options.allowBusy) || state.autoRefreshInFlight || !state.projectPath) return;
+  if ((state.busy && !options.allowBusy) || !state.projectPath) return;
+  if (state.autoRefreshInFlight) {
+    state.queuedDiffRefreshOptions = CheckPoFrontendState.mergeDiffRefreshOptions(
+      state.queuedDiffRefreshOptions,
+      options,
+    );
+    return;
+  }
   const backgroundRefresh = !options.allowBusy;
   const startedUserOperationSerial = state.userOperationSerial;
   state.autoRefreshInFlight = true;
@@ -413,12 +477,14 @@ async function refreshLatestDiff(options = {}) {
       await refreshProject({ fromAutoRefresh: true });
       if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) return;
     }
-    const checkpointId = latestCheckpointId();
+    const requestSerial = ++state.diffRequestSerial;
+    const projectPath = getProjectPath();
+    const checkpointId = diffBaselineCheckpointId();
     if (!checkpointId) {
       if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) return;
       state.currentDiff = null;
       $("diffSummary").textContent = t("diffEmpty");
-      $("diffGroups").replaceChildren();
+      resetVirtualDiffTree();
       $("pendingFileCount").textContent = `0${t("fileUnit")}`;
       updateFilterChips(0, 0, 0);
       return;
@@ -438,26 +504,35 @@ async function refreshLatestDiff(options = {}) {
     if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) {
       return;
     }
-    renderDiff(diff);
+    if (requestSerial !== state.diffRequestSerial
+      || projectPath !== state.projectPath
+      || checkpointId !== diffBaselineCheckpointId()) return;
+    renderDiff(diff, checkpointId);
     if (Array.isArray(diff?.warnings) && diff.warnings.length) {
       setStatus(`高速確認で一部確認できませんでした:\n${diff.warnings.join("\n")}`);
     }
   } catch (error) {
     clearCurrentDiff();
-    if (!options.silent) setStatus(errorText(error));
+    if (!options.silent) showError(error);
   } finally {
     state.autoRefreshInFlight = false;
     updateAutoRefreshStatus();
+    const queued = state.queuedDiffRefreshOptions;
+    state.queuedDiffRefreshOptions = null;
+    if (queued && (!state.busy || queued.allowBusy) && state.projectPath) {
+      window.setTimeout(() => refreshLatestDiff(queued), 0);
+    }
   }
 }
 
 function clearCurrentDiff() {
+  state.diffRequestSerial += 1;
   state.currentDiff = null;
   state.rollbackPlan = null;
   state.currentDiffSelectedPaths.clear();
   state.lastSelectedChangePath = null;
   $("diffSummary").textContent = t("diffEmpty");
-  $("diffGroups").replaceChildren();
+  resetVirtualDiffTree();
   $("pendingFileCount").textContent = `0${t("fileUnit")}`;
   updateFilterChips(0, 0, 0);
   updateSelectedDiffButton();
@@ -524,6 +599,7 @@ function sortCheckpoints(checkpoints) {
 
 function rememberProject(snapshot) {
   if (!state.projectPath) return;
+  if (state.hiddenProjectPaths.has(state.projectPath)) return;
   const entry = {
     path: state.projectPath,
     name: snapshot.project?.projectName || basename(state.projectPath),
@@ -576,6 +652,7 @@ function renderPending(items) {
   if (items.length === 0) {
     $("pendingTransactionText").textContent = "";
     renderTransactionQuarantineAction();
+    updateControls();
     return;
   }
   const states = items
@@ -589,6 +666,7 @@ function renderPending(items) {
       details: states ? ` (${states}${omitted})` : "",
     });
   renderTransactionQuarantineAction();
+  updateControls();
 }
 
 function renderTransactionQuarantineAction() {
@@ -806,7 +884,10 @@ function renderCheckpoints() {
       });
     } else {
       row.querySelector(".checkpoint-title").textContent = checkpoint.name || checkpoint.checkpointId;
-      row.addEventListener("click", () => selectCheckpoint(checkpoint.checkpointId));
+      row.addEventListener("click", async () => {
+        selectCheckpoint(checkpoint.checkpointId);
+        await refreshLatestDiff({ metadataOnly: true });
+      });
     }
     row.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -819,8 +900,12 @@ function renderCheckpoints() {
 }
 
 function selectCheckpoint(checkpointId, options = {}) {
+  const changed = state.selectedCheckpointId !== checkpointId;
   state.selectedCheckpointId = checkpointId;
   state.rollbackPlan = null;
+  state.rollbackPlanContext = null;
+  if (changed) state.rollbackRequestSerial += 1;
+  if (changed) clearCurrentDiff();
   if (options.render !== false) renderCheckpoints();
   renderProjectLabels();
   updateControls();
@@ -828,6 +913,10 @@ function selectCheckpoint(checkpointId, options = {}) {
 
 function beginRenameCheckpoint(checkpointId) {
   if (state.busy || state.confirming) return;
+  if (state.pendingTransactions.length > 0) {
+    showError({ kind: "pendingTransaction", message: "A transaction must be recovered first" });
+    return;
+  }
   if (state.unresolvedQuarantines.length > 0) {
     setStatus("安全を確認できるまでチェックポイント名は変更できません。既知のチェックポイントへ全体復元してください。");
     return;
@@ -901,17 +990,27 @@ function setupCheckpointRenameInput(input, checkpoint) {
 }
 
 function showCheckpointContextMenu(x, y, checkpoint) {
-  const destructiveBlocked = state.projectLocationStatus === "copiedSuspected";
+  const locationBlocked = state.projectLocationStatus === "copiedSuspected";
+  const pendingBlocked = state.pendingTransactions.length > 0;
+  const quarantineBlocked = state.unresolvedQuarantines.length > 0;
   showContextMenu(x, y, [
-    { label: "名前を変更", action: () => beginRenameCheckpoint(checkpoint.checkpointId) },
-    { label: "この状態に戻す", action: () => previewRestoreCheckpoint(checkpoint.checkpointId) },
+    {
+      label: "名前を変更",
+      disabled: locationBlocked || pendingBlocked || quarantineBlocked,
+      action: () => beginRenameCheckpoint(checkpoint.checkpointId),
+    },
+    {
+      label: "この状態に戻す",
+      disabled: locationBlocked || pendingBlocked,
+      action: () => previewRestoreCheckpoint(checkpoint.checkpointId),
+    },
     { separator: true },
     { label: "IDをコピー", action: () => copyCheckpointId(checkpoint.checkpointId) },
     { separator: true },
     {
       label: "削除",
       danger: true,
-      disabled: destructiveBlocked,
+      disabled: locationBlocked || pendingBlocked || quarantineBlocked,
       action: () => deleteCheckpointById(checkpoint.checkpointId),
     },
   ]);
@@ -990,16 +1089,37 @@ async function copyCheckpointId(checkpointId) {
 }
 
 async function previewRestoreCheckpoint(checkpointId) {
+  if (state.pendingTransactions.length > 0) {
+    showError({ kind: "pendingTransaction", message: "A transaction must be recovered first" });
+    return;
+  }
   selectCheckpoint(checkpointId);
+  const requestSerial = ++state.rollbackRequestSerial;
+  const projectPath = getProjectPath();
   await run("戻す内容を確認中", async () => {
-    renderRollbackPlan(await invokeCommand("preview_restore", {
-      projectPath: getProjectPath(),
+    const plan = await invokeCommand("preview_restore", {
+      projectPath,
       checkpointId,
-    }));
+    });
+    if (requestSerial !== state.rollbackRequestSerial
+      || projectPath !== state.projectPath
+      || checkpointId !== state.selectedCheckpointId) return;
+    renderRollbackPlan(plan, { projectPath, checkpointId });
   });
 }
 
 async function deleteCheckpointById(checkpointId) {
+  if (state.pendingTransactions.length > 0) {
+    showError({ kind: "pendingTransaction", message: "A transaction must be recovered first" });
+    return;
+  }
+  if (state.unresolvedQuarantines.length > 0) {
+    showError({
+      kind: "unresolvedTransactionQuarantine",
+      message: "A known checkpoint must be restored before deleting checkpoints",
+    });
+    return;
+  }
   const checkpoint = state.checkpoints.find((item) => item.checkpointId === checkpointId);
   selectCheckpoint(checkpointId);
   state.confirming = true;
@@ -1054,6 +1174,15 @@ function renderProjectHistory() {
         renderSnapshot(await invokeCommand("load_project", { projectPath: project.path }));
         await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
       });
+    });
+    button.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      showContextMenu(event.clientX, event.clientY, [{
+        label: "一覧から消す（データは削除しません）",
+        danger: true,
+        action: () => forgetProjectFromHistory(project.path),
+      }]);
     });
     list.append(button);
   }
@@ -1112,16 +1241,25 @@ async function runExactDiff() {
   await run(t("runDiff"), async () => {
     clearCurrentDiff();
     $("diffSummary").textContent = t("diffLoading");
-    renderDiff(await invokeCommand("diff_checkpoint_full", {
-      projectPath: getProjectPath(),
-      checkpointId: latestCheckpointId() || getCheckpointId(),
-    }));
+    const requestSerial = ++state.diffRequestSerial;
+    const projectPath = getProjectPath();
+    const checkpointId = getCheckpointId();
+    const diff = await invokeCommand("diff_checkpoint_full", {
+      projectPath,
+      checkpointId,
+    });
+    if (requestSerial !== state.diffRequestSerial
+      || projectPath !== state.projectPath
+      || checkpointId !== diffBaselineCheckpointId()) return;
+    renderDiff(diff, checkpointId);
     setStatus(t("diffUpdated"));
   });
 }
 
-function renderRollbackPlan(plan) {
+function renderRollbackPlan(plan, context) {
   state.rollbackPlan = plan;
+  state.rollbackPlanContext = context;
+  clearVisibleError();
   const operations = plan.operations || [];
   $("rollbackSummary").textContent =
     `復元 ${plan.restoreCount ?? 0} / 置換 ${plan.replaceCount ?? 0} / 削除 ${plan.deleteCount ?? 0} / 一時容量 約${formatBytes(plan.estimatedTemporaryBytes ?? 0)} / 対象 ${operations.length} 件`;
@@ -1167,8 +1305,9 @@ function updateControls() {
   const hasCheckpoint = Boolean(state.selectedCheckpointId);
   const hasCheckpointName = Boolean($("checkpointName").value.trim());
   const locationMutationBlocked = state.projectLocationStatus === "copiedSuspected";
+  const pendingMutationBlocked = state.pendingTransactions.length > 0;
   const quarantineMutationBlocked = state.unresolvedQuarantines.length > 0;
-  const destructiveBlocked = locationMutationBlocked || quarantineMutationBlocked;
+  const destructiveBlocked = locationMutationBlocked || pendingMutationBlocked || quarantineMutationBlocked;
   const controlsBlocked = state.busy || state.confirming;
   document.querySelectorAll("button").forEach((button) => {
     if (["confirmOkButton", "confirmCancelButton"].includes(button.id)) {
@@ -1205,7 +1344,9 @@ function updateControls() {
     if (button.id === "applyRollbackButton") {
       button.disabled = controlsBlocked
         || locationMutationBlocked
+        || pendingMutationBlocked
         || !state.rollbackPlan
+        || !state.rollbackPlanContext
         || Boolean(state.rollbackPlan.warnings?.length)
         || !$("rollbackConfirm").checked
         || !state.rollbackPlan.hasChanges;
@@ -1216,7 +1357,8 @@ function updateControls() {
       return;
     }
     if (["previewRollbackButton", "diffButton", "verifyButton"].includes(button.id)) {
-      button.disabled = controlsBlocked || !hasProject || !hasCheckpoint;
+      const pendingBlocked = button.id === "previewRollbackButton" && pendingMutationBlocked;
+      button.disabled = controlsBlocked || pendingBlocked || !hasProject || !hasCheckpoint;
       return;
     }
     if (button.id === "deleteCheckpointButton") {
@@ -1360,13 +1502,30 @@ function startSeparateProjectConfirmMessage() {
 }
 
 async function discardPaths(paths) {
-  const checkpointId = latestCheckpointId();
+  if (state.pendingTransactions.length > 0) {
+    showError({ kind: "pendingTransaction", message: "A transaction must be recovered first" });
+    return;
+  }
+  const projectPath = getProjectPath();
+  const checkpointId = state.currentDiff?.checkpointId;
+  const diffRequestSerial = state.diffRequestSerial;
+  if (!checkpointId || checkpointId !== diffBaselineCheckpointId()) {
+    showError({ kind: "workingTreeChanged", message: "差分の基準が変わりました。再読み込みして選び直してください。" });
+    return;
+  }
   const plan = await run("取り消し確認", () => invokeCommand("preview_discard_files", {
-    projectPath: getProjectPath(),
+    projectPath,
     paths,
     checkpointId,
   }));
   if (!plan) return;
+  const contextIsCurrent = () => projectPath === state.projectPath
+    && checkpointId === diffBaselineCheckpointId()
+    && diffRequestSerial === state.diffRequestSerial;
+  if (!contextIsCurrent()) {
+    showError({ kind: "workingTreeChanged", message: "確認中に差分の基準が変わりました。再読み込みしてください。" });
+    return;
+  }
   if (!plan.hasChanges) {
     setStatus("取り消す変更はありません。");
     return;
@@ -1375,16 +1534,24 @@ async function discardPaths(paths) {
   updateControls();
   let confirmed = false;
   try {
-    confirmed = await confirmAction(`${paths.length} 件の変更を戻します。続行しますか？`, "戻す");
+    const effectivePaths = plan.selectedPaths || paths;
+    confirmed = await confirmAction(
+      `${effectivePaths.length} 件の変更を戻します。\n\n${effectivePaths.join("\n")}\n\n続行しますか？`,
+      "戻す",
+    );
   } finally {
     state.confirming = false;
     updateControls();
   }
   if (!confirmed) return;
+  if (!contextIsCurrent()) {
+    showError({ kind: "workingTreeChanged", message: "確認中に差分の基準が変わりました。もう一度確認してください。" });
+    return;
+  }
 
   await run("戻し中", async () => {
     await invokeCommand("apply_discard_files", {
-      projectPath: getProjectPath(),
+      projectPath,
       paths,
       checkpointId,
       expectedPlan: plan,
@@ -1400,6 +1567,7 @@ async function discardPaths(paths) {
 }
 
 function bindEvents() {
+  $("dismissErrorButton").addEventListener("click", clearVisibleError);
   $("projectMenuButton").addEventListener("click", () => {
     renderProjectHistory();
     $("projectSelectionOverlay").hidden = false;
@@ -1448,7 +1616,7 @@ function bindEvents() {
   document.querySelectorAll("[data-diff-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       state.currentDiffFilter = button.dataset.diffFilter || "all";
-      if (state.currentDiff) renderCurrentDiff(state.currentDiff);
+      if (state.currentDiff) renderCurrentDiff(state.currentDiff, { resetScroll: true });
       else updateFilterChips(0, 0, 0);
     });
   });
@@ -1561,6 +1729,7 @@ function bindEvents() {
   });
   $("openProjectButton").addEventListener("click", async () => {
     const projectPath = $("projectPath").value.trim();
+    state.hiddenProjectPaths.delete(projectPath);
     const storageRootPath = $("registrationStorageRootPath").value.trim();
     const createInitialCheckpoint = wantsInitialCheckpoint("registrationInitialCheckpoint");
     try {
@@ -1678,19 +1847,26 @@ function bindEvents() {
     await previewRestoreCheckpoint(getCheckpointId());
   });
   $("applyRollbackButton").addEventListener("click", async () => {
-    if (!state.rollbackPlan) {
+    const context = state.rollbackPlanContext;
+    if (!state.rollbackPlan || !context
+      || context.projectPath !== state.projectPath
+      || context.checkpointId !== state.selectedCheckpointId) {
+      state.rollbackPlan = null;
+      state.rollbackPlanContext = null;
+      updateControls();
       setStatus("先に preview を実行してください。");
       return;
     }
     await run("戻し中", async () => {
       await invokeCommand("apply_restore", {
-        projectPath: getProjectPath(),
-        checkpointId: getCheckpointId(),
+        projectPath: context.projectPath,
+        checkpointId: context.checkpointId,
         expectedPlan: state.rollbackPlan,
         confirmed: true,
       });
       setBusyIndeterminate("再読み込み中");
       state.rollbackPlan = null;
+      state.rollbackPlanContext = null;
       $("rollbackOverlay").hidden = true;
       await refreshProject();
       await refreshLatestDiff({ allowBusy: true });
@@ -1817,7 +1993,26 @@ function bindEvents() {
 }
 
 function renderProgress(progress) {
+  if (!state.busy || !state.activeCommand) return;
+  if (!immediatelyCancellableCommands.has(state.activeCommand)
+    && !progressCancellableStartCommands.has(state.activeCommand)) return;
+  state.pendingProgress = progress;
+  if (state.progressFrame !== null) return;
+  state.progressFrame = requestAnimationFrame(() => {
+    state.progressFrame = null;
+    const latest = state.pendingProgress;
+    state.pendingProgress = null;
+    if (latest) renderProgressImmediately(latest);
+  });
+}
+
+function renderProgressImmediately(progress) {
   if (!state.busy) return;
+  if (progress?.phase === "complete") {
+    if (state.progressFrame !== null) cancelAnimationFrame(state.progressFrame);
+    state.progressFrame = null;
+    state.pendingProgress = null;
+  }
   const total = Number(progress?.total || 0);
   const completed = Number(progress?.completed || 0);
   const percent = total > 0 ? Math.max(0, Math.min(100, Math.floor((completed * 100) / total))) : undefined;

@@ -1,5 +1,21 @@
 use super::*;
 
+struct TemporaryObjectFile {
+    path: PathBuf,
+}
+
+impl TemporaryObjectFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryObjectFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub fn put_object_from_file_with_known_hash(
     repo_root: &Path,
     source: &Path,
@@ -9,6 +25,7 @@ pub fn put_object_from_file_with_known_hash(
     let tmp_dir = repo_root.join("tmp");
     fs::create_dir_all(&tmp_dir).map_err(|error| io_error(&tmp_dir, error))?;
     let temp_path = tmp_dir.join(format!("object-{}.tmp", Uuid::new_v4().simple()));
+    let _temp_file_guard = TemporaryObjectFile::new(temp_path.clone());
     let mut input = File::open(source).map_err(|error| io_error(source, error))?;
     let mut output = File::create(&temp_path).map_err(|error| io_error(&temp_path, error))?;
     let mut buffer = [0_u8; 64 * 1024];
@@ -32,7 +49,6 @@ pub fn put_object_from_file_with_known_hash(
         .map_err(|error| io_error(&temp_path, error))?;
     drop(output);
     if copied_size_bytes != size_bytes {
-        fs::remove_file(&temp_path).map_err(|error| io_error(&temp_path, error))?;
         return Err(CheckPoError::ObjectHashMismatch(format!(
             "{} size expected {}, got {}",
             source.display(),
@@ -42,7 +58,6 @@ pub fn put_object_from_file_with_known_hash(
     }
     let actual = ObjectId::parse(hasher.finalize().to_hex().as_ref())?;
     if &actual != object_id {
-        let _ = fs::remove_file(&temp_path);
         return Err(CheckPoError::ObjectHashMismatch(format!(
             "{} expected {}, got {}",
             source.display(),

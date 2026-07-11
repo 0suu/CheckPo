@@ -899,6 +899,73 @@ fn orphan_checkpo_temporary_files_can_be_cleaned_up_explicitly() {
 }
 
 #[test]
+fn repository_object_temporary_files_are_included_in_cleanup() {
+    let (_guard, _temp, project, _data) = setup();
+    let view = init_project_for_test(&project).unwrap();
+    let repo_tmp = repo_path(&view).join("tmp");
+    let project_temp =
+        project.join("Assets/Avatar/.checkpo-Foo.prefab-1234567890abcdef1234567890abcdef.tmp");
+    let repository_temp = repo_tmp.join("object-0123456789abcdef0123456789abcdef.tmp");
+    let uppercase_name = repo_tmp.join("object-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.tmp");
+    let invalid_hex = repo_tmp.join("object-gggggggggggggggggggggggggggggggg.tmp");
+    let matching_directory = repo_tmp.join("object-11111111111111111111111111111111.tmp");
+    fs::write(&project_temp, "temp").unwrap();
+    fs::write(&repository_temp, "repository").unwrap();
+    fs::write(&uppercase_name, "uppercase").unwrap();
+    fs::write(&invalid_hex, "invalid").unwrap();
+    fs::create_dir(&matching_directory).unwrap();
+
+    let plan = core::analyze_orphan_temp_files(&project).unwrap();
+
+    assert_eq!(plan.file_count, 2);
+    assert_eq!(plan.files.len(), 1);
+    assert_eq!(plan.repository_files.len(), 1);
+    assert_eq!(plan.files[0].size_bytes, 4);
+    assert_eq!(plan.repository_files[0].size_bytes, 10);
+    assert_eq!(plan.total_bytes, 14);
+    assert_eq!(
+        plan.repository_files[0].file_name,
+        "object-0123456789abcdef0123456789abcdef.tmp"
+    );
+
+    let result =
+        core::cleanup_orphan_temp_files(&project, core::ApplyOptions { yes: true }).unwrap();
+
+    assert_eq!(result.deleted_file_count, 2);
+    assert_eq!(result.deleted_bytes, 14);
+    assert!(!project_temp.exists());
+    assert!(!repository_temp.exists());
+    assert!(uppercase_name.exists());
+    assert!(invalid_hex.exists());
+    assert!(matching_directory.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_temporary_cleanup_does_not_follow_symlinks() {
+    let (_guard, temp, project, _data) = setup();
+    let view = init_project_for_test(&project).unwrap();
+    let repo_tmp = repo_path(&view).join("tmp");
+    let outside = temp.path().join("outside-object-temp");
+    let linked_temp = repo_tmp.join("object-0123456789abcdef0123456789abcdef.tmp");
+    fs::write(&outside, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside, &linked_temp).unwrap();
+
+    let plan = core::analyze_orphan_temp_files(&project).unwrap();
+    assert!(plan.repository_files.is_empty());
+
+    let result =
+        core::cleanup_orphan_temp_files(&project, core::ApplyOptions { yes: true }).unwrap();
+
+    assert_eq!(result.deleted_file_count, 0);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+    assert!(fs::symlink_metadata(&linked_temp)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
 fn temporary_cleanup_only_deletes_checkpo_owned_temporary_files() {
     let (_guard, _temp, project, _data) = setup();
     init_project_for_test(&project).unwrap();
@@ -1622,6 +1689,66 @@ fn discard_deletes_selected_file_absent_from_checkpoint_only() {
         fs::read_to_string(project.join("Assets/Avatar/Foo.prefab")).unwrap(),
         "two"
     );
+}
+
+#[test]
+fn discard_expands_unity_asset_selection_to_its_meta_file() {
+    let (_guard, _temp, project, _data) = setup();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default())
+        .unwrap()
+        .checkpoint_id;
+    let asset = project.join("Assets/Avatar/Added.asset");
+    let meta = project.join("Assets/Avatar/Added.asset.meta");
+    fs::write(&asset, "asset").unwrap();
+    fs::write(&meta, "guid: added").unwrap();
+    let requested = vec!["Assets/Avatar/Added.asset".to_string()];
+
+    let plan =
+        core::preview_discard_files(&project, &requested, Some(checkpoint.as_str())).unwrap();
+
+    assert_eq!(plan.delete_count, 2);
+    assert_eq!(plan.selected_paths.as_ref().unwrap().len(), 2);
+    core::apply_discard_files_plan(
+        &project,
+        &requested,
+        Some(checkpoint.as_str()),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert!(!asset.exists());
+    assert!(!meta.exists());
+}
+
+#[test]
+fn discard_does_not_treat_a_directory_as_the_asset_for_directory_meta() {
+    let (_guard, _temp, project, _data) = setup();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default())
+        .unwrap()
+        .checkpoint_id;
+    let directory = project.join("Assets/Avatar/Folder");
+    let meta = project.join("Assets/Avatar/Folder.meta");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(&meta, "guid: folder").unwrap();
+    let requested = vec!["Assets/Avatar/Folder.meta".to_string()];
+
+    let plan =
+        core::preview_discard_files(&project, &requested, Some(checkpoint.as_str())).unwrap();
+
+    assert_eq!(plan.delete_count, 1);
+    assert_eq!(plan.selected_paths.as_ref().unwrap().len(), 1);
+    core::apply_discard_files_plan(
+        &project,
+        &requested,
+        Some(checkpoint.as_str()),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert!(directory.is_dir());
+    assert!(!meta.exists());
 }
 
 #[test]

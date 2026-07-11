@@ -24,6 +24,12 @@ pub fn build_plan_with_progress_and_cancellation(
         .iter()
         .map(|file| (file.path.clone(), file))
         .collect::<BTreeMap<_, _>>();
+    let effective_selected = match (kind, selected) {
+        (OperationPlanKind::Discard, Some(selected)) => Some(
+            normalize_discard_selection_with_snapshot(project, snapshot_map.keys(), selected)?,
+        ),
+        _ => None,
+    };
     let mut operations = Vec::new();
     let mut warnings = Vec::new();
     match kind {
@@ -110,7 +116,7 @@ pub fn build_plan_with_progress_and_cancellation(
             }
         }
         OperationPlanKind::Discard => {
-            let selected = selected.ok_or_else(|| {
+            let selected = effective_selected.as_deref().ok_or_else(|| {
                 CheckPoError::InvalidTrackedPath(
                     "discard requires selected tracked paths".to_string(),
                 )
@@ -171,7 +177,7 @@ pub fn build_plan_with_progress_and_cancellation(
     Ok(OperationPlan::new(
         checkpoint_id,
         kind,
-        selected.map(|paths| {
+        effective_selected.as_deref().map(|paths| {
             paths
                 .iter()
                 .cloned()
@@ -182,6 +188,67 @@ pub fn build_plan_with_progress_and_cancellation(
         operations,
     )
     .with_warnings(warnings))
+}
+
+pub(crate) fn normalize_discard_selection(
+    project: &ProjectContext,
+    checkpoint_id: &SnapshotId,
+    selected: &[TrackedUnityFilePath],
+) -> Result<Vec<TrackedUnityFilePath>> {
+    let snapshot = load_project_snapshot(project, checkpoint_id)?;
+    normalize_discard_selection_with_snapshot(
+        project,
+        snapshot.files.iter().map(|file| &file.path),
+        selected,
+    )
+}
+
+fn normalize_discard_selection_with_snapshot<'a>(
+    project: &ProjectContext,
+    snapshot_paths: impl Iterator<Item = &'a TrackedUnityFilePath>,
+    selected: &[TrackedUnityFilePath],
+) -> Result<Vec<TrackedUnityFilePath>> {
+    let snapshot_paths = snapshot_paths.cloned().collect::<BTreeSet<_>>();
+    let mut effective = selected.iter().cloned().collect::<BTreeSet<_>>();
+    for path in selected {
+        let Some(companion) = unity_asset_companion_path(path) else {
+            continue;
+        };
+        if snapshot_paths.contains(&companion)
+            || current_companion_is_regular_file(project, &companion)?
+        {
+            effective.insert(companion);
+        }
+    }
+    Ok(effective.into_iter().collect())
+}
+
+fn unity_asset_companion_path(path: &TrackedUnityFilePath) -> Option<TrackedUnityFilePath> {
+    let value = path.as_str();
+    if !value.starts_with("Assets/") {
+        return None;
+    }
+    let candidate = match value.strip_suffix(".meta") {
+        Some(asset) => asset.to_string(),
+        None => format!("{value}.meta"),
+    };
+    TrackedUnityFilePath::parse(&candidate).ok()
+}
+
+fn current_companion_is_regular_file(
+    project: &ProjectContext,
+    path: &TrackedUnityFilePath,
+) -> Result<bool> {
+    ensure_project_parent_is_safe(project, path)?;
+    let full_path = path.to_project_path(project.project_root.as_path());
+    match fs::symlink_metadata(&full_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(CheckPoError::InvalidTrackedPath(path.to_string()))
+        }
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(crate::io_error(&full_path, error)),
+    }
 }
 
 pub(super) fn validate_expected_plan(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {

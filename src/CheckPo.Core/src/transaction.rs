@@ -39,6 +39,7 @@ use journal::{
     JOURNAL_STATE_UNREADABLE,
 };
 pub use plan::build_plan_with_progress_and_cancellation;
+pub(crate) use plan::normalize_discard_selection;
 use plan::{validate_expected_plan, validate_journal_operations};
 #[cfg(test)]
 use project_file_ops::backup_project_file_by_reflink_or_copy;

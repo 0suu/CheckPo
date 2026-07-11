@@ -90,6 +90,14 @@
             <button class="button danger-secondary" id="recoverTransactionsButton" type="button" data-i18n="recoverTransactions">Recover</button>
           </section>
 
+          <section class="error-banner" id="errorBanner" role="alert" aria-live="assertive" hidden>
+            <div>
+              <strong>操作を完了できませんでした</strong>
+              <span id="errorBannerText"></span>
+            </div>
+            <button class="ghost-button" id="dismissErrorButton" type="button">閉じる</button>
+          </section>
+
           <section class="quarantine-banner" id="unresolvedQuarantineBanner" hidden>
             <div>
               <strong data-i18n="unresolvedQuarantineTitle">プロジェクトの状態を確認できません</strong>
@@ -359,6 +367,7 @@
           <div class="danger-band">
             <h2 data-i18n="rollbackTitle">Rollback modifies the current Unity project</h2>
             <p id="rollbackSummary" data-i18n="rollbackEmpty">Preview rollback before applying it.</p>
+            <p class="dialog-error" id="rollbackError" role="alert" hidden></p>
             <ul id="rollbackWarnings"></ul>
           </div>
           <div class="rollback-confirm">

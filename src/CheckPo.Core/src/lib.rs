@@ -42,11 +42,12 @@ pub use models::{
     InvalidObjectLocation, MissingBlobReference, OperationPlan, OperationPlanKind,
     OperationProgress, OrphanTempFile, PendingTransaction, ProjectContext, ProjectLocationStatus,
     ProjectMarkerFile, ProjectView, ProjectWarning, ProjectWarningKind, RebuildIndexResult,
-    RegistryFile, RegistryProjectEntry, RepositoryConfig, ScanWarning, ScannedFile,
-    SkippedSnapshot, SnapshotContent, SnapshotEntry, SnapshotFile, StorageGcPlan, StorageGcResult,
-    StorageSummary, TempFileCleanupPlan, TempFileCleanupResult, TransactionCleanupResult,
-    TransactionQuarantineResult, TransactionRecoveryFailure, TransactionRecoveryResult,
-    UnreferencedBlob, UnresolvedTransactionQuarantine, VerificationResult,
+    RegistryFile, RegistryProjectEntry, RepositoryConfig, RepositoryTempFile, ScanWarning,
+    ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry, SnapshotFile, StorageGcPlan,
+    StorageGcResult, StorageSummary, TempFileCleanupPlan, TempFileCleanupResult,
+    TransactionCleanupResult, TransactionQuarantineResult, TransactionRecoveryFailure,
+    TransactionRecoveryResult, UnreferencedBlob, UnresolvedTransactionQuarantine,
+    VerificationResult,
 };
 pub use path::{
     hash_bytes, parse_tracked_paths, ObjectId, ProjectId, ProjectRoot, SnapshotId, StorageRoot,
