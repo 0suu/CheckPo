@@ -45,6 +45,15 @@ pub fn diff_checkpoint_metadata(
     project_path: impl AsRef<Path>,
     checkpoint_id: &str,
 ) -> Result<DiffResult> {
+    diff_checkpoint_metadata_with_cancellation(project_path, checkpoint_id, None)
+}
+
+pub fn diff_checkpoint_metadata_with_cancellation(
+    project_path: impl AsRef<Path>,
+    checkpoint_id: &str,
+    cancellation: Option<&crate::CancellationToken>,
+) -> Result<DiffResult> {
+    crate::ensure_not_cancelled(cancellation)?;
     let project = load_project(project_path)?;
     let snapshot_id = SnapshotId::parse(checkpoint_id)?;
     let snapshot = load_project_snapshot(&project, &snapshot_id)?;
@@ -62,7 +71,7 @@ pub fn diff_checkpoint_metadata(
         })
         .collect::<BTreeMap<_, _>>();
     let (working, warnings) =
-        crate::scanner::scan_project_metadata(project.project_root.as_path())?;
+        crate::scanner::scan_project_metadata(project.project_root.as_path(), cancellation)?;
     let working_map = working
         .into_iter()
         .map(|file| {

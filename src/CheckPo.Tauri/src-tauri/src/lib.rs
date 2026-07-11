@@ -280,10 +280,18 @@ async fn diff_checkpoint(
     project_path: String,
     checkpoint_id: String,
 ) -> AppResult {
-    run_guarded_blocking(state, None, move || {
-        core::diff_checkpoint(&project_path, &checkpoint_id)
-            .map(|result| json!(result))
-            .map_err(to_app_error)
+    let token = core::CancellationToken::new();
+    run_guarded_blocking(state, Some(token.clone()), move || {
+        core::diff_checkpoint_with_options(
+            &project_path,
+            &checkpoint_id,
+            core::DiffOptions {
+                progress: None,
+                cancellation: Some(token),
+            },
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
     })
     .await
 }
@@ -294,10 +302,15 @@ async fn diff_checkpoint_metadata(
     project_path: String,
     checkpoint_id: String,
 ) -> AppResult {
-    run_guarded_blocking(state, None, move || {
-        core::diff_checkpoint_metadata(&project_path, &checkpoint_id)
-            .map(|result| json!(result))
-            .map_err(to_app_error)
+    let token = core::CancellationToken::new();
+    run_guarded_blocking(state, Some(token.clone()), move || {
+        core::diff_checkpoint_metadata_with_cancellation(
+            &project_path,
+            &checkpoint_id,
+            Some(&token),
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
     })
     .await
 }
@@ -1022,6 +1035,9 @@ mod tests {
         );
         assert!(app_js.contains(r#"invokeCommand("diff_checkpoint_full""#));
         assert!(app_js.contains(r#"await refreshLatestDiff({ allowBusy: true });"#));
+        assert!(app_js.contains(r#"cancel: () => tauriInvoke("cancel_current_operation")"#));
+        assert!(app_js.contains("AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS"));
+        assert!(!app_js.contains("while (state.autoRefreshInFlight)"));
     }
 }
 

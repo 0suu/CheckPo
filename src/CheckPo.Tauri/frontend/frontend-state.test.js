@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   buildChangeTreeModel,
+  cancelAndWaitForIdle,
   collectChangeTreeFolderPaths,
   flattenChangeTreeRows,
   localizedErrorDisplay,
@@ -174,6 +175,42 @@ test("queued metadata refresh stays metadata-only only when every request is met
   assert.equal(queued.metadataOnly, true);
   assert.equal(queued.silent, true);
   assert.equal(queued.allowBusy, true);
+});
+
+test("foreground work cancels an active background operation and waits for it to finish", async () => {
+  let active = true;
+  let cancelCount = 0;
+  const completed = await cancelAndWaitForIdle({
+    isActive: () => active,
+    cancel: async () => {
+      cancelCount += 1;
+      active = false;
+    },
+    sleep: async () => {},
+    timeoutMs: 5000,
+    intervalMs: 100,
+    now: () => 0,
+  });
+
+  assert.equal(completed, true);
+  assert.equal(cancelCount, 1);
+});
+
+test("foreground work stops waiting when background cancellation does not finish", async () => {
+  let now = 0;
+  const completed = await cancelAndWaitForIdle({
+    isActive: () => true,
+    cancel: async () => {},
+    sleep: async (duration) => {
+      now += duration;
+    },
+    timeoutMs: 500,
+    intervalMs: 100,
+    now: () => now,
+  });
+
+  assert.equal(completed, false);
+  assert.equal(now, 500);
 });
 
 test("large change trees flatten without requiring one DOM node per row", () => {

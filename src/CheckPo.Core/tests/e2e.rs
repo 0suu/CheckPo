@@ -1090,6 +1090,25 @@ fn metadata_diff_detects_added_deleted_and_metadata_changed_files() {
 }
 
 #[test]
+fn metadata_diff_honors_pre_cancelled_token() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    let cancellation = core::CancellationToken::new();
+    cancellation.cancel();
+
+    let error = core::diff_checkpoint_metadata_with_cancellation(
+        &project,
+        checkpoint.checkpoint_id.as_str(),
+        Some(&cancellation),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, core::CheckPoError::Cancelled));
+}
+
+#[test]
 fn metadata_diff_warns_when_tracked_root_is_not_directory() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();

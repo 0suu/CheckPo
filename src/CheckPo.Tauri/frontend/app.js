@@ -4,6 +4,7 @@ const RESULT_OUTPUT_MAX_CHARS = 20000;
 const ROLLBACK_OPERATION_RENDER_LIMIT = 500;
 const OPERATION_BUSY_RETRY_DELAYS_MS = [150, 300, 600, 1000, 1500];
 const AUTO_REFRESH_WAIT_INTERVAL_MS = 100;
+const AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS = 1000;
 
 function readLocalSetting(key, fallback = "") {
   const current = localStorage.getItem(`checkPo.${key}`);
@@ -57,6 +58,7 @@ const state = {
   lastSelectedChangePath: null,
   busy: false,
   autoRefreshInFlight: false,
+  autoRefreshGeneration: 0,
   queuedDiffRefreshOptions: null,
   lastAutoRefreshAt: 0,
   userOperationSerial: 0,
@@ -144,11 +146,11 @@ async function invokeCommand(command, args = {}, options = {}) {
     throw new Error("Tauri invoke API is not available.");
   }
   const trackOperation = command !== "cancel_current_operation" && !options.fromAutoRefresh;
-  if (trackOperation) {
+  if (trackOperation && options.preemptAutoRefresh !== false) {
     if (state.autoRefreshInFlight && state.busy) {
-      setBusyIndeterminate(t("waitingForAutoRefresh"));
+      setBusyIndeterminate("背景の差分確認を中止中");
     }
-    await waitForAutoRefreshToFinish();
+    await preemptAutoRefreshForForeground();
   }
   if (trackOperation) {
     state.activeCommand = command;
@@ -172,10 +174,8 @@ async function invokeCommand(command, args = {}, options = {}) {
         const canRetryBusy = command !== "cancel_current_operation"
           && errorKind(error) === "operationBusy";
         if (!canRetryBusy) throw error;
-        if (state.autoRefreshInFlight && !options.fromAutoRefresh) {
-          setStatus(t("waitingForAutoRefresh"));
-          await waitForAutoRefreshToFinish();
-          continue;
+        if (state.cancelRequested) {
+          throw { kind: "cancelled", message: "Operation cancelled" };
         }
         if (busyRetryIndex >= OPERATION_BUSY_RETRY_DELAYS_MS.length) throw error;
         if (busyRetryIndex === 0) setStatus("別の処理の完了を待っています。");
@@ -196,10 +196,18 @@ function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function waitForAutoRefreshToFinish() {
-  while (state.autoRefreshInFlight) {
-    await sleep(AUTO_REFRESH_WAIT_INTERVAL_MS);
-  }
+async function preemptAutoRefreshForForeground() {
+  state.autoRefreshGeneration += 1;
+  state.diffRequestSerial += 1;
+  state.queuedDiffRefreshOptions = null;
+  if (!state.autoRefreshInFlight) return;
+  await CheckPoFrontendState.cancelAndWaitForIdle({
+    isActive: () => state.autoRefreshInFlight,
+    cancel: () => tauriInvoke("cancel_current_operation"),
+    sleep,
+    timeoutMs: AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS,
+    intervalMs: AUTO_REFRESH_WAIT_INTERVAL_MS,
+  });
 }
 
 async function run(title, task, options = {}) {
@@ -455,7 +463,7 @@ async function refreshProject(options = {}) {
     { projectPath: getProjectPath() },
     { fromAutoRefresh: options.fromAutoRefresh },
   );
-  renderSnapshot(snapshot);
+  if (options.render !== false) renderSnapshot(snapshot);
   return snapshot;
 }
 
@@ -470,18 +478,23 @@ async function refreshLatestDiff(options = {}) {
   }
   const backgroundRefresh = !options.allowBusy;
   const startedUserOperationSerial = state.userOperationSerial;
+  const generation = state.autoRefreshGeneration;
   state.autoRefreshInFlight = true;
   updateAutoRefreshStatus();
   try {
     if (options.refreshProject) {
-      await refreshProject({ fromAutoRefresh: true });
-      if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) return;
+      const snapshot = await refreshProject({ fromAutoRefresh: true, render: false });
+      if (generation !== state.autoRefreshGeneration
+        || (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial)) return;
+      renderSnapshot(snapshot);
     }
+    if (generation !== state.autoRefreshGeneration) return;
     const requestSerial = ++state.diffRequestSerial;
     const projectPath = getProjectPath();
     const checkpointId = diffBaselineCheckpointId();
     if (!checkpointId) {
-      if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) return;
+      if (generation !== state.autoRefreshGeneration
+        || (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial)) return;
       state.currentDiff = null;
       $("diffSummary").textContent = t("diffEmpty");
       resetVirtualDiffTree();
@@ -501,7 +514,8 @@ async function refreshLatestDiff(options = {}) {
       },
       { fromAutoRefresh: true },
     );
-    if (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial) {
+    if (generation !== state.autoRefreshGeneration
+      || (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial)) {
       return;
     }
     if (requestSerial !== state.diffRequestSerial
@@ -512,6 +526,7 @@ async function refreshLatestDiff(options = {}) {
       setStatus(`高速確認で一部確認できませんでした:\n${diff.warnings.join("\n")}`);
     }
   } catch (error) {
+    if (generation !== state.autoRefreshGeneration || errorKind(error) === "cancelled") return;
     clearCurrentDiff();
     if (!options.silent) showError(error);
   } finally {
@@ -827,7 +842,12 @@ function renderCheckpoints() {
       <strong class="checkpoint-title">未保存の変更</strong>
       <span class="checkpoint-meta">${changeCount}${t("fileUnit")}</span>
     `;
-    working.addEventListener("click", () => refreshLatestDiff({ refreshProject: true }));
+    working.addEventListener("click", async () => {
+      await run("再読み込み中", async () => {
+        await refreshProject();
+        await refreshLatestDiff({ allowBusy: true });
+      });
+    });
     workingSection.append(heading, working);
     list.append(workingSection);
   }
@@ -1094,6 +1114,7 @@ async function previewRestoreCheckpoint(checkpointId) {
     return;
   }
   selectCheckpoint(checkpointId);
+  $("rollbackOverlay").hidden = true;
   const requestSerial = ++state.rollbackRequestSerial;
   const projectPath = getProjectPath();
   await run("戻す内容を確認中", async () => {

@@ -143,6 +143,25 @@
     };
   }
 
+  async function cancelAndWaitForIdle({
+    isActive,
+    cancel,
+    sleep,
+    timeoutMs,
+    intervalMs,
+    now = Date.now,
+  }) {
+    if (!isActive()) return true;
+    await cancel();
+    const deadline = now() + timeoutMs;
+    while (isActive()) {
+      const remaining = deadline - now();
+      if (remaining <= 0) return false;
+      await sleep(Math.min(intervalMs, remaining));
+    }
+    return true;
+  }
+
   function buildChangeTreeModel(changes) {
     const root = createChangeTreeNode("", "");
     for (const change of changes) {
@@ -274,6 +293,7 @@
 
   return {
     buildChangeTreeModel,
+    cancelAndWaitForIdle,
     collectChangeTreeFilePaths,
     collectChangeTreeFolderPaths,
     flattenChangeTreeRows,

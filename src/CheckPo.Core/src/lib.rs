@@ -27,7 +27,10 @@ pub use db::{
 pub use diagnostics::{
     diagnostic_log_directory, init_diagnostics, log_operation_error, DiagnosticsGuard,
 };
-pub use diff::{diff_checkpoint, diff_checkpoint_metadata, diff_checkpoint_with_options};
+pub use diff::{
+    diff_checkpoint, diff_checkpoint_metadata, diff_checkpoint_metadata_with_cancellation,
+    diff_checkpoint_with_options,
+};
 pub use discard::{
     apply_discard_files_plan, apply_discard_plan_with_progress_and_cancellation,
     preview_discard_files, preview_discard_with_progress_and_cancellation,
