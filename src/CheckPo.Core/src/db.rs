@@ -12,6 +12,38 @@ use walkdir::WalkDir;
 
 const INDEX_STATE_SNAPSHOT_DIR_FINGERPRINT: &str = "snapshot_dir_fingerprint";
 
+fn sqlite_i64_from_u64(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        crate::CheckPoError::Corruption(format!(
+            "{field} value {value} exceeds SQLite's signed integer range"
+        ))
+    })
+}
+
+fn sqlite_i64_from_usize(value: usize, field: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| {
+        crate::CheckPoError::Corruption(format!(
+            "{field} value {value} exceeds SQLite's signed integer range"
+        ))
+    })
+}
+
+fn u64_from_sqlite_i64(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        crate::CheckPoError::IndexUnavailable(format!(
+            "SQLite index contains a negative {field} value: {value}"
+        ))
+    })
+}
+
+fn usize_from_sqlite_i64(value: i64, field: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        crate::CheckPoError::IndexUnavailable(format!(
+            "SQLite index contains an invalid {field} value: {value}"
+        ))
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedFileFingerprint {
     pub size_bytes: u64,
@@ -91,7 +123,7 @@ pub fn checkpoint_summaries_and_storage_summary_from_index(
     let conn = open_db(&project.repo_root)?;
     create_schema(&conn, &db_path)?;
     let mut checkpoints = query_checkpoint_summaries(&conn, &db_path, project)?;
-    crate::apply_checkpoint_name_overrides(project, &mut checkpoints);
+    let _ = crate::apply_checkpoint_name_overrides(project, &mut checkpoints);
     let storage = query_storage_summary(&conn, &db_path, project)?;
     Ok((checkpoints, storage))
 }
@@ -107,7 +139,8 @@ fn query_storage_summary(
             params![project.project_id.as_str()],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| db_error(db_path, error))? as usize;
+        .map_err(|error| db_error(db_path, error))?;
+    let checkpoint_count = usize_from_sqlite_i64(checkpoint_count, "checkpoint count")?;
     let logical_size_bytes = conn
         .query_row(
             "SELECT COALESCE(SUM(se.size_bytes), 0)
@@ -117,7 +150,8 @@ fn query_storage_summary(
             params![project.project_id.as_str()],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| db_error(db_path, error))? as u64;
+        .map_err(|error| db_error(db_path, error))?;
+    let logical_size_bytes = u64_from_sqlite_i64(logical_size_bytes, "logical size in bytes")?;
     let unique_blob_count = conn
         .query_row(
             "SELECT COUNT(DISTINCT se.object_id)
@@ -127,7 +161,8 @@ fn query_storage_summary(
             params![project.project_id.as_str()],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| db_error(db_path, error))? as usize;
+        .map_err(|error| db_error(db_path, error))?;
+    let unique_blob_count = usize_from_sqlite_i64(unique_blob_count, "unique blob count")?;
     let stored_size_bytes = conn
         .query_row(
             "SELECT COALESCE(SUM(o.size_bytes), 0)
@@ -141,7 +176,8 @@ fn query_storage_summary(
             params![project.project_id.as_str()],
             |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| db_error(db_path, error))? as u64;
+        .map_err(|error| db_error(db_path, error))?;
+    let stored_size_bytes = u64_from_sqlite_i64(stored_size_bytes, "stored size in bytes")?;
 
     Ok(StorageSummary {
         checkpoint_count,
@@ -174,7 +210,7 @@ fn load_file_fingerprints_with_connection(
         .query_map(params![project.project_id.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
@@ -184,6 +220,7 @@ fn load_file_fingerprints_with_connection(
     for row in rows {
         let (path, size_bytes, fingerprint, object_id) =
             row.map_err(|error| db_error(db_path, error))?;
+        let size_bytes = u64_from_sqlite_i64(size_bytes, "file fingerprint size in bytes")?;
         let Ok(path) = TrackedUnityFilePath::parse(&path) else {
             continue;
         };
@@ -222,11 +259,13 @@ pub(crate) fn refresh_file_fingerprints_with_index_connection(
             )
             .map_err(|error| db_error(&index.db_path, error))?;
         for update in updates {
+            let size_bytes =
+                sqlite_i64_from_u64(update.size_bytes, "file fingerprint size in bytes")?;
             statement
                 .execute(params![
                     project.project_id.as_str(),
                     update.path.as_str(),
-                    update.size_bytes as i64,
+                    size_bytes,
                     update.modified_at_utc.as_str(),
                     update.fingerprint.as_str(),
                     update.object_id.as_str(),
@@ -346,6 +385,16 @@ fn index_snapshot_with_connection(
     snapshot_id: &SnapshotId,
     snapshot: &SnapshotFile,
 ) -> Result<()> {
+    let file_count = sqlite_i64_from_usize(snapshot.files.len(), "snapshot file count")?;
+    let logical_size_bytes = snapshot.files.iter().try_fold(0_u64, |total, file| {
+        total.checked_add(file.size_bytes).ok_or_else(|| {
+            crate::CheckPoError::Corruption(format!(
+                "snapshot {snapshot_id} logical size exceeds the supported range"
+            ))
+        })
+    })?;
+    let logical_size_bytes =
+        sqlite_i64_from_u64(logical_size_bytes, "snapshot logical size in bytes")?;
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| db_error(db_path, error))?;
@@ -358,8 +407,8 @@ fn index_snapshot_with_connection(
             snapshot.created_at_utc.as_str(),
             snapshot.name.as_str(),
             snapshot.parent_snapshot_id.as_ref().map(|id| id.as_str()),
-            snapshot.files.len() as i64,
-            snapshot.files.iter().map(|file| file.size_bytes).sum::<u64>() as i64,
+            file_count,
+            logical_size_bytes,
         ],
     )
     .map_err(|error| db_error(db_path, error))?;
@@ -369,6 +418,7 @@ fn index_snapshot_with_connection(
     )
     .map_err(|error| db_error(db_path, error))?;
     for file in &snapshot.files {
+        let size_bytes = sqlite_i64_from_u64(file.size_bytes, "snapshot entry size in bytes")?;
         tx.execute(
             "INSERT OR REPLACE INTO snapshot_entries(snapshot_id, path, object_id, size_bytes, modified_at_utc)
              VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -376,7 +426,7 @@ fn index_snapshot_with_connection(
                 snapshot_id.as_str(),
                 file.path.as_str(),
                 file.content_hash().as_str(),
-                file.size_bytes as i64,
+                size_bytes,
                 file.modified_at_utc.as_str(),
             ],
         )
@@ -384,12 +434,14 @@ fn index_snapshot_with_connection(
         if let Ok((relative_path, stored_size_bytes)) =
             object_index_entry(repo_root, file.content_hash())
         {
+            let stored_size_bytes =
+                sqlite_i64_from_u64(stored_size_bytes, "stored object size in bytes")?;
             tx.execute(
                 "INSERT OR REPLACE INTO objects(object_id, size_bytes, relative_path, verified_at_utc)
                  VALUES(?1, ?2, ?3, NULL)",
                 params![
                     file.content_hash().as_str(),
-                    stored_size_bytes as i64,
+                    stored_size_bytes,
                     relative_path.to_string_lossy().to_string(),
                 ],
             )
@@ -481,8 +533,8 @@ fn query_checkpoint_summaries(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)? as usize,
-                row.get::<_, i64>(4)? as u64,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(|error| db_error(db_path, error))?;
@@ -490,6 +542,9 @@ fn query_checkpoint_summaries(
     for row in rows {
         let (snapshot_id, name, created_at_utc, file_count, logical_size_bytes) =
             row.map_err(|error| db_error(db_path, error))?;
+        let file_count = usize_from_sqlite_i64(file_count, "snapshot file count")?;
+        let logical_size_bytes =
+            u64_from_sqlite_i64(logical_size_bytes, "snapshot logical size in bytes")?;
         summaries.push(CheckpointSummary {
             checkpoint_id: SnapshotId::parse(&snapshot_id)?,
             name,
@@ -515,7 +570,7 @@ fn indexed_snapshot_count(
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| db_error(db_path, error))?;
-    Ok(count as usize)
+    usize_from_sqlite_i64(count, "indexed snapshot count")
 }
 
 fn delete_file_fingerprints(
@@ -596,14 +651,19 @@ fn index_existing_objects(
             };
             let metadata =
                 fs::metadata(entry.path()).map_err(|error| crate::io_error(entry.path(), error))?;
+            let size_bytes = sqlite_i64_from_u64(metadata.len(), "stored object size in bytes")?;
             statement
                 .execute(params![
                     object_id.as_str(),
-                    metadata.len() as i64,
+                    size_bytes,
                     relative.to_string_lossy().to_string(),
                 ])
                 .map_err(|error| db_error(db_path, error))?;
-            count += 1;
+            count = count.checked_add(1).ok_or_else(|| {
+                crate::CheckPoError::Corruption(
+                    "object count exceeds the supported platform range".to_string(),
+                )
+            })?;
         }
     }
     tx.commit().map_err(|error| db_error(db_path, error))?;
@@ -850,5 +910,21 @@ mod tests {
         let columns = table_columns(&conn, Path::new(":memory:"), "legacy-cache").unwrap();
 
         assert_eq!(columns, vec!["value".to_string()]);
+    }
+
+    #[test]
+    fn sqlite_integer_conversions_reject_negative_and_oversized_values() {
+        assert!(matches!(
+            u64_from_sqlite_i64(-1, "size"),
+            Err(crate::CheckPoError::IndexUnavailable(_))
+        ));
+        assert!(matches!(
+            usize_from_sqlite_i64(-1, "count"),
+            Err(crate::CheckPoError::IndexUnavailable(_))
+        ));
+        assert!(matches!(
+            sqlite_i64_from_u64(u64::MAX, "size"),
+            Err(crate::CheckPoError::Corruption(_))
+        ));
     }
 }

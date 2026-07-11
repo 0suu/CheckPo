@@ -1,5 +1,6 @@
 mod atomic_io;
 mod db_file;
+mod fs_safety;
 mod layout;
 mod lock;
 mod object_store;
@@ -28,6 +29,11 @@ pub(crate) use atomic_io::{
 };
 pub use atomic_io::{read_json, sync_parent_dir, write_bytes_atomic, write_json_atomic};
 pub use db_file::{db_path, open_db};
+pub(crate) use fs_safety::{
+    create_absolute_dir_all_no_follow, create_dir_all_no_follow,
+    ensure_regular_directory_no_follow, ensure_regular_file_no_follow, metadata_is_link_or_reparse,
+    validate_repository_layout_no_follow,
+};
 pub(crate) use layout::object_id_from_loose_relative_path;
 pub use layout::{
     canonical_utc, checkpoint_names_path, init_repo_layout, load_repo_config, now_utc_string,
@@ -36,7 +42,7 @@ pub use layout::{
 };
 pub(crate) use lock::FileLock;
 pub use lock::{acquire_repository_lock, RepositoryLock};
-pub(crate) use object_store::copy_object_to_file;
+pub(crate) use object_store::{copy_object_to_file, object_path_no_follow};
 pub use object_store::{
     hash_file, put_object_from_file_with_known_hash, verify_file_hash_and_size,
 };

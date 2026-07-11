@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) const JOURNAL_STATE_UNREADABLE: &str = "unreadable";
 pub(super) const JOURNAL_STATE_UNSUPPORTED_SCHEMA: &str = "unsupportedSchema";
-const TRANSACTION_JOURNAL_SCHEMA_VERSION_V1: u32 = 1;
+pub(super) const TRANSACTION_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +19,8 @@ pub(super) struct TransactionJournal {
     pub(super) checkpoint_id: SnapshotId,
     pub(super) kind: OperationPlanKind,
     pub(super) operations: Vec<FileOperation>,
+    pub(super) directories_to_remove: Vec<TrackedUnityFilePath>,
+    pub(super) directories_to_create: Vec<TrackedUnityFilePath>,
     pub(super) created_at_utc: String,
     pub(super) updated_at_utc: String,
 }
@@ -37,14 +39,14 @@ pub(super) fn validate_transaction_journal_identity(
     tx_root: &Path,
     journal: &TransactionJournal,
 ) -> Result<()> {
-    if journal.schema_version > TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
+    if journal.schema_version > TRANSACTION_JOURNAL_SCHEMA_VERSION {
         return Err(CheckPoError::UnsupportedFormat {
             artifact: "transaction journal schema".to_string(),
             found: journal.schema_version,
-            supported: TRANSACTION_JOURNAL_SCHEMA_VERSION_V1,
+            supported: TRANSACTION_JOURNAL_SCHEMA_VERSION,
         });
     }
-    if journal.schema_version != TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
+    if journal.schema_version != TRANSACTION_JOURNAL_SCHEMA_VERSION {
         return Err(CheckPoError::Corruption(format!(
             "invalid transaction journal schema: {}",
             journal.schema_version
@@ -67,18 +69,19 @@ pub(super) fn read_transaction_journal(path: &Path) -> Result<TransactionJournal
     let bytes = fs::read(path).map_err(|error| crate::io_error(path, error))?;
     let envelope: TransactionJournalEnvelope =
         serde_json::from_slice(&bytes).map_err(|error| crate::json_error(path, error))?;
-    if envelope.schema_version > TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
+    if envelope.schema_version > TRANSACTION_JOURNAL_SCHEMA_VERSION {
         return Err(CheckPoError::UnsupportedFormat {
             artifact: "transaction journal schema".to_string(),
             found: envelope.schema_version,
-            supported: TRANSACTION_JOURNAL_SCHEMA_VERSION_V1,
+            supported: TRANSACTION_JOURNAL_SCHEMA_VERSION,
         });
     }
-    if envelope.schema_version != TRANSACTION_JOURNAL_SCHEMA_VERSION_V1 {
-        return Err(CheckPoError::Corruption(format!(
-            "invalid transaction journal schema: {}",
-            envelope.schema_version
-        )));
+    if envelope.schema_version != TRANSACTION_JOURNAL_SCHEMA_VERSION {
+        return Err(CheckPoError::UnsupportedFormat {
+            artifact: "transaction journal schema".to_string(),
+            found: envelope.schema_version,
+            supported: TRANSACTION_JOURNAL_SCHEMA_VERSION,
+        });
     }
     serde_json::from_slice(&bytes).map_err(|error| crate::json_error(path, error))
 }
@@ -91,6 +94,7 @@ pub fn pending_transactions(project_path: impl AsRef<Path>) -> Result<Vec<Pendin
 pub fn pending_transactions_for_project(
     project: &ProjectContext,
 ) -> Result<Vec<PendingTransaction>> {
+    crate::validate_repository_layout_no_follow(&project.repo_root)?;
     let mut pending = Vec::new();
     let dir = journals_dir(&project.repo_root);
     if !dir.exists() {
@@ -98,11 +102,22 @@ pub fn pending_transactions_for_project(
     }
     for entry in fs::read_dir(&dir).map_err(|error| crate::io_error(&dir, error))? {
         let entry = entry.map_err(|error| crate::io_error(&dir, error))?;
-        if !entry.path().is_dir() {
+        let entry_metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| crate::io_error(entry.path(), error))?;
+        if crate::metadata_is_link_or_reparse(&entry_metadata) {
+            return Err(CheckPoError::Corruption(format!(
+                "transaction directory is a symbolic link or reparse point: {}",
+                entry.path().display()
+            )));
+        }
+        if !entry_metadata.is_dir() {
             continue;
         }
         let journal_path = entry.path().join("journal.json");
-        if !journal_path.is_file() {
+        let journal_is_regular = fs::symlink_metadata(&journal_path)
+            .map(|metadata| metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata))
+            .unwrap_or(false);
+        if !journal_is_regular {
             pending.push(PendingTransaction {
                 transaction_id: entry.file_name().to_string_lossy().to_string(),
                 state: "unknown".to_string(),
@@ -163,6 +178,7 @@ pub fn cleanup_journals(
     let project = crate::load_project(project_path)?;
     crate::ensure_project_location_allows_mutation(&project)?;
     let _lock = acquire_repository_lock(&project.repo_root, "transaction-cleanup")?;
+    crate::validate_repository_layout_no_follow(&project.repo_root)?;
     let mut deleted_directory_count = 0_usize;
     let mut deleted_bytes = 0_u64;
     let dir = journals_dir(&project.repo_root);
@@ -175,8 +191,18 @@ pub fn cleanup_journals(
     let mut candidates = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|error| crate::io_error(&dir, error))? {
         let entry = entry.map_err(|error| crate::io_error(&dir, error))?;
+        let entry_metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| crate::io_error(entry.path(), error))?;
+        if crate::metadata_is_link_or_reparse(&entry_metadata) || !entry_metadata.is_dir() {
+            continue;
+        }
         let journal_path = entry.path().join("journal.json");
-        if !journal_path.is_file() {
+        let journal_metadata = match fs::symlink_metadata(&journal_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(crate::io_error(&journal_path, error)),
+        };
+        if crate::metadata_is_link_or_reparse(&journal_metadata) || !journal_metadata.is_file() {
             continue;
         }
         let journal = read_transaction_journal(&journal_path)?;
@@ -214,39 +240,37 @@ fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(files);
     }
-    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+    let mut entries = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = entries.next() {
         let entry = entry.map_err(|error| CheckPoError::Unexpected(error.to_string()))?;
-        if entry.file_type().is_file() {
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| crate::io_error(entry.path(), error))?;
+        if crate::metadata_is_link_or_reparse(&metadata) {
+            if metadata.is_dir() {
+                entries.skip_current_dir();
+            }
+            return Err(CheckPoError::Corruption(format!(
+                "transaction payload contains a symbolic link or reparse point: {}",
+                entry.path().display()
+            )));
+        }
+        if metadata.is_file() {
             files.push(entry.path().to_path_buf());
         }
     }
     Ok(files)
 }
 
-pub(super) fn directory_is_empty_or_missing(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(CheckPoError::Corruption(format!(
-                "transaction payload path is not a regular directory: {}",
-                path.display()
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
-        Err(error) => return Err(crate::io_error(path, error)),
-    }
-    match fs::read_dir(path) {
-        Ok(mut entries) => Ok(entries.next().is_none()),
-        Err(error) => Err(crate::io_error(path, error)),
-    }
-}
-
 pub(super) fn dir_size(root: &Path) -> Result<u64> {
     let mut total = 0_u64;
     for file in walk_files(root)? {
-        total += fs::metadata(&file)
-            .map_err(|error| crate::io_error(&file, error))?
-            .len();
+        total = total
+            .checked_add(
+                fs::symlink_metadata(&file)
+                    .map_err(|error| crate::io_error(&file, error))?
+                    .len(),
+            )
+            .ok_or_else(|| CheckPoError::Corruption("transaction payload size overflow".into()))?;
     }
     Ok(total)
 }

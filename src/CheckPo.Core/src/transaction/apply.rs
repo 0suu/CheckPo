@@ -4,6 +4,8 @@ use super::*;
 pub(super) enum TransactionFaultPoint {
     ApplyingJournalWritten,
     ProjectFileBackedUp,
+    ProjectDirectoriesRemoved,
+    ProjectDirectoriesCreated,
     ProjectFileRestored,
     OperationsAppliedBeforeCommit,
 }
@@ -59,16 +61,19 @@ pub(super) fn apply_plan_inner(
     let journal_root = journals_dir(&project.repo_root).join(&transaction_id);
     let staged_root = journal_root.join("staged");
     let backup_root = journal_root.join("backup");
-    fs::create_dir_all(&staged_root).map_err(|error| crate::io_error(&staged_root, error))?;
-    fs::create_dir_all(&backup_root).map_err(|error| crate::io_error(&backup_root, error))?;
+    let journals = journals_dir(&project.repo_root);
+    crate::create_dir_all_no_follow(&journals, &staged_root)?;
+    crate::create_dir_all_no_follow(&journals, &backup_root)?;
     crate::storage::sync_parent_chain(&backup_root, &journals_dir(&project.repo_root))?;
     let mut journal = TransactionJournal {
-        schema_version: 1,
+        schema_version: TRANSACTION_JOURNAL_SCHEMA_VERSION,
         transaction_id: transaction_id.clone(),
         state: JournalState::Created,
         checkpoint_id: plan.checkpoint_id.clone(),
         kind: plan.kind,
         operations: plan.operations.clone(),
+        directories_to_remove: plan.directories_to_remove.clone(),
+        directories_to_create: plan.directories_to_create.clone(),
         created_at_utc: crate::now_utc_string(),
         updated_at_utc: crate::now_utc_string(),
     };
@@ -118,54 +123,43 @@ pub(super) fn apply_plan_inner(
     journal.updated_at_utc = crate::now_utc_string();
     write_journal(&journal_path, &journal)?;
     inject_transaction_fault(fault_hook, TransactionFaultPoint::ApplyingJournalWritten)?;
+    for operation in &plan.operations {
+        let destination = operation
+            .path
+            .to_project_path(project.project_root.as_path());
+        let backup_path = staged_path(&backup_root, &operation.path);
+        if matches!(
+            operation.operation_type,
+            FileOperationType::Delete | FileOperationType::Replace
+        ) {
+            ensure_project_parent_is_safe(project, &operation.path)?;
+            backup_project_file(
+                project,
+                operation,
+                &destination,
+                &backup_path,
+                backup_copy_mode,
+            )?;
+            inject_transaction_fault(fault_hook, TransactionFaultPoint::ProjectFileBackedUp)?;
+        }
+    }
+    for directory in &plan.directories_to_remove {
+        remove_project_directory(project, directory)?;
+    }
+    inject_transaction_fault(fault_hook, TransactionFaultPoint::ProjectDirectoriesRemoved)?;
+    for directory in &plan.directories_to_create {
+        create_project_directory(project, directory)?;
+    }
+    inject_transaction_fault(fault_hook, TransactionFaultPoint::ProjectDirectoriesCreated)?;
+
     let mut restored_directories = BTreeSet::new();
     for (index, operation) in plan.operations.iter().enumerate() {
         let destination = operation
             .path
             .to_project_path(project.project_root.as_path());
-        let backup_path = staged_path(&backup_root, &operation.path);
         match operation.operation_type {
-            FileOperationType::Delete => {
-                ensure_project_parent_is_safe(project, &operation.path)?;
-                if destination.exists() {
-                    backup_project_file(
-                        project,
-                        operation,
-                        &destination,
-                        &backup_path,
-                        backup_copy_mode,
-                    )?;
-                    inject_transaction_fault(
-                        fault_hook,
-                        TransactionFaultPoint::ProjectFileBackedUp,
-                    )?;
-                }
-            }
-            FileOperationType::Restore => {
-                let staged = staged_path(&staged_root, &operation.path);
-                restore_staged_file_to_project(project, operation, &staged, &destination)?;
-                restore_mtime(&destination, operation.after_modified_at_utc.as_deref())?;
-                sync_project_file(&destination)?;
-                if let Some(parent) = destination.parent() {
-                    restored_directories.insert(parent.to_path_buf());
-                }
-                inject_transaction_fault(fault_hook, TransactionFaultPoint::ProjectFileRestored)?;
-            }
-            FileOperationType::Replace => {
-                ensure_project_parent_is_safe(project, &operation.path)?;
-                if destination.exists() {
-                    backup_project_file(
-                        project,
-                        operation,
-                        &destination,
-                        &backup_path,
-                        backup_copy_mode,
-                    )?;
-                    inject_transaction_fault(
-                        fault_hook,
-                        TransactionFaultPoint::ProjectFileBackedUp,
-                    )?;
-                }
+            FileOperationType::Delete => {}
+            FileOperationType::Restore | FileOperationType::Replace => {
                 let staged = staged_path(&staged_root, &operation.path);
                 restore_staged_file_to_project(project, operation, &staged, &destination)?;
                 restore_mtime(&destination, operation.after_modified_at_utc.as_deref())?;

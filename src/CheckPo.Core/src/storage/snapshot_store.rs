@@ -246,6 +246,19 @@ pub fn validate_snapshot_file(snapshot_id: &SnapshotId, snapshot: &SnapshotFile)
             )));
         }
     }
+    for (portable_path, original_path) in &portable_paths {
+        for (index, byte) in portable_path.bytes().enumerate() {
+            if byte != b'/' {
+                continue;
+            }
+            let ancestor = &portable_path[..index];
+            if let Some(existing) = portable_paths.get(ancestor) {
+                return Err(CheckPoError::Corruption(format!(
+                    "{snapshot_id}: snapshot contains a file/directory ancestor conflict: {existing} and {original_path}"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 

@@ -235,16 +235,30 @@ fn collect_project_files(
     for root in ["Assets", "Packages", "ProjectSettings"] {
         crate::ensure_not_cancelled(cancellation)?;
         let root_path = project_root.join(root);
-        if !root_path.exists() {
-            continue;
-        }
-        if !root_path.is_dir() {
-            incomplete = true;
-            warnings.push(ScanWarning {
-                relative_path: root.to_string(),
-                reason: "tracked root is not a directory".to_string(),
-            });
-            continue;
+        match fs::symlink_metadata(&root_path) {
+            Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {
+            }
+            Ok(metadata) => {
+                incomplete = true;
+                warnings.push(ScanWarning {
+                    relative_path: root.to_string(),
+                    reason: if crate::metadata_is_link_or_reparse(&metadata) {
+                        "tracked root is a symbolic link or reparse point".to_string()
+                    } else {
+                        "tracked root is not a directory".to_string()
+                    },
+                });
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                incomplete = true;
+                warnings.push(ScanWarning {
+                    relative_path: root.to_string(),
+                    reason: format!("tracked root metadata could not be read: {error}"),
+                });
+                continue;
+            }
         }
         for entry in WalkDir::new(&root_path).follow_links(false).into_iter() {
             crate::ensure_not_cancelled(cancellation)?;
@@ -259,7 +273,44 @@ fn collect_project_files(
                     continue;
                 }
             };
-            if entry.file_type().is_symlink() || entry.file_type().is_dir() {
+            if entry.file_type().is_symlink() {
+                incomplete = true;
+                warnings.push(ScanWarning {
+                    relative_path: entry
+                        .path()
+                        .strip_prefix(project_root)
+                        .unwrap_or(entry.path())
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    reason: "symbolic links and reparse points are not supported".to_string(),
+                });
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                #[cfg(windows)]
+                match fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) => {
+                        incomplete = true;
+                        warnings.push(ScanWarning {
+                            relative_path: entry
+                                .path()
+                                .strip_prefix(project_root)
+                                .unwrap_or(entry.path())
+                                .to_string_lossy()
+                                .replace('\\', "/"),
+                            reason: "symbolic links and reparse points are not supported"
+                                .to_string(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        incomplete = true;
+                        warnings.push(ScanWarning {
+                            relative_path: entry.path().display().to_string(),
+                            reason: format!("directory metadata could not be read: {error}"),
+                        });
+                    }
+                }
                 continue;
             }
             if !entry.file_type().is_file() {
@@ -306,11 +357,11 @@ fn collect_project_files(
                     continue;
                 }
             };
-            if leaf_metadata.file_type().is_symlink() {
+            if crate::metadata_is_link_or_reparse(&leaf_metadata) {
                 incomplete = true;
                 warnings.push(ScanWarning {
                     relative_path: path.to_string(),
-                    reason: "symlink files are not supported".to_string(),
+                    reason: "symbolic links and reparse points are not supported".to_string(),
                 });
                 continue;
             }
@@ -519,9 +570,9 @@ mod windows_benchmarks {
         for file in &baseline.files {
             unique_objects.insert(file.content_hash().clone(), file.content_size_bytes());
         }
+        let unique_objects = unique_objects.into_iter().collect::<Vec<_>>();
         let checked_objects = unique_objects
-            .into_iter()
-            .collect::<Vec<_>>()
+            .clone()
             .into_par_iter()
             .map(|(object_id, size_bytes)| {
                 let path = crate::object_path(&context.repo_root, &object_id);
@@ -532,13 +583,44 @@ mod windows_benchmarks {
             })
             .collect::<Vec<_>>();
         let object_check_elapsed = object_check_started.elapsed();
+        let safe_object_check_started = Instant::now();
+        crate::ensure_regular_directory_no_follow(&context.repo_root.join("objects/loose"))
+            .unwrap();
+        let mut first_level_shards = std::collections::BTreeSet::new();
+        let mut second_level_shards = std::collections::BTreeSet::new();
+        for (object_id, _) in &unique_objects {
+            let path = crate::object_path(&context.repo_root, object_id);
+            let shard = path.parent().unwrap().to_path_buf();
+            first_level_shards.insert(shard.parent().unwrap().to_path_buf());
+            second_level_shards.insert(shard);
+        }
+        first_level_shards
+            .par_iter()
+            .for_each(|path| crate::ensure_regular_directory_no_follow(path).unwrap());
+        second_level_shards
+            .par_iter()
+            .for_each(|path| crate::ensure_regular_directory_no_follow(path).unwrap());
+        let safely_checked_objects = unique_objects
+            .into_par_iter()
+            .map(|(object_id, size_bytes)| {
+                let path = crate::object_path(&context.repo_root, &object_id);
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert!(metadata.is_file());
+                assert_eq!(metadata.len(), size_bytes);
+                object_id
+            })
+            .collect::<Vec<_>>();
+        let safe_object_check_elapsed = safe_object_check_started.elapsed();
         println!(
-            "files={} warnings={} cached_scan_ms={:.1} unique_objects={} object_check_ms={:.1}",
+            "files={} warnings={} cached_scan_ms={:.1} unique_objects={} object_check_ms={:.1} shards={} safe_object_check_ms={:.1}",
             files.len(),
             warnings.len(),
             elapsed.as_secs_f64() * 1000.0,
             checked_objects.len(),
-            object_check_elapsed.as_secs_f64() * 1000.0
+            object_check_elapsed.as_secs_f64() * 1000.0,
+            second_level_shards.len(),
+            safe_object_check_elapsed.as_secs_f64() * 1000.0
         );
+        assert_eq!(safely_checked_objects.len(), checked_objects.len());
     }
 }

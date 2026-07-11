@@ -102,10 +102,13 @@ pub(crate) use project::{
 pub(crate) use scanner::{scan_project_for_checkpoint, scan_project_for_checkpoint_with_baseline};
 pub(crate) use storage::{
     acquire_repository_lock, available_space_bytes, canonical_utc, checkpoint_names_path,
-    hash_file, init_repo_layout, list_snapshot_ids, load_project_snapshot, load_repo_config,
+    create_absolute_dir_all_no_follow, create_dir_all_no_follow,
+    ensure_regular_directory_no_follow, ensure_regular_file_no_follow, hash_file, init_repo_layout,
+    list_snapshot_ids, load_project_snapshot, load_repo_config, metadata_is_link_or_reparse,
     move_file_no_replace, now_utc_string, object_id_from_loose_relative_path, refs_latest_path,
     repo_root, snapshots_dir, sync_parent_dir, validate_repository_config,
-    verify_file_hash_and_size, write_json_atomic, write_latest_snapshot_id, RepositoryLock,
+    validate_repository_layout_no_follow, verify_file_hash_and_size, write_json_atomic,
+    write_latest_snapshot_id, RepositoryLock,
 };
 pub(crate) use transaction::{
     build_plan_with_progress_and_cancellation, ensure_no_pending_transactions,

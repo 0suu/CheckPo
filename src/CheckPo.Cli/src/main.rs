@@ -281,7 +281,8 @@ fn run() -> Result<u8, String> {
                 Err(error)
                     if context.location_status == core::ProjectLocationStatus::CopiedSuspected
                         || !pending_transactions.is_empty()
-                        || !unresolved_quarantines.is_empty() =>
+                        || !unresolved_quarantines.is_empty()
+                        || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
                 {
                     warnings.push(format!("Failed to load storage summary: {error}"));
                     None

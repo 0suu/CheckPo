@@ -645,19 +645,35 @@ async fn check_for_update(
 #[tauri::command]
 async fn install_update(
     app: AppHandle,
+    state: tauri::State<'_, OperationState>,
     pending_update: tauri::State<'_, PendingUpdate>,
 ) -> AppResult {
+    let (_guard, update) = take_pending_update_for_install(&state, &pending_update)?;
+    if let Err(error) = update.download_and_install(|_, _| {}, || {}).await {
+        let mut pending = pending_update
+            .0
+            .lock()
+            .map_err(|_| AppError::new("updateStatePoisoned", "Update state lock is poisoned."))?;
+        if pending.is_none() {
+            *pending = Some(update);
+        }
+        return Err(to_update_error(error));
+    }
+    app.restart();
+}
+
+fn take_pending_update_for_install(
+    state: &OperationState,
+    pending_update: &PendingUpdate,
+) -> Result<(OperationGuard, Update), AppError> {
+    let guard = OperationGuard::begin(state, None)?;
     let update = pending_update
         .0
         .lock()
         .map_err(|_| AppError::new("updateStatePoisoned", "Update state lock is poisoned."))?
         .take()
         .ok_or_else(|| AppError::new("updateNotFound", "No pending update is available."))?;
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(to_update_error)?;
-    app.restart();
+    Ok((guard, update))
 }
 
 pub fn run() {
@@ -783,7 +799,8 @@ fn project_snapshot(project_path: String) -> AppResult {
         Err(error)
             if context.location_status == core::ProjectLocationStatus::CopiedSuspected
                 || !pending_transactions.is_empty()
-                || !unresolved_quarantines.is_empty() =>
+                || !unresolved_quarantines.is_empty()
+                || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
         {
             let prefix = if pending_transactions.is_empty() {
                 "保存容量の集計を読み込めません"
@@ -1011,6 +1028,30 @@ mod tests {
         assert_eq!(error.kind, "confirmationRequired");
         assert_eq!(error.message, "journal cleanup requires confirmation.");
         assert!(require_confirmation(true, "ignored").is_ok());
+    }
+
+    #[test]
+    fn update_install_does_not_consume_pending_state_while_an_operation_is_running() {
+        let state = OperationState::default();
+        let pending_update = PendingUpdate::default();
+        let active_operation = OperationGuard::begin(&state, None).unwrap();
+
+        let error = match take_pending_update_for_install(&state, &pending_update) {
+            Err(error) => error,
+            Ok(_) => panic!("a competing update install must be rejected"),
+        };
+
+        assert_eq!(error.kind, "operationBusy");
+        assert!(state.current.lock().unwrap().is_some());
+        assert!(pending_update.0.lock().unwrap().is_none());
+
+        drop(active_operation);
+        let error = match take_pending_update_for_install(&state, &pending_update) {
+            Err(error) => error,
+            Ok(_) => panic!("an idle installer without an update must report updateNotFound"),
+        };
+        assert_eq!(error.kind, "updateNotFound");
+        assert!(state.current.lock().unwrap().is_none());
     }
 
     #[test]

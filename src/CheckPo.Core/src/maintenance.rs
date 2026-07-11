@@ -409,7 +409,8 @@ fn enumerate_loose_objects(repo_root: &Path) -> Result<ObjectInventory> {
             invalid_locations,
         });
     }
-    for entry in WalkDir::new(&loose_root).follow_links(false) {
+    let mut entries = WalkDir::new(&loose_root).follow_links(false).into_iter();
+    while let Some(entry) = entries.next() {
         let entry = entry.map_err(|error| {
             let path = error
                 .path()
@@ -419,10 +420,13 @@ fn enumerate_loose_objects(repo_root: &Path) -> Result<ObjectInventory> {
         })?;
         let metadata =
             fs::symlink_metadata(entry.path()).map_err(|error| io_error(entry.path(), error))?;
-        if metadata.file_type().is_symlink() {
+        if crate::metadata_is_link_or_reparse(&metadata) {
+            if metadata.is_dir() {
+                entries.skip_current_dir();
+            }
             invalid_locations.push(InvalidObjectLocation {
                 object_path: repo_relative_path(repo_root, entry.path())?,
-                reason: "object storage symlinks are not supported.".to_string(),
+                reason: "object storage symlinks and reparse points are not supported.".to_string(),
             });
             continue;
         }
@@ -465,7 +469,7 @@ fn safe_repo_relative_file(repo_root: &Path, relative: &Path) -> Result<PathBuf>
     }
     let path = repo_root.join(relative);
     let metadata = fs::symlink_metadata(&path).map_err(|error| io_error(&path, error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
         return Err(crate::user_error(format!(
             "repository path is not a regular file: {}",
             path.display()

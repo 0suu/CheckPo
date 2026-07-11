@@ -249,6 +249,43 @@ fn snapshot_unicode_normalization_path_collisions_are_rejected_without_rewriting
 }
 
 #[test]
+fn snapshot_file_directory_ancestor_conflicts_are_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let object_id = ObjectId::parse(&"0".repeat(64)).unwrap();
+    let entry = |path: &str| SnapshotEntry {
+        path: TrackedUnityFilePath::parse(path).unwrap(),
+        size_bytes: 0,
+        modified_at_utc: "2026-01-01T00:00:00.000000000Z".to_string(),
+        content: SnapshotContent::Whole {
+            hash: object_id.clone(),
+            size_bytes: 0,
+        },
+    };
+    let snapshot = SnapshotFile {
+        schema_version: 1,
+        project_id,
+        parent_snapshot_id: None,
+        created_at_utc: "2026-01-01T00:00:00.000000000Z".to_string(),
+        name: "ancestor conflict".to_string(),
+        tool_version: "test".to_string(),
+        tracked_roots: vec![
+            "Assets".to_string(),
+            "Packages".to_string(),
+            "ProjectSettings".to_string(),
+        ],
+        files: vec![entry("Assets/Foo"), entry("Assets/Foo/Bar.asset")],
+    };
+
+    let error = save_snapshot(temp.path(), &snapshot).unwrap_err();
+
+    assert!(matches!(
+        error,
+        CheckPoError::Corruption(message) if message.contains("ancestor conflict")
+    ));
+}
+
+#[test]
 fn init_repo_layout_leaves_valid_existing_config_untouched() {
     let temp = tempfile::tempdir().unwrap();
     let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
@@ -286,4 +323,35 @@ fn copy_object_to_file_rejects_symlink_object() {
 
     assert!(matches!(error, CheckPoError::ObjectHashMismatch(_)));
     assert!(!destination.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn object_store_rejects_symlink_shard_parent_for_read_and_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let loose = repo.join("objects/loose");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&loose).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let source = temp.path().join("source");
+    fs::write(&source, "content").unwrap();
+    let object_id = hash_file(&source).unwrap();
+    let first = &object_id.as_str()[..2];
+    let second = &object_id.as_str()[2..4];
+    std::os::unix::fs::symlink(&outside, loose.join(first)).unwrap();
+    fs::create_dir_all(outside.join(second)).unwrap();
+    fs::write(outside.join(second).join(object_id.as_str()), "content").unwrap();
+
+    let read_error =
+        copy_object_to_file(&repo, &object_id, &temp.path().join("destination"), 7).unwrap_err();
+    let write_error =
+        put_object_from_file_with_known_hash(&repo, &source, &object_id, 7).unwrap_err();
+
+    assert!(matches!(read_error, CheckPoError::Corruption(_)));
+    assert!(matches!(write_error, CheckPoError::Corruption(_)));
+    assert_eq!(
+        fs::read_to_string(outside.join(second).join(object_id.as_str())).unwrap(),
+        "content"
+    );
 }

@@ -210,6 +210,8 @@ pub struct OperationPlan {
     pub kind: OperationPlanKind,
     pub selected_paths: Option<Vec<TrackedUnityFilePath>>,
     pub operations: Vec<FileOperation>,
+    pub directories_to_remove: Vec<TrackedUnityFilePath>,
+    pub directories_to_create: Vec<TrackedUnityFilePath>,
     pub warnings: Vec<String>,
     pub restore_count: usize,
     pub replace_count: usize,
@@ -249,7 +251,7 @@ impl OperationPlan {
                 )
             })
             .filter_map(|operation| operation.after_size_bytes)
-            .sum();
+            .fold(0_u64, u64::saturating_add);
         let backup_bytes = operations
             .iter()
             .filter(|operation| {
@@ -259,25 +261,51 @@ impl OperationPlan {
                 )
             })
             .filter_map(|operation| operation.before_size_bytes)
-            .sum();
+            .fold(0_u64, u64::saturating_add);
         Self {
             checkpoint_id,
             kind,
             selected_paths,
             has_changes: !operations.is_empty(),
             operations,
+            directories_to_remove: Vec::new(),
+            directories_to_create: Vec::new(),
             warnings: Vec::new(),
             restore_count,
             replace_count,
             delete_count,
             staged_bytes,
             backup_bytes,
-            estimated_temporary_bytes: staged_bytes + backup_bytes,
+            estimated_temporary_bytes: staged_bytes.saturating_add(backup_bytes),
         }
     }
 
     pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
         self.warnings = warnings;
+        self
+    }
+
+    pub(crate) fn with_directory_changes(
+        mut self,
+        mut directories_to_remove: Vec<TrackedUnityFilePath>,
+        mut directories_to_create: Vec<TrackedUnityFilePath>,
+    ) -> Self {
+        directories_to_remove.sort_by(|left, right| {
+            right
+                .as_str()
+                .matches('/')
+                .count()
+                .cmp(&left.as_str().matches('/').count())
+                .then_with(|| left.cmp(right))
+        });
+        directories_to_remove.dedup();
+        directories_to_create.sort();
+        directories_to_create.dedup();
+        self.has_changes = self.has_changes
+            || !directories_to_remove.is_empty()
+            || !directories_to_create.is_empty();
+        self.directories_to_remove = directories_to_remove;
+        self.directories_to_create = directories_to_create;
         self
     }
 }

@@ -38,10 +38,11 @@ pub fn validate_repository_config(config: &RepositoryConfig, project_id: &Projec
 
 pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<PathBuf> {
     let repo_root = repo_root(storage_root, project_id);
+    create_dir_all_no_follow(storage_root, &repo_root)?;
     let config_path = repo_root.join("repo.json");
     let config_exists = match fs::symlink_metadata(&config_path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
+            if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
                 return Err(CheckPoError::Corruption(format!(
                     "repo.json is not a regular file: {}",
                     config_path.display()
@@ -62,7 +63,7 @@ pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<P
         repo_root.join("tmp"),
         repo_root.join("locks"),
     ] {
-        fs::create_dir_all(&dir).map_err(|error| io_error(&dir, error))?;
+        create_dir_all_no_follow(&repo_root, &dir)?;
     }
     if !config_exists {
         match write_json_atomic_new(&config_path, &default_repository_config(project_id)) {
@@ -72,7 +73,7 @@ pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<P
             {
                 let metadata = fs::symlink_metadata(&config_path)
                     .map_err(|error| io_error(&config_path, error))?;
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
                     return Err(CheckPoError::Corruption(format!(
                         "repo.json is not a regular file: {}",
                         config_path.display()
@@ -83,6 +84,7 @@ pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<P
             Err(error) => return Err(error),
         }
     }
+    validate_repository_layout_no_follow(&repo_root)?;
     Ok(repo_root)
 }
 
@@ -117,6 +119,8 @@ pub fn repo_root(storage_root: &Path, project_id: &ProjectId) -> PathBuf {
 
 pub fn load_repo_config(repo_root: &Path, project_id: &ProjectId) -> Result<RepositoryConfig> {
     let path = repo_root.join("repo.json");
+    ensure_regular_directory_no_follow(repo_root)?;
+    ensure_regular_file_no_follow(&path)?;
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct RepositoryConfigEnvelope {

@@ -290,6 +290,30 @@ fn checkpoint_reuses_existing_object_without_full_rehash() {
     assert!(!core::verify_project(&project, true).unwrap().is_valid);
 }
 
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_symlinked_object_shard_without_touching_outside() {
+    let (_guard, temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "content").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let repo = repo_path(&view);
+    let object_id = core::hash_file(&file).unwrap();
+    let first = &object_id.as_str()[..2];
+    let second = &object_id.as_str()[2..4];
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(outside.join(second)).unwrap();
+    let outside_object = outside.join(second).join(object_id.as_str());
+    fs::write(&outside_object, "changed").unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("objects/loose").join(first)).unwrap();
+
+    let error = core::create_checkpoint(&project, "unsafe", Default::default()).unwrap_err();
+
+    assert!(matches!(error, core::CheckPoError::Corruption(_)));
+    assert_eq!(fs::read_to_string(outside_object).unwrap(), "changed");
+    assert!(core::list_snapshot_ids(&repo).unwrap().is_empty());
+}
+
 #[test]
 fn checkpoint_does_not_trust_cached_object_id_without_latest_snapshot_anchor() {
     let (_guard, _temp, project, _data) = setup();
@@ -492,12 +516,14 @@ fn recovery_rejects_symlink_parent_without_touching_outside_project() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "symlinktx",
             "state": "applying",
             "checkpointId": checkpoint,
             "kind": "discard",
             "operations": plan.operations,
+            "directoriesToRemove": plan.directories_to_remove,
+            "directoriesToCreate": plan.directories_to_create,
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -547,12 +573,14 @@ fn recovery_rejects_symlink_backup_without_touching_project_file() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "symlinkbackuptx",
             "state": "applying",
             "checkpointId": checkpoint,
             "kind": "discard",
             "operations": plan.operations,
+            "directoriesToRemove": plan.directories_to_remove,
+            "directoriesToCreate": plan.directories_to_create,
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -570,7 +598,7 @@ fn recovery_rejects_symlink_backup_without_touching_project_file() {
 
 #[cfg(unix)]
 #[test]
-fn checkpoint_ignores_symlink_file_but_apply_rejects_tracked_leaf_symlink() {
+fn checkpoint_and_apply_reject_tracked_symlink_file() {
     let (_guard, temp, project, _data) = setup();
     let file = project.join("Assets/Avatar/Foo.prefab");
     let link = project.join("Assets/Avatar/Linked.prefab");
@@ -578,16 +606,10 @@ fn checkpoint_ignores_symlink_file_but_apply_rejects_tracked_leaf_symlink() {
     fs::write(&file, "one").unwrap();
     fs::write(&outside, "outside").unwrap();
     std::os::unix::fs::symlink(&outside, &link).unwrap();
-    let view = init_project_for_test(&project).unwrap();
+    init_project_for_test(&project).unwrap();
 
-    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
-
-    let snapshot = core::load_snapshot(&repo_path(&view), &checkpoint.checkpoint_id).unwrap();
-    assert_eq!(snapshot.files.len(), 2);
-    assert!(snapshot
-        .files
-        .iter()
-        .all(|file| file.path.as_str() != "Assets/Avatar/Linked.prefab"));
+    let error = core::create_checkpoint(&project, "Initial", Default::default()).unwrap_err();
+    assert!(error.to_string().contains("symbolic links"));
 
     fs::remove_file(&link).unwrap();
     fs::write(&link, "tracked").unwrap();
@@ -604,6 +626,69 @@ fn checkpoint_ignores_symlink_file_but_apply_rejects_tracked_leaf_symlink() {
     .unwrap_err();
 
     assert!(matches!(error, core::CheckPoError::InvalidTrackedPath(_)));
+}
+
+#[cfg(unix)]
+#[test]
+fn quick_verify_rejects_symlink_object_without_following_it() {
+    let (_guard, temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let snapshot = core::load_snapshot(&repo, &checkpoint.checkpoint_id).unwrap();
+    let object = core::object_path(&repo, snapshot.files[0].content_hash());
+    let outside = temp.path().join("outside-object");
+    fs::write(&outside, fs::read(&object).unwrap()).unwrap();
+    fs::remove_file(&object).unwrap();
+    std::os::unix::fs::symlink(&outside, &object).unwrap();
+
+    let quick = core::verify_project(&project, false).unwrap();
+
+    assert!(!quick.is_valid);
+    assert!(quick.errors.iter().any(|error| error.contains("no-follow")));
+    assert!(outside.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_tracked_root_symlink() {
+    let (_guard, temp, project, _data) = setup();
+    init_project_for_test(&project).unwrap();
+    let outside = temp.path().join("outside-assets");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("Outside.asset"), "outside").unwrap();
+    fs::remove_dir_all(project.join("Assets")).unwrap();
+    std::os::unix::fs::symlink(&outside, project.join("Assets")).unwrap();
+
+    let error = core::create_checkpoint(&project, "Unsafe", Default::default()).unwrap_err();
+
+    assert!(error.to_string().contains("unsafe Assets"));
+    assert_eq!(
+        fs::read_to_string(outside.join("Outside.asset")).unwrap(),
+        "outside"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_cleanup_rejects_linked_repository_directory() {
+    let (_guard, temp, project, _data) = setup();
+    let view = init_project_for_test(&project).unwrap();
+    let repo = repo_path(&view);
+    let journals = repo.join("journals");
+    let outside = temp.path().join("outside-journals");
+    fs::remove_dir(&journals).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::create_dir(outside.join("important")).unwrap();
+    fs::write(outside.join("important/data.txt"), "keep").unwrap();
+    std::os::unix::fs::symlink(&outside, &journals).unwrap();
+
+    assert!(core::cleanup_journals(&project, core::ApplyOptions { yes: true }).is_err());
+    assert_eq!(
+        fs::read_to_string(outside.join("important/data.txt")).unwrap(),
+        "keep"
+    );
 }
 
 #[test]
@@ -714,10 +799,55 @@ fn corrupt_checkpoint_display_names_do_not_block_checkpoint_list() {
     assert!(!checkpoints[0].warnings.is_empty());
 
     let context = core::load_project(&project).unwrap();
+    let list_result = core::list_checkpoints_with_warnings_for_project(&context).unwrap();
+    assert!(!list_result.warnings.is_empty());
     let (indexed_checkpoints, _) =
         core::checkpoint_summaries_and_storage_summary_from_index(&context).unwrap();
     assert_eq!(indexed_checkpoints[0].name, "before");
     assert!(!indexed_checkpoints[0].warnings.is_empty());
+}
+
+#[test]
+fn corrupt_checkpoint_display_names_block_rename_and_delete_without_overwriting_metadata() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let created = core::create_checkpoint(&project, "before", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let names_path = repo.join("refs").join("checkpoint_names.json");
+    let corrupt_bytes = b"not json";
+    fs::write(&names_path, corrupt_bytes).unwrap();
+
+    let rename_error =
+        core::rename_checkpoint(&project, created.checkpoint_id.as_str(), "after").unwrap_err();
+    assert!(matches!(rename_error, core::CheckPoError::Corruption(_)));
+    assert_eq!(fs::read(&names_path).unwrap(), corrupt_bytes);
+
+    let delete_error =
+        core::delete_checkpoint(&project, created.checkpoint_id.as_str()).unwrap_err();
+    assert!(matches!(delete_error, core::CheckPoError::Corruption(_)));
+    assert_eq!(fs::read(&names_path).unwrap(), corrupt_bytes);
+    assert!(core::snapshot_path(&repo, &created.checkpoint_id).is_file());
+
+    let checkpoints = core::list_checkpoints(&project).unwrap();
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].name, "before");
+    assert!(!checkpoints[0].warnings.is_empty());
+}
+
+#[test]
+fn negative_sqlite_sizes_are_rejected_instead_of_wrapping() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let conn = core::open_db(&repo).unwrap();
+    conn.execute("UPDATE snapshot_entries SET size_bytes = -1", [])
+        .unwrap();
+
+    let error = core::storage_summary(&project).unwrap_err();
+    assert!(matches!(error, core::CheckPoError::IndexUnavailable(_)));
 }
 
 #[test]
@@ -807,6 +937,24 @@ fn missing_cached_object_is_rehashed_and_restored() {
     let snapshot = core::load_snapshot(&repo, &first.checkpoint_id).unwrap();
     let object = core::object_path(&repo, snapshot.files[0].content_hash());
     fs::remove_file(&object).unwrap();
+
+    core::create_checkpoint(&project, "two", Default::default()).unwrap();
+
+    assert!(object.is_file());
+}
+
+#[test]
+fn missing_cached_object_shard_is_recreated() {
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let first = core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let snapshot = core::load_snapshot(&repo, &first.checkpoint_id).unwrap();
+    let object = core::object_path(&repo, snapshot.files[0].content_hash());
+    let shard = object.parent().unwrap();
+    fs::remove_dir_all(shard).unwrap();
 
     core::create_checkpoint(&project, "two", Default::default()).unwrap();
 
@@ -1642,6 +1790,161 @@ fn restore_restores_deleted_tracked_file_and_mtime() {
     assert!(restored.duration_since(original_time).unwrap_or_default() < Duration::from_secs(2));
 }
 
+#[test]
+fn restore_replaces_directory_tree_with_snapshot_file() {
+    let (_guard, _temp, project, _data) = setup();
+    let target = project.join("Assets/Topology");
+    fs::write(&target, "snapshot-file").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "File", Default::default())
+        .unwrap()
+        .checkpoint_id;
+
+    fs::remove_file(&target).unwrap();
+    fs::create_dir_all(target.join("Nested/Empty")).unwrap();
+    fs::write(target.join("Nested/current.asset"), "current").unwrap();
+
+    let plan = core::preview_restore(&project, checkpoint.as_str()).unwrap();
+    assert!(plan
+        .directories_to_remove
+        .iter()
+        .any(|path| path.as_str() == "Assets/Topology"));
+    core::apply_restore_plan(
+        &project,
+        checkpoint.as_str(),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert!(target.is_file());
+    assert_eq!(fs::read_to_string(target).unwrap(), "snapshot-file");
+}
+
+#[test]
+fn restore_replaces_blocking_file_with_snapshot_directory_tree() {
+    let (_guard, _temp, project, _data) = setup();
+    let target = project.join("Assets/Topology");
+    fs::create_dir_all(target.join("Nested")).unwrap();
+    fs::write(target.join("Nested/snapshot.asset"), "snapshot-tree").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Tree", Default::default())
+        .unwrap()
+        .checkpoint_id;
+
+    fs::remove_dir_all(&target).unwrap();
+    fs::write(&target, "blocking-file").unwrap();
+
+    let plan = core::preview_restore(&project, checkpoint.as_str()).unwrap();
+    assert!(plan
+        .directories_to_create
+        .iter()
+        .any(|path| path.as_str() == "Assets/Topology"));
+    core::apply_restore_plan(
+        &project,
+        checkpoint.as_str(),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert!(target.is_dir());
+    assert_eq!(
+        fs::read_to_string(target.join("Nested/snapshot.asset")).unwrap(),
+        "snapshot-tree"
+    );
+}
+
+#[test]
+fn discard_expands_directory_blocker_and_restores_snapshot_file() {
+    let (_guard, _temp, project, _data) = setup();
+    let target = project.join("Assets/Topology");
+    fs::write(&target, "snapshot-file").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "File", Default::default())
+        .unwrap()
+        .checkpoint_id;
+
+    fs::remove_file(&target).unwrap();
+    fs::create_dir_all(target.join("Nested/Empty")).unwrap();
+    fs::write(target.join("Nested/current.asset"), "current").unwrap();
+    let requested = vec!["Assets/Topology".to_string()];
+
+    let plan =
+        core::preview_discard_files(&project, &requested, Some(checkpoint.as_str())).unwrap();
+    assert_eq!(
+        plan.selected_paths.as_deref(),
+        Some(
+            ["Assets/Topology", "Assets/Topology/Nested/current.asset"]
+                .map(|path| TrackedUnityFilePath::parse(path).unwrap())
+                .as_slice()
+        )
+    );
+    assert!(plan
+        .directories_to_remove
+        .iter()
+        .any(|path| path.as_str() == "Assets/Topology"));
+
+    core::apply_discard_files_plan(
+        &project,
+        &requested,
+        Some(checkpoint.as_str()),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert!(target.is_file());
+    assert_eq!(fs::read_to_string(target).unwrap(), "snapshot-file");
+}
+
+#[test]
+fn discard_expands_file_blocker_without_restoring_unselected_snapshot_sibling() {
+    let (_guard, _temp, project, _data) = setup();
+    let target = project.join("Assets/Topology");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("A.asset"), "snapshot-a").unwrap();
+    fs::write(target.join("B.asset"), "snapshot-b").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Tree", Default::default())
+        .unwrap()
+        .checkpoint_id;
+
+    fs::remove_dir_all(&target).unwrap();
+    fs::write(&target, "blocking-file").unwrap();
+    let requested = vec!["Assets/Topology/A.asset".to_string()];
+
+    let plan =
+        core::preview_discard_files(&project, &requested, Some(checkpoint.as_str())).unwrap();
+    assert_eq!(
+        plan.selected_paths.as_deref(),
+        Some(
+            ["Assets/Topology", "Assets/Topology/A.asset"]
+                .map(|path| TrackedUnityFilePath::parse(path).unwrap())
+                .as_slice()
+        )
+    );
+    assert!(plan
+        .directories_to_create
+        .iter()
+        .any(|path| path.as_str() == "Assets/Topology"));
+
+    core::apply_discard_files_plan(
+        &project,
+        &requested,
+        Some(checkpoint.as_str()),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(target.join("A.asset")).unwrap(),
+        "snapshot-a"
+    );
+    assert!(!target.join("B.asset").exists());
+}
+
 #[cfg(windows)]
 #[test]
 fn checkpoint_and_discard_support_windows_paths_longer_than_260_characters() {
@@ -1909,12 +2212,14 @@ fn pending_transaction_blocks_new_mutating_operation_and_cleanup_removes_committ
     fs::write(
         pending.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "pendingtx",
             "state": "staged",
             "checkpointId": checkpoint,
             "kind": "restore",
             "operations": [],
+            "directoriesToRemove": [],
+            "directoriesToCreate": [],
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -1929,12 +2234,14 @@ fn pending_transaction_blocks_new_mutating_operation_and_cleanup_removes_committ
     fs::write(
         pending.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "pendingtx",
             "state": "committed",
             "checkpointId": checkpoint,
             "kind": "restore",
             "operations": [],
+            "directoriesToRemove": [],
+            "directoriesToCreate": [],
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -1971,12 +2278,14 @@ fn cleanup_removes_completed_journals_even_when_payload_is_not_empty() {
         fs::write(
             journal.join("journal.json"),
             serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "transactionId": transaction_id,
                 "state": state,
                 "checkpointId": checkpoint,
                 "kind": "discard",
                 "operations": [],
+                "directoriesToRemove": [],
+                "directoriesToCreate": [],
                 "createdAtUtc": "2026-01-01T00:00:00Z",
                 "updatedAtUtc": "2026-01-01T00:00:00Z"
             }))
@@ -1993,7 +2302,7 @@ fn cleanup_removes_completed_journals_even_when_payload_is_not_empty() {
 }
 
 #[test]
-fn recovery_removes_missing_journal_when_backup_is_empty() {
+fn recovery_quarantines_missing_journal_when_payload_is_empty() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -2008,10 +2317,19 @@ fn recovery_removes_missing_journal_when_backup_is_empty() {
 
     let result = core::recover_transactions(&project).unwrap();
 
-    assert_eq!(result.recovered_transaction_count, 1);
-    assert_eq!(result.failed_transaction_count, 0);
+    assert_eq!(result.recovered_transaction_count, 0);
+    assert_eq!(result.failed_transaction_count, 1);
     assert!(!pending.exists());
-    core::create_checkpoint(&project, "Unblocked", Default::default()).unwrap();
+    assert_eq!(
+        core::unresolved_transaction_quarantines(&project)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(matches!(
+        core::create_checkpoint(&project, "Blocked", Default::default()).unwrap_err(),
+        core::CheckPoError::UnresolvedTransactionQuarantine(_)
+    ));
 }
 
 #[test]
@@ -2028,7 +2346,13 @@ fn recovery_rejects_missing_journal_when_backup_is_not_empty() {
 
     assert_eq!(result.recovered_transaction_count, 0);
     assert_eq!(result.failed_transaction_count, 1);
-    assert!(pending.exists());
+    assert!(!pending.exists());
+    let unresolved = core::unresolved_transaction_quarantines(&project).unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert!(unresolved[0]
+        .quarantine_path
+        .join("backup/Assets/Avatar/Foo.prefab")
+        .is_file());
 }
 
 #[test]
@@ -2046,14 +2370,18 @@ fn recovery_rejects_missing_journal_when_staged_is_not_empty() {
 
     assert_eq!(result.recovered_transaction_count, 0);
     assert_eq!(result.failed_transaction_count, 1);
-    assert!(result.failed_transactions[0]
-        .error
-        .contains("staged files are not empty"));
-    assert!(pending.exists());
+    assert!(result.failed_transactions[0].error.contains("quarantined"));
+    assert!(!pending.exists());
+    let unresolved = core::unresolved_transaction_quarantines(&project).unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert!(unresolved[0]
+        .quarantine_path
+        .join("staged/Assets/Avatar/Foo.prefab")
+        .is_file());
 }
 
 #[test]
-fn recovery_removes_unreadable_journal_when_backup_is_empty() {
+fn recovery_quarantines_unreadable_journal_when_payload_is_empty() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -2071,10 +2399,15 @@ fn recovery_removes_unreadable_journal_when_backup_is_empty() {
 
     let result = core::recover_transactions(&project).unwrap();
 
-    assert_eq!(result.recovered_transaction_count, 1);
-    assert_eq!(result.failed_transaction_count, 0);
+    assert_eq!(result.recovered_transaction_count, 0);
+    assert_eq!(result.failed_transaction_count, 1);
     assert!(!pending.exists());
-    core::create_checkpoint(&project, "Unblocked", Default::default()).unwrap();
+    assert_eq!(
+        core::unresolved_transaction_quarantines(&project)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -2092,10 +2425,14 @@ fn recovery_rejects_unreadable_journal_when_backup_is_not_empty() {
 
     assert_eq!(result.recovered_transaction_count, 0);
     assert_eq!(result.failed_transaction_count, 1);
-    assert!(result.failed_transactions[0]
-        .error
-        .contains("journal is unreadable"));
-    assert!(pending.exists());
+    assert!(result.failed_transactions[0].error.contains("quarantined"));
+    assert!(!pending.exists());
+    let unresolved = core::unresolved_transaction_quarantines(&project).unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert!(unresolved[0]
+        .quarantine_path
+        .join("backup/Assets/Avatar/Foo.prefab")
+        .is_file());
 }
 
 #[test]
@@ -2114,10 +2451,14 @@ fn recovery_rejects_unreadable_journal_when_staged_is_not_empty() {
 
     assert_eq!(result.recovered_transaction_count, 0);
     assert_eq!(result.failed_transaction_count, 1);
-    assert!(result.failed_transactions[0]
-        .error
-        .contains("staged files are not empty"));
-    assert!(pending.exists());
+    assert!(result.failed_transactions[0].error.contains("quarantined"));
+    assert!(!pending.exists());
+    let unresolved = core::unresolved_transaction_quarantines(&project).unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert!(unresolved[0]
+        .quarantine_path
+        .join("staged/Assets/Avatar/Foo.prefab")
+        .is_file());
 }
 
 #[test]
@@ -2140,12 +2481,14 @@ fn recovery_removes_completed_restore_operation() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "restoretx",
             "state": "applying",
             "checkpointId": checkpoint,
             "kind": "restore",
             "operations": plan.operations,
+            "directoriesToRemove": plan.directories_to_remove,
+            "directoriesToCreate": plan.directories_to_create,
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -2174,7 +2517,7 @@ fn recovery_rejects_unknown_journal_schema_without_touching_project() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
+            "schemaVersion": 99,
             "transactionId": "badschema",
             "state": "applying",
             "checkpointId": checkpoint,
@@ -2207,14 +2550,14 @@ fn future_journal_with_unknown_state_is_never_treated_as_unreadable_or_deleted()
     fs::create_dir_all(tx.join("staged")).unwrap();
     fs::write(
         tx.join("journal.json"),
-        br#"{"schemaVersion":2,"state":"pausedByNewClient"}"#,
+        br#"{"schemaVersion":3,"state":"pausedByNewClient"}"#,
     )
     .unwrap();
 
     let pending = core::pending_transactions(&project).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].transaction_id, transaction_id);
-    assert_eq!(pending[0].state, "unsupportedSchema:2");
+    assert_eq!(pending[0].state, "unsupportedSchema:3");
 
     let recovery = core::recover_transactions(&project).unwrap();
     assert_eq!(recovery.recovered_transaction_count, 0);
@@ -2227,7 +2570,7 @@ fn future_journal_with_unknown_state_is_never_treated_as_unreadable_or_deleted()
     let cleanup = core::cleanup_journals(&project, core::ApplyOptions { yes: true }).unwrap_err();
     assert!(matches!(
         cleanup,
-        core::CheckPoError::UnsupportedFormat { found: 2, .. }
+        core::CheckPoError::UnsupportedFormat { found: 3, .. }
     ));
     assert!(tx.exists());
     assert_eq!(
@@ -2263,12 +2606,14 @@ fn recovery_rejects_journal_transaction_id_mismatch_without_touching_project() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "differentid",
             "state": "applying",
             "checkpointId": checkpoint,
             "kind": "restore",
             "operations": [],
+            "directoriesToRemove": [],
+            "directoriesToCreate": [],
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -2300,12 +2645,14 @@ fn recovery_does_not_restore_untracked_backup_path() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "badtx",
             "state": "applying",
             "checkpointId": checkpoint,
             "kind": "restore",
             "operations": [],
+            "directoriesToRemove": [],
+            "directoriesToCreate": [],
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -2679,12 +3026,14 @@ fn copied_project_blocks_mutating_operations_until_decided() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "transactionId": "copiedtx",
             "state": "created",
             "checkpointId": checkpoint,
             "kind": "restore",
             "operations": [],
+            "directoriesToRemove": [],
+            "directoriesToCreate": [],
             "createdAtUtc": "2026-01-01T00:00:00Z",
             "updatedAtUtc": "2026-01-01T00:00:00Z"
         }))
@@ -2697,6 +3046,13 @@ fn copied_project_blocks_mutating_operations_until_decided() {
     assert_copied_project_error(&error);
     assert!(tx.join("journal.json").is_file());
 
+    let pending_error =
+        core::start_as_separate_project(&copied, core::ApplyOptions { yes: true }).unwrap_err();
+    assert!(matches!(
+        pending_error,
+        core::CheckPoError::PendingTransaction(_)
+    ));
+    fs::remove_dir_all(&tx).unwrap();
     let copied_view =
         core::start_as_separate_project(&copied, core::ApplyOptions { yes: true }).unwrap();
     assert_ne!(copied_view.project_id, original.project_id);

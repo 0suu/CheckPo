@@ -184,15 +184,53 @@ fn preload_available_previous_objects(
             _ => {}
         }
     }
-    expected_sizes
+    let expected_sizes = expected_sizes.into_iter().collect::<Vec<_>>();
+    let loose_root = repo_root.join("objects").join("loose");
+    crate::ensure_regular_directory_no_follow(&loose_root)?;
+    let mut first_level_shards = BTreeSet::new();
+    let mut second_level_shards = BTreeSet::new();
+    for (object_id, _) in &expected_sizes {
+        let object = object_path(repo_root, object_id);
+        let shard = object.parent().ok_or_else(|| {
+            CheckPoError::Corruption(format!("invalid object path: {}", object.display()))
+        })?;
+        let first_level = shard.parent().ok_or_else(|| {
+            CheckPoError::Corruption(format!("invalid object shard: {}", shard.display()))
+        })?;
+        first_level_shards.insert(first_level.to_path_buf());
+        second_level_shards.insert(shard.to_path_buf());
+    }
+    let existing_first_level_shards = first_level_shards
+        .into_par_iter()
+        .map(|path| regular_directory_exists_no_follow(&path).map(|exists| (path, exists)))
+        .collect::<Result<Vec<_>>>()?
         .into_iter()
-        .collect::<Vec<_>>()
+        .filter_map(|(path, exists)| exists.then_some(path))
+        .collect::<BTreeSet<_>>();
+    let existing_second_level_shards = second_level_shards
+        .into_par_iter()
+        .filter(|path| {
+            path.parent()
+                .is_some_and(|parent| existing_first_level_shards.contains(parent))
+        })
+        .map(|path| regular_directory_exists_no_follow(&path).map(|exists| (path, exists)))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(path, exists)| exists.then_some(path))
+        .collect::<BTreeSet<_>>();
+    expected_sizes
         .into_par_iter()
         .map(|(object_id, expected_size)| {
             let object = object_path(repo_root, &object_id);
+            if !object
+                .parent()
+                .is_some_and(|parent| existing_second_level_shards.contains(parent))
+            {
+                return Ok(None);
+            }
             match fs::symlink_metadata(&object) {
                 Ok(metadata)
-                    if !metadata.file_type().is_symlink()
+                    if !crate::metadata_is_link_or_reparse(&metadata)
                         && metadata.is_file()
                         && metadata.len() == expected_size =>
                 {
@@ -205,6 +243,20 @@ fn preload_available_previous_objects(
         })
         .collect::<Result<Vec<_>>>()
         .map(|objects| objects.into_iter().flatten().collect())
+}
+
+fn regular_directory_exists_no_follow(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {
+            Ok(true)
+        }
+        Ok(_) => Err(CheckPoError::Corruption(format!(
+            "unsafe object shard directory: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(crate::io_error(path, error)),
+    }
 }
 
 fn latest_checkpoint_for_create(
@@ -257,10 +309,10 @@ fn reuse_previous_object_or_repair(
         return Ok((object_id.clone(), false, file.size_bytes));
     }
 
-    let object = object_path(repo_root, object_id);
+    let object = crate::storage::object_path_no_follow(repo_root, object_id)?;
     let available = match fs::symlink_metadata(&object) {
         Ok(metadata) => {
-            !metadata.file_type().is_symlink()
+            !crate::metadata_is_link_or_reparse(&metadata)
                 && metadata.is_file()
                 && metadata.len() == previous.content_size_bytes()
         }
@@ -290,15 +342,27 @@ fn reuse_previous_object_or_repair(
 }
 
 fn put_scanned_file(repo_root: &Path, file: &ScannedFile) -> Result<(crate::ObjectId, bool, u64)> {
-    let object = object_path(repo_root, &file.hash);
-    if object.is_file() {
-        ensure_scanned_file_still_matches(file)?;
-        let metadata = fs::metadata(&object).map_err(|error| crate::io_error(&object, error))?;
-        // Existing objects are content-addressed and verified when written.
-        // Normal checkpoint creation keeps the hot path fast; full integrity checks belong to verify.
-        if metadata.is_file() && metadata.len() == file.size_bytes {
+    let object = crate::storage::object_path_no_follow(repo_root, &file.hash)?;
+    match fs::symlink_metadata(&object) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !crate::metadata_is_link_or_reparse(&metadata)
+                && metadata.len() == file.size_bytes =>
+        {
+            ensure_scanned_file_still_matches(file)?;
+            // Existing objects are content-addressed and verified when written.
+            // Normal checkpoint creation keeps the hot path fast; full integrity checks belong to verify.
             return Ok((file.hash.clone(), false, file.size_bytes));
         }
+        Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
+            return Err(CheckPoError::Corruption(format!(
+                "object destination is not a no-follow regular file: {}",
+                object.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(crate::io_error(&object, error)),
     }
     let created = match put_object_from_file_with_known_hash(
         repo_root,
@@ -371,7 +435,10 @@ pub fn list_checkpoints_with_warnings_for_project(
             (direct.checkpoints, direct.warnings)
         }
     };
-    crate::apply_checkpoint_name_overrides(project, &mut checkpoints);
+    warnings.extend(crate::apply_checkpoint_name_overrides(
+        project,
+        &mut checkpoints,
+    ));
     warnings.sort();
     warnings.dedup();
     Ok(CheckpointListResult {
@@ -399,6 +466,12 @@ pub fn rename_checkpoint(
     let id = SnapshotId::parse(checkpoint_id)?;
     let snapshot = load_project_snapshot(&project, &id)?;
     let (mut names, warnings) = crate::read_checkpoint_name_overrides(&project);
+    if !warnings.is_empty() {
+        return Err(crate::CheckPoError::Corruption(format!(
+            "checkpoint display names cannot be modified until their metadata is repaired: {}",
+            warnings.join("; ")
+        )));
+    }
     if name == snapshot.name {
         names.remove(id.as_str());
     } else {
@@ -409,7 +482,7 @@ pub fn rename_checkpoint(
         id,
         &snapshot,
         name.to_string(),
-        warnings,
+        Vec::new(),
     ))
 }
 
@@ -428,6 +501,13 @@ pub fn delete_checkpoint(
         return Err(crate::CheckPoError::SnapshotNotFound(id.to_string()));
     }
     load_project_snapshot(&project, &id)?;
+    let (_, name_warnings) = crate::read_checkpoint_name_overrides(&project);
+    if !name_warnings.is_empty() {
+        return Err(crate::CheckPoError::Corruption(format!(
+            "checkpoint display names cannot be modified until their metadata is repaired: {}",
+            name_warnings.join("; ")
+        )));
+    }
     let direct = list_checkpoints_from_snapshots(&project)?;
     if !direct.warnings.is_empty() {
         return Err(crate::user_error(format!(

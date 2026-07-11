@@ -206,6 +206,48 @@ fn unverified_quarantine_blocks_mutation_until_full_restore_succeeds() {
 }
 
 #[test]
+fn orphan_quarantine_payload_blocks_mutation_until_full_restore() {
+    let (_guard, _temp, project, view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "known good", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&file, "two").unwrap();
+    let quarantine = view
+        .storage_root_path
+        .join("repos")
+        .join(view.project_id)
+        .join("quarantined-journals/orphan-payload");
+    fs::create_dir_all(&quarantine).unwrap();
+
+    let unresolved = crate::unresolved_transaction_quarantines(&project).unwrap();
+
+    assert_eq!(unresolved.len(), 1);
+    assert!(unresolved[0].reason.contains("no matching record"));
+    assert!(matches!(
+        crate::create_checkpoint(&project, "blocked", CreateCheckpointOptions::default())
+            .unwrap_err(),
+        CheckPoError::UnresolvedTransactionQuarantine(_)
+    ));
+
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+    crate::apply_restore_plan(
+        &project,
+        checkpoint.as_str(),
+        plan,
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read_to_string(&file).unwrap(), "one");
+    assert!(crate::unresolved_transaction_quarantines(&project)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
     let (_guard, _temp, project, _view) = setup_project();
     let file = project.join("Assets/Avatar/Foo.prefab");
@@ -231,6 +273,11 @@ fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
 
     assert!(matches!(error, CheckPoError::Unexpected(_)));
     assert!(!file.exists());
+    let transaction_root = crate::pending_transactions(&project).unwrap()[0]
+        .journal_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let recovered = crate::recover_transactions(&project).unwrap();
     assert_eq!(recovered.recovered_transaction_count, 1);
     assert_eq!(recovered.failed_transaction_count, 0);
@@ -238,6 +285,169 @@ fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
     assert_eq!(
         FileTime::from_last_modification_time(&fs::metadata(&file).unwrap()),
         original_mtime
+    );
+    assert!(transaction_root
+        .join("backup/Assets/Avatar/Foo.prefab")
+        .is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_quarantines_transaction_with_symlink_journal() {
+    let (_guard, temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    let pending = crate::pending_transactions(&project).unwrap();
+    let journal = &pending[0].journal_path;
+    let outside = temp.path().join("outside.json");
+    fs::write(&outside, "do not touch").unwrap();
+    fs::remove_file(journal).unwrap();
+    std::os::unix::fs::symlink(&outside, journal).unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 0);
+    assert_eq!(recovered.failed_transaction_count, 1);
+    assert!(crate::pending_transactions(&project).unwrap().is_empty());
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "do not touch");
+    assert_eq!(
+        crate::unresolved_transaction_quarantines(&project)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn recovery_restores_blocking_file_after_directory_creation_fault() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let target = project.join("Assets/Topology");
+    fs::create_dir_all(target.join("Nested")).unwrap();
+    fs::write(target.join("Nested/snapshot.asset"), "snapshot").unwrap();
+    let checkpoint = crate::create_checkpoint(&project, "Tree", CreateCheckpointOptions::default())
+        .unwrap()
+        .checkpoint_id;
+    fs::remove_dir_all(&target).unwrap();
+    fs::write(&target, "blocking").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectDirectoriesCreated {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    assert!(target.is_dir());
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert!(target.is_file());
+    assert_eq!(fs::read_to_string(target).unwrap(), "blocking");
+}
+
+#[test]
+fn recovery_restores_blocking_file_after_topology_files_were_applied() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let target = project.join("Assets/Topology");
+    fs::create_dir_all(target.join("Nested")).unwrap();
+    fs::write(target.join("A.asset"), "snapshot-a").unwrap();
+    fs::write(target.join("Nested/B.asset"), "snapshot-b").unwrap();
+    let checkpoint = crate::create_checkpoint(&project, "Tree", CreateCheckpointOptions::default())
+        .unwrap()
+        .checkpoint_id;
+    fs::remove_dir_all(&target).unwrap();
+    fs::write(&target, "blocking").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::OperationsAppliedBeforeCommit {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    assert!(target.join("A.asset").is_file());
+    assert!(target.join("Nested/B.asset").is_file());
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert!(target.is_file());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "blocking");
+    assert!(crate::pending_transactions(&project).unwrap().is_empty());
+}
+
+#[test]
+fn recovery_recreates_removed_directory_tree_after_topology_fault() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let target = project.join("Assets/Topology");
+    fs::write(&target, "snapshot").unwrap();
+    let checkpoint = crate::create_checkpoint(&project, "File", CreateCheckpointOptions::default())
+        .unwrap()
+        .checkpoint_id;
+    fs::remove_file(&target).unwrap();
+    fs::create_dir_all(target.join("Nested/Empty")).unwrap();
+    fs::write(target.join("Nested/current.asset"), "current").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectDirectoriesRemoved {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    assert!(!target.exists());
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert!(target.join("Nested/Empty").is_dir());
+    assert_eq!(
+        fs::read_to_string(target.join("Nested/current.asset")).unwrap(),
+        "current"
     );
 }
 
