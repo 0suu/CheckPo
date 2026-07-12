@@ -1,18 +1,36 @@
-function renderDiff(diff) {
-  state.currentDiff = { ...diff, checkpoint: state.checkpoints[0] || null };
-  if (!state.diffTreeTouched) {
-    state.diffTreeOpenPaths = new Set();
-  }
-  renderCurrentDiff(state.currentDiff);
+const DIFF_TREE_ROW_HEIGHT = 36;
+const DIFF_TREE_OVERSCAN = 10;
+
+const diffVirtualView = {
+  container: null,
+  spacer: null,
+  root: null,
+  rows: [],
+  rowIndexByKey: new Map(),
+  rowHeight: DIFF_TREE_ROW_HEIGHT,
+  activeKey: null,
+  revision: 0,
+  renderFrame: null,
+  resizeObserver: null,
+};
+
+function renderDiff(diff, checkpointId = state.selectedCheckpointId) {
+  const previousCheckpointId = state.currentDiff?.checkpointId || null;
+  const checkpoint = state.checkpoints.find((item) => item.checkpointId === checkpointId) || null;
+  state.currentDiff = { ...diff, checkpointId, checkpoint };
+  if (!state.diffTreeTouched) state.diffTreeOpenPaths = new Set();
+  renderCurrentDiff(state.currentDiff, {
+    resetScroll: previousCheckpointId !== checkpointId,
+  });
   renderCheckpoints();
 }
 
-function renderCurrentDiff(diff) {
+function renderCurrentDiff(diff, options = {}) {
   const addedCount = diff.added?.length ?? 0;
   const editedCount = diff.modified?.length ?? 0;
   const deletedCount = diff.deleted?.length ?? 0;
   const unchangedCount = diff.unchangedCount ?? 0;
-  const checkpoint = diff.checkpoint || state.checkpoints[0] || null;
+  const checkpoint = diff.checkpoint || null;
   $("diffSummary").textContent = tf("fileChangesSummary", {
     total: addedCount + editedCount + deletedCount,
     added: addedCount,
@@ -28,23 +46,33 @@ function renderCurrentDiff(diff) {
     [t("added"), diff.added || [], "added"],
     [t("edited"), diff.modified || [], "modified"],
     [t("deleted"), diff.deleted || [], "deleted"],
-  ]);
+  ], options);
 }
 
-function renderChangeGroups(groups) {
+function renderChangeGroups(groups, options = {}) {
   const container = $("diffGroups");
-  container.replaceChildren();
+  initializeVirtualTree(container);
   const allChanges = groups.flatMap(([, paths, type]) => paths.map((path) => ({ path, type })));
-  const allChangePathSet = new Set(allChanges.map((change) => change.path));
-  const pathToIndex = new Map(allChanges.map((change, index) => [change.path, index]));
   const changes = state.currentDiffFilter === "all"
     ? allChanges
     : allChanges.filter((change) => change.type === state.currentDiffFilter);
-  state.currentDiffSelectedPaths = new Set(
-    [...state.currentDiffSelectedPaths].filter((path) => allChangePathSet.has(path)),
+  const retainedSelection = CheckPoFrontendState.retainVisibleChangeSelection(
+    state.currentDiffSelectedPaths,
+    state.lastSelectedChangePath,
+    changes.map((change) => change.path),
   );
-  updateSelectedDiffButton();
+  state.currentDiffSelectedPaths = retainedSelection.selectedPaths;
+  state.lastSelectedChangePath = retainedSelection.anchorPath;
+
+  invalidateVirtualTreeRender();
+  diffVirtualView.root = null;
+  setVirtualTreeRows([]);
+  diffVirtualView.activeKey = null;
+  container.setAttribute("aria-busy", "true");
+  container.replaceChildren();
+
   if (changes.length === 0) {
+    resetTreeAccessibility(container);
     state.currentDiffSelectedPaths.clear();
     state.lastSelectedChangePath = null;
     updateSelectedDiffButton();
@@ -62,81 +90,386 @@ function renderChangeGroups(groups) {
     return;
   }
 
-  const root = buildChangeTree(changes);
-  if (!state.diffTreeTouched && state.diffTreeOpenPaths.size === 0) {
-    collectFolderPaths(root).forEach((path) => state.diffTreeOpenPaths.add(path));
-  }
-  const renderContext = { allChanges, pathToIndex, groups };
-  for (const folder of [...root.children.values()].sort(compareTreeNode)) {
-    renderFolderNode(container, folder, 0, renderContext);
-  }
-  for (const file of root.files.sort(compareTreeFile)) {
-    container.append(changeFileRow(file, allChanges, pathToIndex.get(file.path) ?? -1, renderContext, 0));
-  }
+  diffVirtualView.root = buildChangeTree(changes);
+  setVirtualTreeRows(CheckPoFrontendState.flattenChangeTreeRows(
+    diffVirtualView.root,
+    state.diffTreeOpenPaths,
+  ));
+  retainLogicalTreeSelection();
+  diffVirtualView.activeKey = diffVirtualView.rows[0]?.key || null;
+  container.setAttribute("role", "tree");
+  container.setAttribute("aria-label", "変更ファイル");
+  container.setAttribute("aria-multiselectable", "true");
+  container.tabIndex = 0;
+  const spacer = document.createElement("div");
+  spacer.className = "diff-tree-spacer";
+  spacer.setAttribute("role", "presentation");
+  diffVirtualView.spacer = spacer;
+  container.append(spacer);
+  if (options.resetScroll) container.scrollTop = 0;
+  updateVirtualTreeHeight();
+  renderVirtualTreeWindow(true);
+  container.setAttribute("aria-busy", "false");
+  updateSelectedDiffButton();
   updateControls();
 }
 
-function changeFileRow(change, changes, index, renderContext, depth = 0) {
+function initializeVirtualTree(container) {
+  if (diffVirtualView.container === container) return;
+  if (diffVirtualView.resizeObserver) diffVirtualView.resizeObserver.disconnect();
+  diffVirtualView.container = container;
+  diffVirtualView.rowHeight = Number.parseFloat(
+    getComputedStyle(container).getPropertyValue("--diff-tree-row-height"),
+  ) || DIFF_TREE_ROW_HEIGHT;
+  container.addEventListener("scroll", scheduleVirtualTreeRender, { passive: true });
+  container.addEventListener("keydown", handleVirtualTreeKeydown);
+  container.addEventListener("focus", () => renderVirtualTreeWindow(true));
+  if (typeof ResizeObserver === "function") {
+    diffVirtualView.resizeObserver = new ResizeObserver(scheduleVirtualTreeRender);
+    diffVirtualView.resizeObserver.observe(container);
+  }
+}
+
+function resetVirtualDiffTree() {
+  invalidateVirtualTreeRender();
+  diffVirtualView.root = null;
+  setVirtualTreeRows([]);
+  diffVirtualView.activeKey = null;
+  diffVirtualView.spacer = null;
+  const container = $("diffGroups");
+  container.replaceChildren();
+  resetTreeAccessibility(container);
+}
+
+function resetTreeAccessibility(container) {
+  container.removeAttribute("role");
+  container.removeAttribute("aria-label");
+  container.removeAttribute("aria-multiselectable");
+  container.removeAttribute("aria-activedescendant");
+  container.removeAttribute("aria-busy");
+  container.removeAttribute("tabindex");
+}
+
+function invalidateVirtualTreeRender() {
+  diffVirtualView.revision += 1;
+  if (diffVirtualView.renderFrame !== null) {
+    cancelAnimationFrame(diffVirtualView.renderFrame);
+    diffVirtualView.renderFrame = null;
+  }
+}
+
+function scheduleVirtualTreeRender() {
+  if (diffVirtualView.renderFrame !== null) return;
+  const revision = diffVirtualView.revision;
+  diffVirtualView.renderFrame = requestAnimationFrame(() => {
+    diffVirtualView.renderFrame = null;
+    if (revision !== diffVirtualView.revision) return;
+    renderVirtualTreeWindow();
+  });
+}
+
+function updateVirtualTreeHeight() {
+  if (!diffVirtualView.spacer) return;
+  diffVirtualView.spacer.style.height = `${diffVirtualView.rows.length * diffVirtualView.rowHeight}px`;
+}
+
+function renderVirtualTreeWindow(force = false) {
+  const { container, spacer, rows, revision } = diffVirtualView;
+  if (!container || !spacer || !spacer.isConnected) return;
+  const range = CheckPoFrontendState.virtualTreeWindowRange(
+    rows.length,
+    container.scrollTop,
+    container.clientHeight,
+    diffVirtualView.rowHeight,
+    DIFF_TREE_OVERSCAN,
+  );
+  if (!force
+    && Number(spacer.dataset.start) === range.start
+    && Number(spacer.dataset.end) === range.end
+    && spacer.dataset.activeKey === (diffVirtualView.activeKey || "")) return;
+
+  spacer.dataset.start = String(range.start);
+  spacer.dataset.end = String(range.end);
+  spacer.dataset.activeKey = diffVirtualView.activeKey || "";
+  const fragment = document.createDocumentFragment();
+  const indexes = [];
+  for (let index = range.start; index < range.end; index += 1) indexes.push(index);
+  const activeIndex = diffVirtualView.rowIndexByKey.get(diffVirtualView.activeKey) ?? -1;
+  if (activeIndex >= 0 && (activeIndex < range.start || activeIndex >= range.end)) {
+    indexes.push(activeIndex);
+    indexes.sort((left, right) => left - right);
+  }
+  for (const index of indexes) {
+    fragment.append(createVirtualTreeRow(rows[index], index, revision));
+  }
+  spacer.replaceChildren(fragment);
+  updateActiveDescendant();
+  updateControls();
+}
+
+function createVirtualTreeRow(rowData, index, revision) {
   const row = document.createElement("div");
-  row.className = `tree-row file ${change.type === "deleted" ? "is-deleted" : ""}`;
+  row.id = `diff-tree-row-${revision}-${index}`;
+  row.className = `tree-row virtual-row ${rowData.kind}`;
+  row.dataset.rowKey = rowData.key;
+  row.style.top = `${index * diffVirtualView.rowHeight}px`;
+  row.style.setProperty("--ind", `${rowData.depth * 20}px`);
+  row.setAttribute("role", "treeitem");
+  row.setAttribute("aria-level", String(rowData.depth + 1));
+  row.setAttribute("aria-posinset", String(rowData.posInSet));
+  row.setAttribute("aria-setsize", String(rowData.setSize));
+  row.classList.toggle("is-active", diffVirtualView.activeKey === rowData.key);
+  if (rowData.kind === "folder") populateVirtualFolderRow(row, rowData, revision);
+  else populateVirtualFileRow(row, rowData, revision);
+  return row;
+}
+
+function populateVirtualFolderRow(row, rowData, revision) {
+  row.classList.toggle("is-open", rowData.isOpen);
+  row.setAttribute("aria-expanded", String(rowData.isOpen));
+  row.setAttribute("aria-label", `フォルダー ${rowData.node.path}`);
+  const triangle = document.createElement("span");
+  triangle.className = "tree-triangle";
+  triangle.textContent = "▶";
+  const icon = document.createElement("span");
+  icon.className = "file-icon";
+  icon.textContent = "📁";
+  const label = document.createElement("span");
+  label.className = "tree-name";
+  const chain = document.createElement("span");
+  chain.className = "folder-chain";
+  chain.textContent = rowData.names.length > 1 ? `${rowData.names.slice(0, -1).join(" / ")} / ` : "";
+  const leaf = document.createElement("span");
+  leaf.className = "folder-leaf";
+  leaf.textContent = rowData.names[rowData.names.length - 1];
+  label.append(chain, leaf);
+  const aggregate = document.createElement("span");
+  aggregate.className = "agg";
+  renderAggregateBadges(aggregate, rowData.node.counts);
+  const grow = document.createElement("span");
+  grow.className = "grow";
+  const actionLabel = t("discardFolderChanges");
+  const action = createTreeAction(
+    actionLabel,
+    () => {
+      if (revision !== diffVirtualView.revision) return;
+      discardPaths(CheckPoFrontendState.collectChangeTreeFilePaths(rowData.node));
+    },
+    `${actionLabel}: ${rowData.node.path}`,
+  );
+  action.classList.add("folder-op");
+  row.append(triangle, icon, label, aggregate, grow, action);
+  row.addEventListener("click", (event) => {
+    event.currentTarget.closest(".diff-tree")?.focus({ preventScroll: true });
+    activateVirtualRow(rowData.key);
+    toggleVirtualFolder(rowData);
+  });
+}
+
+function populateVirtualFileRow(row, rowData, revision) {
+  const change = rowData.change;
+  row.classList.toggle("is-deleted", change.type === "deleted");
+  row.classList.toggle("is-selected", state.currentDiffSelectedPaths.has(change.path));
   row.dataset.path = change.path;
   row.dataset.type = change.type;
-  row.style.setProperty("--ind", `${depth * 20}px`);
-  row.tabIndex = 0;
+  row.setAttribute("aria-selected", String(state.currentDiffSelectedPaths.has(change.path)));
+  row.setAttribute("aria-label", `${change.path}: ${changeFileDescription(change.type)}`);
   const mark = document.createElement("span");
   mark.className = `status-dot ${change.type}`;
   mark.textContent = change.type === "added" ? "＋" : change.type === "deleted" ? "−" : "✎";
   const label = document.createElement("span");
   label.className = "tree-name grow";
-  label.textContent = basename(change.path);
+  label.textContent = change.name || basename(change.path);
   const meta = document.createElement("span");
   meta.className = `change-meta ${change.type}`;
   meta.textContent = changeFileDescription(change.type);
+  const actionLabel = change.type === "deleted" ? t("restoreDeletedFile") : t("discardFileChange");
+  const action = createTreeAction(
+    actionLabel,
+    () => {
+      if (revision !== diffVirtualView.revision) return;
+      discardPaths([change.path]);
+    },
+    `${actionLabel}: ${change.path}`,
+  );
+  row.append(mark, label, meta, action);
+  row.addEventListener("click", (event) => {
+    event.currentTarget.closest(".diff-tree")?.focus({ preventScroll: true });
+    activateVirtualRow(rowData.key);
+    selectChangeFile(change.path, event);
+    renderVirtualTreeWindow(true);
+  });
+}
+
+function createTreeAction(label, handler, accessibleLabel = label) {
   const action = document.createElement("button");
   action.className = "tree-op";
   action.type = "button";
+  action.tabIndex = -1;
   action.dataset.destructive = "true";
-  action.textContent = change.type === "deleted" ? t("restoreDeletedFile") : t("discardFileChange");
+  action.textContent = label;
+  action.setAttribute("aria-label", accessibleLabel);
+  action.addEventListener("pointerdown", (event) => event.preventDefault());
   action.addEventListener("click", (event) => {
     event.stopPropagation();
-    discardPaths([change.path]);
+    handler();
   });
-  row.append(mark, label, meta, action);
-  const select = (event) => {
-    selectChangeFile(change.path, changes, index, event);
-    renderChangeGroups(renderContext.groups);
-  };
-  row.addEventListener("click", select);
-  row.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") select(event);
-  });
-  row.classList.toggle("is-selected", state.currentDiffSelectedPaths.has(change.path));
-  return row;
+  return action;
 }
 
-function selectChangeFile(path, changes, index, event) {
-  const selected = new Set(state.currentDiffSelectedPaths);
-  if (event.shiftKey && state.lastSelectedChangePath) {
-    const anchorIndex = changes.findIndex((change) => change.path === state.lastSelectedChangePath);
-    if (anchorIndex >= 0) {
-      const start = Math.min(anchorIndex, index);
-      const end = Math.max(anchorIndex, index);
-      for (const change of changes.slice(start, end + 1)) selected.add(change.path);
-      state.currentDiffSelectedPaths = selected;
-      updateSelectedDiffButton();
+function activateVirtualRow(key) {
+  diffVirtualView.activeKey = key;
+  updateActiveDescendant();
+}
+
+function updateActiveDescendant() {
+  const { container, activeKey } = diffVirtualView;
+  if (!container || !activeKey) {
+    container?.removeAttribute("aria-activedescendant");
+    return;
+  }
+  const active = [...container.querySelectorAll(".virtual-row")]
+    .find((row) => row.dataset.rowKey === activeKey);
+  if (active) container.setAttribute("aria-activedescendant", active.id);
+  else container.removeAttribute("aria-activedescendant");
+}
+
+function toggleVirtualFolder(rowData, forceOpen) {
+  state.diffTreeTouched = true;
+  const shouldOpen = forceOpen ?? !state.diffTreeOpenPaths.has(rowData.node.path);
+  if (shouldOpen) state.diffTreeOpenPaths.add(rowData.node.path);
+  else state.diffTreeOpenPaths.delete(rowData.node.path);
+  reflattenVirtualTree(rowData.key);
+}
+
+function reflattenVirtualTree(preferredActiveKey) {
+  if (!diffVirtualView.root) return;
+  invalidateVirtualTreeRender();
+  setVirtualTreeRows(CheckPoFrontendState.flattenChangeTreeRows(
+    diffVirtualView.root,
+    state.diffTreeOpenPaths,
+  ));
+  retainLogicalTreeSelection();
+  const preferredExists = diffVirtualView.rows.some((row) => row.key === preferredActiveKey);
+  diffVirtualView.activeKey = preferredExists
+    ? preferredActiveKey
+    : diffVirtualView.rows[0]?.key || null;
+  updateVirtualTreeHeight();
+  renderVirtualTreeWindow(true);
+  updateSelectedDiffButton();
+}
+
+function setVirtualTreeRows(rows) {
+  diffVirtualView.rows = rows;
+  diffVirtualView.rowIndexByKey = new Map(rows.map((row, index) => [row.key, index]));
+}
+
+function retainLogicalTreeSelection() {
+  const visibleFilePaths = diffVirtualView.rows
+    .filter((row) => row.kind === "file")
+    .map((row) => row.change.path);
+  const retained = CheckPoFrontendState.retainVisibleChangeSelection(
+    state.currentDiffSelectedPaths,
+    state.lastSelectedChangePath,
+    visibleFilePaths,
+  );
+  state.currentDiffSelectedPaths = retained.selectedPaths;
+  state.lastSelectedChangePath = retained.anchorPath;
+}
+
+function selectChangeFile(path, event) {
+  const visiblePaths = diffVirtualView.rows
+    .filter((row) => row.kind === "file")
+    .map((row) => row.change.path);
+  const result = CheckPoFrontendState.selectChangePaths({
+    selectedPaths: state.currentDiffSelectedPaths,
+    anchorPath: state.lastSelectedChangePath,
+    targetPath: path,
+    visiblePaths,
+    shiftKey: event.shiftKey,
+    toggleKey: event.metaKey || event.ctrlKey,
+  });
+  state.currentDiffSelectedPaths = result.selectedPaths;
+  state.lastSelectedChangePath = result.anchorPath;
+  updateSelectedDiffButton();
+}
+
+function handleVirtualTreeKeydown(event) {
+  if (event.target !== diffVirtualView.container || diffVirtualView.rows.length === 0) return;
+  let index = diffVirtualView.rowIndexByKey.get(diffVirtualView.activeKey) ?? -1;
+  if (index < 0) index = 0;
+  const row = diffVirtualView.rows[index];
+  let nextIndex = index;
+  if (event.key === "ArrowDown") nextIndex = Math.min(diffVirtualView.rows.length - 1, index + 1);
+  else if (event.key === "ArrowUp") nextIndex = Math.max(0, index - 1);
+  else if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = diffVirtualView.rows.length - 1;
+  else if (event.key === "ArrowRight" && row.kind === "folder") {
+    if (!row.isOpen) {
+      toggleVirtualFolder(row, true);
+      event.preventDefault();
       return;
     }
-  }
-  if (event.metaKey || event.ctrlKey) {
-    if (selected.has(path)) selected.delete(path);
-    else selected.add(path);
+    const childIndex = index + 1 < diffVirtualView.rows.length
+      && diffVirtualView.rows[index + 1].parentKey === row.key
+      ? index + 1
+      : -1;
+    if (childIndex >= 0) nextIndex = childIndex;
+  } else if (event.key === "ArrowLeft") {
+    if (row.kind === "folder" && row.isOpen) {
+      toggleVirtualFolder(row, false);
+      event.preventDefault();
+      return;
+    }
+    if (row.parentKey) {
+      const parentIndex = diffVirtualView.rowIndexByKey.get(row.parentKey) ?? -1;
+      if (parentIndex >= 0) nextIndex = parentIndex;
+    }
+  } else if (event.key === "Enter" || event.key === " ") {
+    if (row.kind === "folder") toggleVirtualFolder(row);
+    else {
+      selectChangeFile(row.change.path, event);
+      renderVirtualTreeWindow(true);
+    }
+    event.preventDefault();
+    return;
+  } else if (event.key === "Delete") {
+    if (diffDestructiveActionBlocked()) return;
+    if (row.kind === "folder") {
+      discardPaths(CheckPoFrontendState.collectChangeTreeFilePaths(row.node));
+    } else {
+      discardPaths([row.change.path]);
+    }
+    event.preventDefault();
+    return;
   } else {
-    selected.clear();
-    selected.add(path);
+    return;
   }
-  state.currentDiffSelectedPaths = selected;
-  state.lastSelectedChangePath = path;
-  updateSelectedDiffButton();
+  event.preventDefault();
+  setActiveVirtualRow(nextIndex);
+}
+
+function setActiveVirtualRow(index) {
+  const row = diffVirtualView.rows[index];
+  if (!row) return;
+  diffVirtualView.activeKey = row.key;
+  const top = index * diffVirtualView.rowHeight;
+  const bottom = top + diffVirtualView.rowHeight;
+  const container = diffVirtualView.container;
+  if (top < container.scrollTop) container.scrollTop = top;
+  else if (bottom > container.scrollTop + container.clientHeight) {
+    container.scrollTop = bottom - container.clientHeight;
+  }
+  renderVirtualTreeWindow(true);
+}
+
+function diffDestructiveActionBlocked() {
+  return state.busy
+    || state.confirming
+    || !state.projectPath
+    || state.pendingTransactions.length > 0
+    || state.unresolvedQuarantines.length > 0
+    || state.projectLocationStatus === "copiedSuspected";
 }
 
 function changeFileDescription(type) {
@@ -178,108 +511,11 @@ function updateFilterChips(addedCount, modifiedCount, deletedCount) {
 }
 
 function buildChangeTree(changes) {
-  const root = createTreeNode("", "", null);
-  for (const change of changes) {
-    const parts = String(change.path).split(/[\\/]/).filter(Boolean);
-    const fileName = parts.pop() || change.path;
-    let node = root;
-    for (const part of parts) {
-      const path = node.path ? `${node.path}/${part}` : part;
-      if (!node.children.has(part)) node.children.set(part, createTreeNode(part, path, node));
-      node = node.children.get(part);
-      node.counts[change.type] += 1;
-      node.paths.push(change.path);
-    }
-    node.files.push({ ...change, name: fileName });
-  }
-  return root;
+  return CheckPoFrontendState.buildChangeTreeModel(changes);
 }
 
-function createTreeNode(name, path, parent) {
-  return {
-    name,
-    path,
-    parent,
-    children: new Map(),
-    files: [],
-    counts: { added: 0, modified: 0, deleted: 0 },
-    paths: [],
-  };
-}
-
-function collectFolderPaths(node, paths = []) {
-  for (const child of node.children.values()) {
-    const compressed = compressedFolder(child);
-    paths.push(compressed.node.path);
-    collectFolderPaths(compressed.node, paths);
-  }
-  return paths;
-}
-
-function compressedFolder(node) {
-  const names = [node.name];
-  let current = node;
-  while (current.files.length === 0 && current.children.size === 1) {
-    const next = [...current.children.values()][0];
-    names.push(next.name);
-    current = next;
-  }
-  return { node: current, names };
-}
-
-function renderFolderNode(container, sourceNode, depth, renderContext) {
-  const { node, names } = compressedFolder(sourceNode);
-  const row = document.createElement("div");
-  const isOpen = state.diffTreeOpenPaths.has(node.path);
-  row.className = `tree-row folder ${isOpen ? "is-open" : ""}`;
-  row.style.setProperty("--ind", `${depth * 20}px`);
-  row.dataset.folderPath = node.path;
-  const chain = names.length > 1 ? `${names.slice(0, -1).join(" / ")} / ` : "";
-  row.innerHTML = `
-    <span class="tree-triangle">▶</span>
-    <span class="file-icon">📁</span>
-    <span class="tree-name"><span class="folder-chain"></span><span class="folder-leaf"></span></span>
-    <span class="agg"></span>
-    <span class="grow"></span>
-  `;
-  row.querySelector(".folder-chain").textContent = chain;
-  row.querySelector(".folder-leaf").textContent = names[names.length - 1];
-  renderAggregateBadges(row.querySelector(".agg"), node.counts);
-  const action = document.createElement("button");
-  action.className = "tree-op folder-op";
-  action.type = "button";
-  action.dataset.destructive = "true";
-  action.textContent = t("discardFolderChanges");
-  action.addEventListener("click", (event) => {
-    event.stopPropagation();
-    discardPaths([...new Set(node.paths)]);
-  });
-  row.append(action);
-  row.addEventListener("click", () => {
-    state.diffTreeTouched = true;
-    if (state.diffTreeOpenPaths.has(node.path)) state.diffTreeOpenPaths.delete(node.path);
-    else state.diffTreeOpenPaths.add(node.path);
-    renderChangeGroups(renderContext.groups);
-  });
-  container.append(row);
-
-  if (!isOpen) return;
-  const children = document.createElement("div");
-  children.className = "tree-children";
-  children.style.setProperty("--ind", `${depth * 20 + 14}px`);
-  for (const child of [...node.children.values()].sort(compareTreeNode)) {
-    renderFolderNode(children, child, depth + 1, renderContext);
-  }
-  for (const file of node.files.sort(compareTreeFile)) {
-    children.append(changeFileRow(
-      file,
-      renderContext.allChanges,
-      renderContext.pathToIndex.get(file.path) ?? -1,
-      renderContext,
-      depth + 1,
-    ));
-  }
-  container.append(children);
+function collectFolderPaths(root) {
+  return CheckPoFrontendState.collectChangeTreeFolderPaths(root);
 }
 
 function updateSelectedDiffButton() {
@@ -292,6 +528,8 @@ function updateSelectedDiffButton() {
   button.disabled = selectedCount === 0
     || state.busy
     || state.confirming
+    || state.pendingTransactions.length > 0
+    || state.unresolvedQuarantines.length > 0
     || state.projectLocationStatus === "copiedSuspected";
 }
 
@@ -309,19 +547,4 @@ function renderAggregateBadges(container, counts) {
     badge.textContent = `${mark}${count}`;
     container.append(badge);
   }
-}
-
-function compareTreeNode(a, b) {
-  return a.name.localeCompare(b.name, "ja");
-}
-
-function compareTreeFile(a, b) {
-  if (a.type !== b.type) return changeTypeOrder(a.type) - changeTypeOrder(b.type);
-  return a.name.localeCompare(b.name, "ja");
-}
-
-function changeTypeOrder(type) {
-  if (type === "added") return 0;
-  if (type === "modified") return 1;
-  return 2;
 }

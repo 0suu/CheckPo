@@ -1,6 +1,7 @@
 use super::*;
 
 pub const REPO_FORMAT_VERSION: u32 = 1;
+const REPOSITORY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const SNAPSHOT_FORMAT: &str = "canonical-json-v1";
 pub const OBJECT_FORMAT: &str = "loose-whole-file-v1";
 pub const HASH_ALGORITHM: &str = "blake3";
@@ -25,6 +26,7 @@ pub fn default_repository_config(project_id: &ProjectId) -> RepositoryConfig {
 }
 
 pub fn validate_repository_config(config: &RepositoryConfig, project_id: &ProjectId) -> Result<()> {
+    validate_repository_versions(config.schema_version, config.repo_format_version)?;
     let expected = default_repository_config(project_id);
     if config != &expected {
         return Err(CheckPoError::Corruption(
@@ -36,6 +38,22 @@ pub fn validate_repository_config(config: &RepositoryConfig, project_id: &Projec
 
 pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<PathBuf> {
     let repo_root = repo_root(storage_root, project_id);
+    create_dir_all_no_follow(storage_root, &repo_root)?;
+    let config_path = repo_root.join("repo.json");
+    let config_exists = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+                return Err(CheckPoError::Corruption(format!(
+                    "repo.json is not a regular file: {}",
+                    config_path.display()
+                )));
+            }
+            load_repo_config(&repo_root, project_id)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_error(&config_path, error)),
+    };
     for dir in [
         repo_root.join("refs"),
         repo_root.join("snapshots"),
@@ -45,13 +63,54 @@ pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<P
         repo_root.join("tmp"),
         repo_root.join("locks"),
     ] {
-        fs::create_dir_all(&dir).map_err(|error| io_error(&dir, error))?;
+        create_dir_all_no_follow(&repo_root, &dir)?;
     }
-    write_json_atomic(
-        &repo_root.join("repo.json"),
-        &default_repository_config(project_id),
-    )?;
+    if !config_exists {
+        match write_json_atomic_new(&config_path, &default_repository_config(project_id)) {
+            Ok(()) => {}
+            Err(CheckPoError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let metadata = fs::symlink_metadata(&config_path)
+                    .map_err(|error| io_error(&config_path, error))?;
+                if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+                    return Err(CheckPoError::Corruption(format!(
+                        "repo.json is not a regular file: {}",
+                        config_path.display()
+                    )));
+                }
+                load_repo_config(&repo_root, project_id)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    validate_repository_layout_no_follow(&repo_root)?;
     Ok(repo_root)
+}
+
+fn validate_repository_versions(schema_version: u32, repo_format_version: u32) -> Result<()> {
+    if schema_version > REPOSITORY_CONFIG_SCHEMA_VERSION {
+        return Err(CheckPoError::UnsupportedFormat {
+            artifact: "repository config schema".to_string(),
+            found: schema_version,
+            supported: REPOSITORY_CONFIG_SCHEMA_VERSION,
+        });
+    }
+    if repo_format_version > REPO_FORMAT_VERSION {
+        return Err(CheckPoError::UnsupportedFormat {
+            artifact: "repository format".to_string(),
+            found: repo_format_version,
+            supported: REPO_FORMAT_VERSION,
+        });
+    }
+    if schema_version != REPOSITORY_CONFIG_SCHEMA_VERSION
+        || repo_format_version != REPO_FORMAT_VERSION
+    {
+        return Err(CheckPoError::Corruption(
+            "repo.json does not match CheckPo schema v1".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn repo_root(storage_root: &Path, project_id: &ProjectId) -> PathBuf {
@@ -60,7 +119,36 @@ pub fn repo_root(storage_root: &Path, project_id: &ProjectId) -> PathBuf {
 
 pub fn load_repo_config(repo_root: &Path, project_id: &ProjectId) -> Result<RepositoryConfig> {
     let path = repo_root.join("repo.json");
-    let config: RepositoryConfig = read_json(&path)?;
+    ensure_regular_directory_no_follow(repo_root)?;
+    ensure_regular_file_no_follow(&path)?;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RepositoryConfigEnvelope {
+        schema_version: u32,
+        repo_format_version: Option<u32>,
+    }
+
+    let bytes = fs::read(&path).map_err(|error| io_error(&path, error))?;
+    let envelope: RepositoryConfigEnvelope =
+        serde_json::from_slice(&bytes).map_err(|error| json_error(&path, error))?;
+    if envelope.schema_version > REPOSITORY_CONFIG_SCHEMA_VERSION {
+        return Err(CheckPoError::UnsupportedFormat {
+            artifact: "repository config schema".to_string(),
+            found: envelope.schema_version,
+            supported: REPOSITORY_CONFIG_SCHEMA_VERSION,
+        });
+    }
+    if let Some(repo_format_version) = envelope.repo_format_version {
+        if repo_format_version > REPO_FORMAT_VERSION {
+            return Err(CheckPoError::UnsupportedFormat {
+                artifact: "repository format".to_string(),
+                found: repo_format_version,
+                supported: REPO_FORMAT_VERSION,
+            });
+        }
+    }
+    let config: RepositoryConfig =
+        serde_json::from_slice(&bytes).map_err(|error| json_error(&path, error))?;
     validate_repository_config(&config, project_id)?;
     Ok(config)
 }

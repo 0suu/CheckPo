@@ -21,6 +21,8 @@ enum Command {
         project_path: PathBuf,
         #[arg(long)]
         start_as_separate: bool,
+        #[arg(long)]
+        yes: bool,
     },
     Status {
         project_path: PathBuf,
@@ -84,6 +86,12 @@ enum CheckpointCommand {
         checkpoint_id: String,
         #[arg(long)]
         yes: bool,
+    },
+    Rename {
+        project_path: PathBuf,
+        checkpoint_id: String,
+        #[arg(long)]
+        name: String,
     },
 }
 
@@ -167,19 +175,57 @@ enum StorageGcCommand {
 
 #[derive(Debug, Subcommand)]
 enum TransactionsCommand {
-    List { project_path: PathBuf },
-    Recover { project_path: PathBuf },
+    List {
+        project_path: PathBuf,
+    },
+    Recover {
+        project_path: PathBuf,
+    },
+    Quarantine {
+        project_path: PathBuf,
+        transaction_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum MaintenanceCommand {
-    CleanupJournals { project_path: PathBuf },
+    CleanupJournals {
+        project_path: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+    TempFiles {
+        #[command(subcommand)]
+        command: TempFilesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TempFilesCommand {
+    Analyze {
+        project_path: PathBuf,
+    },
+    Cleanup {
+        project_path: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> ExitCode {
+    let _diagnostics = match core::init_diagnostics() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("Warning: diagnostic logging is unavailable: {error}");
+            None
+        }
+    };
     match run() {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
+            core::log_operation_error("cli", &error);
             eprintln!("{error}");
             ExitCode::from(1)
         }
@@ -192,9 +238,10 @@ fn run() -> Result<u8, String> {
         Command::Init {
             project_path,
             start_as_separate,
+            yes,
         } => {
             let value = if start_as_separate {
-                core::start_as_separate_project(project_path)
+                core::start_as_separate_project(project_path, core::ApplyOptions { yes })
             } else {
                 core::init_project(project_path)
             }
@@ -209,44 +256,74 @@ fn run() -> Result<u8, String> {
             let project = core::project_view(&context).map_err(to_message)?;
             let pending_transactions =
                 core::pending_transactions_for_project(&context).map_err(to_message)?;
+            let unresolved_quarantines =
+                core::unresolved_transaction_quarantines_for_project(&context)
+                    .map_err(to_message)?;
             let mut warnings = Vec::new();
-            let checkpoints = match core::list_checkpoints_for_project(&context) {
-                Ok(checkpoints) => checkpoints,
-                Err(error)
-                    if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                        || !pending_transactions.is_empty() =>
-                {
-                    warnings.push(format!("Failed to load checkpoints: {error}"));
-                    Vec::new()
+            let mut checkpoint_index =
+                core::checkpoint_index_status(&context).map_err(to_message)?;
+            let checkpoints = if checkpoint_index.state == core::CheckpointIndexState::Current {
+                match core::list_checkpoints_with_warnings_for_project(&context) {
+                    Ok(result) => {
+                        warnings.extend(result.warnings);
+                        Some(result.checkpoints)
+                    }
+                    Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                        checkpoint_index = core::CheckpointIndexStatus {
+                            state: core::CheckpointIndexState::Corrupt,
+                            rebuildable: true,
+                            detail: Some(detail),
+                        };
+                        None
+                    }
+                    Err(error) => return Err(to_message(error)),
                 }
-                Err(error) => return Err(to_message(error)),
+            } else {
+                None
             };
-            let storage = match core::storage_summary_from_index(&context) {
-                Ok(storage) => Some(storage),
-                Err(error)
-                    if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                        || !pending_transactions.is_empty() =>
-                {
-                    warnings.push(format!("Failed to load storage summary: {error}"));
-                    None
+            let storage = if checkpoint_index.state == core::CheckpointIndexState::Current {
+                match core::storage_summary_from_index(&context) {
+                    Ok(storage) => Some(storage),
+                    Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                        checkpoint_index = core::CheckpointIndexStatus {
+                            state: core::CheckpointIndexState::Corrupt,
+                            rebuildable: true,
+                            detail: Some(detail),
+                        };
+                        None
+                    }
+                    Err(error) => return Err(to_message(error)),
                 }
-                Err(error) => return Err(to_message(error)),
+            } else {
+                None
             };
             let value = serde_json::json!({
                 "project": project,
+                "checkpointIndex": checkpoint_index,
                 "checkpoints": checkpoints,
                 "storage": storage,
+                "pendingTransactions": pending_transactions,
+                "unresolvedQuarantines": unresolved_quarantines,
                 "warnings": warnings
             });
             print_or_json(cli.json, &value, || {
                 println!("Project: {}", project.project_root_path.display());
                 println!("Storage: {}", project.storage_root_path.display());
-                println!("Checkpoints: {}", checkpoints.len());
+                match &checkpoints {
+                    Some(checkpoints) => println!("Checkpoints: {}", checkpoints.len()),
+                    None => println!("Checkpoints: unavailable ({:?})", checkpoint_index.state),
+                }
                 for warning in &project.warnings {
                     println!("Warning: {}", project_warning_text(warning));
                 }
                 for warning in &warnings {
                     println!("Warning: {warning}");
+                }
+                for quarantine in &unresolved_quarantines {
+                    println!(
+                        "Warning: unresolved quarantined transaction {}. Restore a known good checkpoint before making changes.",
+                        quarantine.transaction_id
+                    );
                 }
             })?;
         }
@@ -300,6 +377,21 @@ fn run() -> Result<u8, String> {
                 print_or_json(cli.json, &result, || {
                     println!("Deleted checkpoint: {}", result.deleted_checkpoint_id);
                     for warning in &result.warnings {
+                        println!("Warning: {warning}");
+                    }
+                })?;
+            }
+            CheckpointCommand::Rename {
+                project_path,
+                checkpoint_id,
+                name,
+            } => {
+                let summary = core::rename_checkpoint(project_path, &checkpoint_id, &name)
+                    .map_err(to_message)?;
+                print_or_json(cli.json, &summary, || {
+                    println!("Renamed checkpoint: {}", summary.checkpoint_id);
+                    println!("Name: {}", summary.name);
+                    for warning in &summary.warnings {
                         println!("Warning: {warning}");
                     }
                 })?;
@@ -402,8 +494,11 @@ fn run() -> Result<u8, String> {
                 print_or_json(cli.json, &result, || {
                     println!("Rebuilt index.");
                     println!("Snapshots: {}", result.snapshot_count);
-                    println!("Objects: {}", result.object_count);
-                    println!("Missing objects: {}", result.missing_object_count);
+                    println!("Referenced objects: {}", result.referenced_object_count);
+                    println!(
+                        "Unavailable referenced objects: {}",
+                        result.unavailable_referenced_object_count
+                    );
                 })?;
                 return Ok(if ok { 0 } else { 1 });
             }
@@ -472,15 +567,66 @@ fn run() -> Result<u8, String> {
                 })?;
                 return Ok(if ok { 0 } else { 1 });
             }
+            TransactionsCommand::Quarantine {
+                project_path,
+                transaction_id,
+                yes,
+            } => {
+                if !yes {
+                    return Err("transaction quarantine requires --yes.".to_string());
+                }
+                let result = core::quarantine_transaction(
+                    project_path,
+                    &transaction_id,
+                    core::ApplyOptions { yes },
+                )
+                .map_err(to_message)?;
+                print_or_json(cli.json, &result, || {
+                    println!("Quarantined transaction: {}", result.transaction_id);
+                    println!("Preserved at: {}", result.quarantine_path.display());
+                    println!("Preserved bytes: {}", result.preserved_bytes);
+                    for warning in &result.warnings {
+                        println!("Warning: {warning}");
+                    }
+                })?;
+            }
         },
         Command::Maintenance { command } => match command {
-            MaintenanceCommand::CleanupJournals { project_path } => {
-                let result = core::cleanup_journals(project_path).map_err(to_message)?;
+            MaintenanceCommand::CleanupJournals { project_path, yes } => {
+                let result = core::cleanup_journals(project_path, core::ApplyOptions { yes })
+                    .map_err(to_message)?;
                 print_or_json(cli.json, &result, || {
                     println!("Deleted journals: {}", result.deleted_directory_count);
                     println!("Deleted bytes: {}", result.deleted_bytes);
                 })?;
             }
+            MaintenanceCommand::TempFiles { command } => match command {
+                TempFilesCommand::Analyze { project_path } => {
+                    let plan = core::analyze_orphan_temp_files(project_path).map_err(to_message)?;
+                    print_or_json(cli.json, &plan, || {
+                        println!("Temporary files: {}", plan.file_count);
+                        println!("Temporary bytes: {}", plan.total_bytes);
+                        for warning in &plan.warnings {
+                            println!("Warning: {warning}");
+                        }
+                    })?;
+                }
+                TempFilesCommand::Cleanup { project_path, yes } => {
+                    if !yes {
+                        return Err("temporary file cleanup requires --yes.".to_string());
+                    }
+                    let result =
+                        core::cleanup_orphan_temp_files(project_path, core::ApplyOptions { yes })
+                            .map_err(to_message)?;
+                    print_or_json(cli.json, &result, || {
+                        println!("Deleted temporary files: {}", result.deleted_file_count);
+                        println!("Deleted bytes: {}", result.deleted_bytes);
+                        for warning in result.plan.warnings.iter().chain(result.warnings.iter()) {
+                            println!("Warning: {warning}");
+                        }
+                    })?;
+                }
+            },
         },
     }
     Ok(0)
@@ -524,6 +670,9 @@ fn print_plan(plan: &core::OperationPlan) {
     for operation in &plan.operations {
         println!("{:?} {}", operation.operation_type, operation.path);
     }
+    for warning in &plan.warnings {
+        println!("Warning: {warning}");
+    }
 }
 
 fn project_warning_text(warning: &core::ProjectWarning) -> String {
@@ -555,4 +704,74 @@ fn read_operation_plan(path: &PathBuf) -> Result<core::OperationPlan, String> {
 
 fn to_message(error: core::CheckPoError) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_start_as_separate_accepts_explicit_confirmation() {
+        let cli =
+            Cli::try_parse_from(["checkpo", "init", "project", "--start-as-separate", "--yes"])
+                .unwrap();
+
+        let Command::Init {
+            start_as_separate,
+            yes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert!(start_as_separate);
+        assert!(yes);
+    }
+
+    #[test]
+    fn cleanup_journals_accepts_explicit_confirmation() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "maintenance",
+            "cleanup-journals",
+            "project",
+            "--yes",
+        ])
+        .unwrap();
+
+        let Command::Maintenance {
+            command: MaintenanceCommand::CleanupJournals { yes, .. },
+        } = cli.command
+        else {
+            panic!("expected cleanup-journals command");
+        };
+        assert!(yes);
+    }
+
+    #[test]
+    fn transaction_quarantine_accepts_id_and_explicit_confirmation() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "transactions",
+            "quarantine",
+            "project",
+            "0123456789abcdef0123456789abcdef",
+            "--yes",
+        ])
+        .unwrap();
+
+        let Command::Transactions {
+            command:
+                TransactionsCommand::Quarantine {
+                    transaction_id,
+                    yes,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected transaction quarantine command");
+        };
+        assert_eq!(transaction_id, "0123456789abcdef0123456789abcdef");
+        assert!(yes);
+    }
 }

@@ -1,9 +1,10 @@
 use crate::{
-    canonical_utc, hash_file, relative_path_from_project, report_operation_progress,
-    CancellationToken, CheckPoError, OperationProgress, Result, ScanWarning, ScannedFile,
-    TrackedUnityFilePath,
+    canonical_utc, hash_file, is_checkpo_temporary_file, relative_path_from_project,
+    report_operation_progress, CancellationToken, CheckPoError, OperationProgress, Result,
+    ScanWarning, ScannedFile, SnapshotEntry, SnapshotFile, TrackedUnityFilePath,
 };
 use rayon::prelude::*;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -19,155 +20,173 @@ struct PendingScannedFile {
     fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ScannedMetadataFile {
+    pub(crate) path: TrackedUnityFilePath,
+    pub(crate) size_bytes: u64,
+    pub(crate) modified_at_utc: String,
+}
+
 pub fn scan_project_for_checkpoint(
     project: &crate::ProjectContext,
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
-) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>)> {
+) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
+    // Callers that can prove a snapshot is an appropriate cache baseline pass it
+    // explicitly. With no baseline every source file is hashed, so an unrelated
+    // or unreadable refs/latest can never affect a scan.
+    scan_project_for_checkpoint_with_baseline(project, None, progress, cancellation)
+}
+
+pub(crate) fn scan_project_for_checkpoint_with_baseline(
+    project: &crate::ProjectContext,
+    baseline: Option<&SnapshotFile>,
+    progress: Option<&dyn Fn(OperationProgress)>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
     let cached = if platform_fingerprint_is_strong_enough_for_hash_reuse() {
         crate::load_file_fingerprints(project).unwrap_or_default()
     } else {
         Default::default()
     };
+    let baseline_files = baseline.map(|snapshot| {
+        snapshot
+            .files
+            .iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<BTreeMap<_, _>>()
+    });
     scan_project_internal(
         project.project_root.as_path(),
         Some(&cached),
+        baseline_files.as_ref(),
         progress,
         cancellation,
     )
 }
 
+pub(crate) fn scan_project_metadata(
+    project_root: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<ScannedMetadataFile>, Vec<ScanWarning>)> {
+    let (files, warnings, _) = collect_project_files(project_root, cancellation)?;
+    Ok((
+        files
+            .into_iter()
+            .map(|file| ScannedMetadataFile {
+                path: file.path,
+                size_bytes: file.size_bytes,
+                modified_at_utc: file.modified_at_utc,
+            })
+            .collect(),
+        warnings,
+    ))
+}
+
+pub(crate) fn format_scan_warning(warning: &ScanWarning) -> String {
+    format!("{}: {}", warning.relative_path, warning.reason)
+}
+
 fn scan_project_internal(
     project_root: &Path,
     cached: Option<&std::collections::BTreeMap<TrackedUnityFilePath, crate::CachedFileFingerprint>>,
+    baseline: Option<&BTreeMap<TrackedUnityFilePath, &SnapshotEntry>>,
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
-) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>)> {
-    let mut files = Vec::new();
-    let mut warnings = Vec::new();
-    for root in ["Assets", "Packages", "ProjectSettings"] {
-        crate::ensure_not_cancelled(cancellation)?;
-        let root_path = project_root.join(root);
-        if !root_path.exists() {
-            continue;
+) -> Result<(Vec<ScannedFile>, Vec<ScanWarning>, bool)> {
+    let (files, mut warnings, mut incomplete) = collect_project_files(project_root, cancellation)?;
+    // Windows needs an opened handle for the strong file id/change-time
+    // fingerprint. Doing that serially made large Unity projects spend minutes
+    // in handle opens even when no content needed hashing, so assess independent
+    // files in parallel while keeping the same cache acceptance conditions.
+    let assessed = files
+        .into_par_iter()
+        .map(
+            |mut file| -> Result<(Option<PendingScannedFile>, Option<ScanWarning>)> {
+                crate::ensure_not_cancelled(cancellation)?;
+                let metadata = match fs::metadata(&file.full_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let relative_path = file.path.to_string();
+                        return Ok((
+                            None,
+                            Some(ScanWarning {
+                                relative_path,
+                                reason: format!("file metadata could not be read: {error}"),
+                            }),
+                        ));
+                    }
+                };
+                let fingerprint_warning = match file_fingerprint(&file.full_path, &metadata) {
+                    Ok(fingerprint) => {
+                        file.fingerprint = fingerprint;
+                        None
+                    }
+                    Err(error) => Some(ScanWarning {
+                        relative_path: file.path.to_string(),
+                        reason: format!("file fingerprint could not be read: {error}"),
+                    }),
+                };
+                file.hash = match (
+                    cached.and_then(|records| records.get(&file.path)),
+                    baseline.and_then(|entries| entries.get(&file.path)),
+                ) {
+                    (Some(record), Some(entry))
+                        if Some(record.fingerprint.as_str()) == file.fingerprint.as_deref()
+                            && record.size_bytes == file.size_bytes
+                            && entry.size_bytes == file.size_bytes
+                            && entry.content_size_bytes() == file.size_bytes
+                            && entry.content_hash() == &record.object_id
+                            && entry.modified_at_utc == file.modified_at_utc =>
+                    {
+                        Some(record.object_id.clone())
+                    }
+                    _ => None,
+                };
+                Ok((Some(file), fingerprint_warning))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let mut valid_files = Vec::with_capacity(assessed.len());
+    for (file, warning) in assessed {
+        if let Some(warning) = warning {
+            if file.is_none() {
+                incomplete = true;
+            }
+            warnings.push(warning);
         }
-        if !root_path.is_dir() {
-            warnings.push(ScanWarning {
-                relative_path: root.to_string(),
-                reason: "tracked root is not a directory".to_string(),
-            });
-            continue;
-        }
-        for entry in WalkDir::new(&root_path).follow_links(false).into_iter() {
-            crate::ensure_not_cancelled(cancellation)?;
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    warnings.push(ScanWarning {
-                        relative_path: root.to_string(),
-                        reason: error.to_string(),
-                    });
-                    continue;
-                }
-            };
-            if entry.file_type().is_symlink() || entry.file_type().is_dir() {
-                continue;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let full_path = entry.path().to_path_buf();
-            let relative = match relative_path_from_project(project_root, &full_path) {
-                Ok(relative) => relative,
-                Err(error) => {
-                    warnings.push(ScanWarning {
-                        relative_path: full_path.display().to_string(),
-                        reason: error.to_string(),
-                    });
-                    continue;
-                }
-            };
-            if is_checkpo_temporary_file(entry.path()) {
-                warnings.push(ScanWarning {
-                    relative_path: relative,
-                    reason: "temporary CheckPo file was skipped".to_string(),
-                });
-                continue;
-            }
-            let path = match TrackedUnityFilePath::parse(&relative) {
-                Ok(path) => path,
-                Err(error) => {
-                    warnings.push(ScanWarning {
-                        relative_path: relative,
-                        reason: error.to_string(),
-                    });
-                    continue;
-                }
-            };
-            let leaf_metadata = match fs::symlink_metadata(&full_path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    warnings.push(ScanWarning {
-                        relative_path: path.to_string(),
-                        reason: error.to_string(),
-                    });
-                    continue;
-                }
-            };
-            if leaf_metadata.file_type().is_symlink() {
-                warnings.push(ScanWarning {
-                    relative_path: path.to_string(),
-                    reason: "symlink files are not supported".to_string(),
-                });
-                continue;
-            }
-            let metadata = match fs::metadata(&full_path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    warnings.push(ScanWarning {
-                        relative_path: path.to_string(),
-                        reason: error.to_string(),
-                    });
-                    continue;
-                }
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            let modified = metadata
-                .modified()
-                .map_err(|error| crate::io_error(&full_path, error))?;
-            let fingerprint = file_fingerprint(&full_path, &metadata)?;
-            let hash = cached
-                .and_then(|records| records.get(&path))
-                .filter(|record| {
-                    Some(record.fingerprint.as_str()) == fingerprint.as_deref()
-                        && record.size_bytes == metadata.len()
-                })
-                .map(|record| record.object_id.clone())
-                .map(Some)
-                .unwrap_or(None);
-            files.push(PendingScannedFile {
-                path,
-                full_path,
-                size_bytes: metadata.len(),
-                modified_at_utc: canonical_utc(modified),
-                hash,
-                fingerprint,
-            });
+        if let Some(file) = file {
+            valid_files.push(file);
         }
     }
+    let mut files = valid_files;
     let total = files.len();
     let mut completed = 0_usize;
     for chunk in files.chunks_mut(PARALLEL_HASH_CHUNK_SIZE) {
         crate::ensure_not_cancelled(cancellation)?;
-        chunk.par_iter_mut().try_for_each(|file| -> Result<()> {
-            crate::ensure_not_cancelled(cancellation)?;
-            if file.hash.is_none() {
-                file.hash = Some(hash_file(&file.full_path)?);
-            }
-            Ok(())
-        })?;
+        let chunk_warnings = chunk
+            .par_iter_mut()
+            .map(|file| -> Result<Option<ScanWarning>> {
+                crate::ensure_not_cancelled(cancellation)?;
+                if file.hash.is_some() {
+                    return Ok(None);
+                }
+                match hash_file(&file.full_path) {
+                    Ok(hash) => {
+                        file.hash = Some(hash);
+                        Ok(None)
+                    }
+                    Err(error) => Ok(Some(ScanWarning {
+                        relative_path: file.path.to_string(),
+                        reason: format!("file content could not be read: {error}"),
+                    })),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if chunk_warnings.iter().any(Option::is_some) {
+            incomplete = true;
+        }
+        warnings.extend(chunk_warnings.into_iter().flatten());
         completed += chunk.len();
         report_operation_progress(
             progress,
@@ -177,6 +196,7 @@ fn scan_project_internal(
             chunk.last().map(|file| file.path.to_string()),
         );
     }
+    files.retain(|file| file.hash.is_some());
     files.sort_by(|a, b| a.path.cmp(&b.path));
     if files
         .iter()
@@ -202,24 +222,194 @@ fn scan_project_internal(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((files, warnings))
+    Ok((files, warnings, incomplete))
 }
 
-fn is_checkpo_temporary_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    if name.starts_with(".checkpo-") && name.ends_with(".tmp") {
-        return true;
+fn collect_project_files(
+    project_root: &Path,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<PendingScannedFile>, Vec<ScanWarning>, bool)> {
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    let mut incomplete = false;
+    for root in ["Assets", "Packages", "ProjectSettings"] {
+        crate::ensure_not_cancelled(cancellation)?;
+        let root_path = project_root.join(root);
+        match fs::symlink_metadata(&root_path) {
+            Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {
+            }
+            Ok(metadata) => {
+                incomplete = true;
+                warnings.push(ScanWarning {
+                    relative_path: root.to_string(),
+                    reason: if crate::metadata_is_link_or_reparse(&metadata) {
+                        "tracked root is a symbolic link or reparse point".to_string()
+                    } else {
+                        "tracked root is not a directory".to_string()
+                    },
+                });
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                incomplete = true;
+                warnings.push(ScanWarning {
+                    relative_path: root.to_string(),
+                    reason: format!("tracked root metadata could not be read: {error}"),
+                });
+                continue;
+            }
+        }
+        for entry in WalkDir::new(&root_path).follow_links(false).into_iter() {
+            crate::ensure_not_cancelled(cancellation)?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    incomplete = true;
+                    warnings.push(ScanWarning {
+                        relative_path: root.to_string(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if entry.file_type().is_symlink() {
+                incomplete = true;
+                warnings.push(ScanWarning {
+                    relative_path: entry
+                        .path()
+                        .strip_prefix(project_root)
+                        .unwrap_or(entry.path())
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    reason: "symbolic links and reparse points are not supported".to_string(),
+                });
+                continue;
+            }
+            if entry.file_type().is_dir() {
+                #[cfg(windows)]
+                match fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) => {
+                        incomplete = true;
+                        warnings.push(ScanWarning {
+                            relative_path: entry
+                                .path()
+                                .strip_prefix(project_root)
+                                .unwrap_or(entry.path())
+                                .to_string_lossy()
+                                .replace('\\', "/"),
+                            reason: "symbolic links and reparse points are not supported"
+                                .to_string(),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        incomplete = true;
+                        warnings.push(ScanWarning {
+                            relative_path: entry.path().display().to_string(),
+                            reason: format!("directory metadata could not be read: {error}"),
+                        });
+                    }
+                }
+                continue;
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let full_path = entry.path().to_path_buf();
+            let relative = match relative_path_from_project(project_root, &full_path) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    incomplete = true;
+                    warnings.push(ScanWarning {
+                        relative_path: full_path.display().to_string(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if is_checkpo_temporary_file(entry.path()) {
+                warnings.push(ScanWarning {
+                    relative_path: relative,
+                    reason: "temporary CheckPo file was skipped".to_string(),
+                });
+                continue;
+            }
+            let path = match TrackedUnityFilePath::parse(&relative) {
+                Ok(path) => path,
+                Err(error) => {
+                    incomplete = true;
+                    warnings.push(ScanWarning {
+                        relative_path: relative,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let leaf_metadata = match fs::symlink_metadata(&full_path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    incomplete = true;
+                    warnings.push(ScanWarning {
+                        relative_path: path.to_string(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if crate::metadata_is_link_or_reparse(&leaf_metadata) {
+                incomplete = true;
+                warnings.push(ScanWarning {
+                    relative_path: path.to_string(),
+                    reason: "symbolic links and reparse points are not supported".to_string(),
+                });
+                continue;
+            }
+            let metadata = match fs::metadata(&full_path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    incomplete = true;
+                    warnings.push(ScanWarning {
+                        relative_path: path.to_string(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let modified = match metadata.modified() {
+                Ok(modified) => modified,
+                Err(error) => {
+                    incomplete = true;
+                    warnings.push(ScanWarning {
+                        relative_path: path.to_string(),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            files.push(PendingScannedFile {
+                path,
+                full_path,
+                size_bytes: metadata.len(),
+                modified_at_utc: canonical_utc(modified),
+                hash: None,
+                fingerprint: None,
+            });
+        }
     }
-    if !name.starts_with('.') || !name.ends_with(".tmp") {
-        return false;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    if files
+        .iter()
+        .any(|file| !file.full_path.starts_with(project_root))
+    {
+        return Err(CheckPoError::OutsideTrackedScope(
+            project_root.display().to_string(),
+        ));
     }
-    let body = &name[1..name.len() - ".tmp".len()];
-    let Some((_, suffix)) = body.rsplit_once('.') else {
-        return false;
-    };
-    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    Ok((files, warnings, incomplete))
 }
 
 #[cfg(unix)]
@@ -298,4 +488,139 @@ pub(crate) fn file_fingerprint(path: &Path, metadata: &fs::Metadata) -> Result<O
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn file_fingerprint(_path: &Path, _metadata: &fs::Metadata) -> Result<Option<String>> {
     Ok(None)
+}
+
+#[cfg(all(test, windows))]
+mod windows_benchmarks {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "requires CHECKPO_BENCH_PROJECT"]
+    fn strong_fingerprint_parallel_benchmark() {
+        let project = std::env::var_os("CHECKPO_BENCH_PROJECT")
+            .map(std::path::PathBuf::from)
+            .expect("CHECKPO_BENCH_PROJECT is required");
+        let enumerate_started = Instant::now();
+        let (files, warnings, incomplete) = collect_project_files(&project, None).unwrap();
+        let enumerate_elapsed = enumerate_started.elapsed();
+        assert!(!incomplete, "scan warnings: {warnings:?}");
+
+        let fingerprint_started = Instant::now();
+        let fingerprints = files
+            .par_iter()
+            .map(|file| {
+                let metadata = fs::metadata(&file.full_path)
+                    .map_err(|error| crate::io_error(&file.full_path, error))?;
+                file_fingerprint(&file.full_path, &metadata)
+            })
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let fingerprint_elapsed = fingerprint_started.elapsed();
+        assert_eq!(fingerprints.len(), files.len());
+        println!(
+            "files={} enumerate_ms={:.1} fingerprint_ms={:.1}",
+            files.len(),
+            enumerate_elapsed.as_secs_f64() * 1000.0,
+            fingerprint_elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires CHECKPO_BENCH_PROJECT and CHECKPO_BENCH_REPO"]
+    fn cached_checkpoint_scan_benchmark() {
+        let project = std::env::var_os("CHECKPO_BENCH_PROJECT")
+            .map(std::path::PathBuf::from)
+            .expect("CHECKPO_BENCH_PROJECT is required");
+        let repo = std::env::var_os("CHECKPO_BENCH_REPO")
+            .map(std::path::PathBuf::from)
+            .expect("CHECKPO_BENCH_REPO is required");
+        let project_id = crate::ProjectId::parse(
+            repo.file_name()
+                .and_then(|value| value.to_str())
+                .expect("repo directory must be the project id"),
+        )
+        .unwrap();
+        let storage_root = repo
+            .parent()
+            .and_then(|repos| repos.parent())
+            .expect("repo must be under <storage>/repos")
+            .to_path_buf();
+        let context = crate::ProjectContext {
+            project_id,
+            project_root: crate::ProjectRoot::new(project),
+            storage_root: crate::StorageRoot::new(storage_root),
+            repo_root: repo,
+            location_status: crate::ProjectLocationStatus::Current,
+            warnings: Vec::new(),
+        };
+        let latest = crate::read_latest_snapshot_id(&context.repo_root)
+            .unwrap()
+            .expect("latest snapshot is required");
+        let baseline = crate::load_project_snapshot(&context, &latest).unwrap();
+
+        let started = Instant::now();
+        let (files, warnings, incomplete) =
+            scan_project_for_checkpoint_with_baseline(&context, Some(&baseline), None, None)
+                .unwrap();
+        let elapsed = started.elapsed();
+        assert!(!incomplete, "scan warnings: {warnings:?}");
+        let object_check_started = Instant::now();
+        let mut unique_objects = std::collections::BTreeMap::new();
+        for file in &baseline.files {
+            unique_objects.insert(file.content_hash().clone(), file.content_size_bytes());
+        }
+        let unique_objects = unique_objects.into_iter().collect::<Vec<_>>();
+        let checked_objects = unique_objects
+            .clone()
+            .into_par_iter()
+            .map(|(object_id, size_bytes)| {
+                let path = crate::object_path(&context.repo_root, &object_id);
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert!(metadata.is_file());
+                assert_eq!(metadata.len(), size_bytes);
+                object_id
+            })
+            .collect::<Vec<_>>();
+        let object_check_elapsed = object_check_started.elapsed();
+        let safe_object_check_started = Instant::now();
+        crate::ensure_regular_directory_no_follow(&context.repo_root.join("objects/loose"))
+            .unwrap();
+        let mut first_level_shards = std::collections::BTreeSet::new();
+        let mut second_level_shards = std::collections::BTreeSet::new();
+        for (object_id, _) in &unique_objects {
+            let path = crate::object_path(&context.repo_root, object_id);
+            let shard = path.parent().unwrap().to_path_buf();
+            first_level_shards.insert(shard.parent().unwrap().to_path_buf());
+            second_level_shards.insert(shard);
+        }
+        first_level_shards
+            .par_iter()
+            .for_each(|path| crate::ensure_regular_directory_no_follow(path).unwrap());
+        second_level_shards
+            .par_iter()
+            .for_each(|path| crate::ensure_regular_directory_no_follow(path).unwrap());
+        let safely_checked_objects = unique_objects
+            .into_par_iter()
+            .map(|(object_id, size_bytes)| {
+                let path = crate::object_path(&context.repo_root, &object_id);
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert!(metadata.is_file());
+                assert_eq!(metadata.len(), size_bytes);
+                object_id
+            })
+            .collect::<Vec<_>>();
+        let safe_object_check_elapsed = safe_object_check_started.elapsed();
+        println!(
+            "files={} warnings={} cached_scan_ms={:.1} unique_objects={} object_check_ms={:.1} shards={} safe_object_check_ms={:.1}",
+            files.len(),
+            warnings.len(),
+            elapsed.as_secs_f64() * 1000.0,
+            checked_objects.len(),
+            object_check_elapsed.as_secs_f64() * 1000.0,
+            second_level_shards.len(),
+            safe_object_check_elapsed.as_secs_f64() * 1000.0
+        );
+        assert_eq!(safely_checked_objects.len(), checked_objects.len());
+    }
 }

@@ -33,6 +33,10 @@
               <span data-i18n="searchCheckpoints">Search checkpoints</span>
               <input id="checkpointSearch" type="text" autocomplete="off" data-i18n-placeholder="searchCheckpointsPlaceholder" />
             </label>
+            <section class="checkpoint-index-notice" id="checkpointIndexNotice" role="region" aria-labelledby="checkpointIndexMessage" hidden>
+              <p id="checkpointIndexMessage" role="status"></p>
+              <button class="button" id="rebuildIndexButton" type="button" data-command="rebuild_index">索引を再構築</button>
+            </section>
           </section>
 
           <div class="checkpoint-list" id="checkpointList" role="listbox" tabindex="0"></div>
@@ -90,6 +94,21 @@
             <button class="button danger-secondary" id="recoverTransactionsButton" type="button" data-i18n="recoverTransactions">Recover</button>
           </section>
 
+          <section class="error-banner" id="errorBanner" role="alert" aria-live="assertive" hidden>
+            <div>
+              <strong>操作を完了できませんでした</strong>
+              <span id="errorBannerText"></span>
+            </div>
+            <button class="ghost-button" id="dismissErrorButton" type="button">閉じる</button>
+          </section>
+
+          <section class="quarantine-banner" id="unresolvedQuarantineBanner" hidden>
+            <div>
+              <strong data-i18n="unresolvedQuarantineTitle">プロジェクトの状態を確認できません</strong>
+              <span id="unresolvedQuarantineText"></span>
+            </div>
+          </section>
+
           <section class="project-warning-banner" id="projectWarningBanner" hidden>
             <div>
               <strong data-i18n="projectWarningTitle">Project path warning</strong>
@@ -109,7 +128,7 @@
           </section>
 
           <footer class="status-bar">
-            <span>📌 <strong id="checkpointCount">0</strong> CP · <strong id="storedSize">-</strong></span>
+            <span data-i18n-title="referencedStorageDescription">📌 <strong id="checkpointCount">0</strong> CP · <span data-i18n="referencedStorage">使用中の保存データ</span> <strong id="storedSize">-</strong></span>
             <span>📂 <strong id="projectStatusPath">-</strong></span>
             <span class="auto-refresh-status" id="autoRefreshStatus" hidden>
               <span class="activity-dot" aria-hidden="true"></span>
@@ -232,6 +251,15 @@
             <p id="cleanupSummary" data-i18n="cleanupEmpty">Cleanup preview has not run.</p>
             <p id="cleanupResult">-</p>
           </article>
+          <article class="storage-widget">
+            <div class="maintenance-actions">
+              <button class="button" id="previewTempCleanupButton" type="button" data-command="preview_temp_cleanup">一時ファイル確認</button>
+              <button class="button danger-secondary" id="applyTempCleanupButton" type="button" data-command="apply_temp_cleanup" data-destructive="true">一時ファイル削除</button>
+            </div>
+            <h4>一時ファイル cleanup</h4>
+            <p id="tempCleanupSummary">未確認</p>
+            <p id="tempCleanupResult">-</p>
+          </article>
         </details>
 
         <details class="inspector-section">
@@ -239,7 +267,10 @@
           <article class="log-panel">
             <div class="section-heading compact">
               <h3 data-i18n="operationLog">Operation log</h3>
-              <button class="ghost-button" id="clearLogButton" type="button" data-i18n="clear">Clear</button>
+              <span>
+                <button class="ghost-button" id="openDiagnosticLogsButton" type="button">診断ログフォルダ</button>
+                <button class="ghost-button" id="clearLogButton" type="button" data-i18n="clear">Clear</button>
+              </span>
             </div>
             <ol class="log-list" id="logList"></ol>
           </article>
@@ -340,6 +371,7 @@
           <div class="danger-band">
             <h2 data-i18n="rollbackTitle">Rollback modifies the current Unity project</h2>
             <p id="rollbackSummary" data-i18n="rollbackEmpty">Preview rollback before applying it.</p>
+            <p class="dialog-error" id="rollbackError" role="alert" hidden></p>
             <ul id="rollbackWarnings"></ul>
           </div>
           <div class="rollback-confirm">
@@ -392,6 +424,7 @@
     <script src="./config.js" defer></script>
     <script src="./utils.js" defer></script>
     <script src="./i18n.js" defer></script>
+    <script src="./frontend-state.js" defer></script>
     <script src="./app.js" defer></script>
     <script src="./theme.js" defer></script>
     <script src="./diff-tree.js" defer></script>

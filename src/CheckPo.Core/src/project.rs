@@ -2,7 +2,7 @@ use crate::{
     init_repo_layout, load_repo_config, now_utc_string, read_json, repo_root, write_json_atomic,
     CheckPoError, ProjectContext, ProjectId, ProjectLocationStatus, ProjectMarkerFile, ProjectRoot,
     ProjectView, ProjectWarning, ProjectWarningKind, RegistryFile, RegistryProjectEntry, Result,
-    StorageRoot,
+    StorageRoot, TrackedUnityFilePath,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -27,19 +27,38 @@ pub fn init_project_with_storage_root(
     )
 }
 
-pub fn start_as_separate_project(project_path: impl AsRef<Path>) -> Result<ProjectView> {
+pub fn start_as_separate_project(
+    project_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
+) -> Result<ProjectView> {
+    require_start_as_separate_confirmation(project_path.as_ref(), options)?;
     init_project_internal(project_path.as_ref(), InitMode::ForceNewProject, None)
 }
 
 pub fn start_as_separate_project_with_storage_root(
     project_path: impl AsRef<Path>,
     storage_root_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
 ) -> Result<ProjectView> {
+    require_start_as_separate_confirmation(project_path.as_ref(), options)?;
     init_project_internal(
         project_path.as_ref(),
         InitMode::ForceNewProject,
         Some(storage_root_path.as_ref()),
     )
+}
+
+fn require_start_as_separate_confirmation(
+    project_path: &Path,
+    options: crate::ApplyOptions,
+) -> Result<()> {
+    if !options.yes {
+        return Err(crate::user_error(
+            "starting as a separate project requires --yes.",
+        ));
+    }
+    normalize_existing_dir(project_path)?;
+    Ok(())
 }
 
 pub fn load_project(project_path: impl AsRef<Path>) -> Result<ProjectContext> {
@@ -108,11 +127,21 @@ fn load_project_registration(project_path: &Path) -> Result<LoadedProjectRegistr
     let project_root = normalize_existing_dir(project_path)?;
     validate_unity_project_root(&project_root)?;
     let marker_path = marker_path(&project_root);
-    if !marker_path.is_file() {
-        return Err(CheckPoError::InvalidProject(format!(
-            "CheckPo marker was not found: {}",
-            marker_path.display()
-        )));
+    match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {}
+        Ok(_) => {
+            return Err(CheckPoError::InvalidProject(format!(
+                "CheckPo marker is not a regular file: {}",
+                marker_path.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CheckPoError::InvalidProject(format!(
+                "CheckPo marker was not found: {}",
+                marker_path.display()
+            )))
+        }
+        Err(error) => return Err(crate::io_error(&marker_path, error)),
     }
     let marker = load_project_marker(&marker_path)?;
     let registry = load_registry()?;
@@ -131,6 +160,7 @@ fn load_project_registration(project_path: &Path) -> Result<LoadedProjectRegistr
     let repo_root = repo_root(&storage_root, &marker.project_id);
     ensure_repo_outside_tracked_roots(&project_root, &repo_root)?;
     load_repo_config(&repo_root, &marker.project_id)?;
+    crate::validate_repository_layout_no_follow(&repo_root)?;
     Ok(LoadedProjectRegistration {
         registry_entry_needs_project_root_refresh: registry_entry_needs_project_root_refresh(
             entry,
@@ -194,9 +224,12 @@ fn test_or_custom_data_dir() -> Option<PathBuf> {
 pub(crate) fn validate_unity_project_root(project_root: &Path) -> Result<()> {
     for required_dir in ["Assets", "ProjectSettings"] {
         let path = project_root.join(required_dir);
-        if !path.is_dir() {
+        let valid = fs::symlink_metadata(&path)
+            .map(|metadata| metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata))
+            .unwrap_or(false);
+        if !valid {
             return Err(CheckPoError::InvalidProject(format!(
-                "missing {required_dir}/"
+                "missing or unsafe {required_dir}/"
             )));
         }
     }
@@ -217,15 +250,65 @@ fn init_project_internal(
     let project_root = normalize_existing_dir(project_path)?;
     validate_unity_project_root(&project_root)?;
     let marker_path = marker_path(&project_root);
+    let existing_marker = match fs::symlink_metadata(&marker_path) {
+        Ok(metadata) if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {
+            Some(load_project_marker(&marker_path)?)
+        }
+        Ok(_) => {
+            return Err(CheckPoError::InvalidProject(format!(
+                "CheckPo marker is not a regular file: {}",
+                marker_path.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(crate::io_error(&marker_path, error)),
+    };
     let marker = if mode == InitMode::ForceNewProject {
         new_project_marker()
-    } else if marker_path.is_file() {
-        load_project_marker(&marker_path)?
+    } else if let Some(existing_marker) = existing_marker.as_ref() {
+        existing_marker.clone()
     } else {
         new_project_marker()
     };
     let registry_lock = acquire_registry_lock()?;
     let registry = load_registry()?;
+    if mode == InitMode::ForceNewProject {
+        let existing_marker = load_project_marker(&marker_path).map_err(|error| match error {
+            CheckPoError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+                crate::user_error(
+                    "starting as a separate project requires an existing CheckPo marker.",
+                )
+            }
+            error => error,
+        })?;
+        let entry = registry
+            .projects
+            .get(existing_marker.project_id.as_str())
+            .ok_or_else(|| {
+                CheckPoError::InvalidProject(
+                    "Storage registry entry was not found for this project. Run init again."
+                        .to_string(),
+                )
+            })?;
+        let (status, _) =
+            project_location_status_and_warnings(&project_root, &existing_marker.project_id, entry);
+        if status != ProjectLocationStatus::CopiedSuspected {
+            return Err(crate::user_error(
+                "starting as a separate project is only allowed for a copied project.",
+            ));
+        }
+        let old_storage_root = normalize_existing_dir_or_create_parent(&entry.storage_root_path)?;
+        let old_context = ProjectContext {
+            project_id: existing_marker.project_id.clone(),
+            project_root: ProjectRoot::new(project_root.clone()),
+            repo_root: repo_root(&old_storage_root, &existing_marker.project_id),
+            storage_root: StorageRoot::new(old_storage_root),
+            location_status: status,
+            warnings: Vec::new(),
+        };
+        crate::ensure_no_pending_transactions(&old_context)?;
+        crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
+    }
     if mode == InitMode::Normal
         && registered_project_root_conflict(
             &project_root,
@@ -244,11 +327,10 @@ fn init_project_internal(
             None => default_storage_root()?,
         },
     };
-    fs::create_dir_all(&storage_root).map_err(|error| crate::io_error(&storage_root, error))?;
+    let storage_root = crate::create_absolute_dir_all_no_follow(&storage_root)?;
     let planned_repo_root = repo_root(&storage_root, &marker.project_id);
     ensure_repo_outside_tracked_roots(&project_root, &planned_repo_root)?;
     let repo_root = init_repo_layout(&storage_root, &marker.project_id)?;
-    write_json_atomic(&marker_path, &marker)?;
     update_registry_locked(
         &registry_lock,
         registry,
@@ -256,6 +338,13 @@ fn init_project_internal(
         &project_root,
         &storage_root,
     )?;
+    let marker_directory = marker_path.parent().ok_or_else(|| {
+        CheckPoError::InvalidProject(format!("invalid marker path: {}", marker_path.display()))
+    })?;
+    crate::create_dir_all_no_follow(&project_root, marker_directory)?;
+    if mode == InitMode::ForceNewProject || existing_marker.is_none() {
+        write_json_atomic(&marker_path, &marker)?;
+    }
     let context = ProjectContext {
         project_id: marker.project_id,
         project_root: ProjectRoot::new(project_root),
@@ -264,6 +353,11 @@ fn init_project_internal(
         location_status: ProjectLocationStatus::Current,
         warnings: Vec::new(),
     };
+    if !crate::db_path(&context.repo_root).exists()
+        && crate::list_snapshot_ids(&context.repo_root)?.is_empty()
+    {
+        crate::rebuild_index_for_project_unlocked(&context, None, None)?;
+    }
     project_view(&context)
 }
 
@@ -297,6 +391,21 @@ pub(crate) fn load_registry() -> Result<RegistryFile> {
 }
 
 pub(crate) fn load_project_marker(path: &Path) -> Result<ProjectMarkerFile> {
+    let parent = path.parent().ok_or_else(|| {
+        CheckPoError::InvalidProject(format!("invalid marker path: {}", path.display()))
+    })?;
+    crate::ensure_regular_directory_no_follow(parent).map_err(|_| {
+        CheckPoError::InvalidProject(format!(
+            "CheckPo marker directory is unsafe: {}",
+            parent.display()
+        ))
+    })?;
+    crate::ensure_regular_file_no_follow(path).map_err(|_| {
+        CheckPoError::InvalidProject(format!(
+            "CheckPo marker is not a regular file: {}",
+            path.display()
+        ))
+    })?;
     let marker: ProjectMarkerFile = match read_json(path) {
         Err(CheckPoError::Json { source, .. }) if source.to_string().contains("invalid id:") => {
             return Err(CheckPoError::InvalidId(source.to_string()));
@@ -478,6 +587,31 @@ fn previous_marker_has_same_project_id(path: &Path, project_id: &ProjectId) -> b
 pub fn ensure_project_location_allows_mutation(project: &ProjectContext) -> Result<()> {
     if project.location_status == ProjectLocationStatus::CopiedSuspected {
         return Err(copied_project_error(project.project_root.as_path()));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_project_parent_is_safe(
+    project: &ProjectContext,
+    path: &TrackedUnityFilePath,
+) -> Result<()> {
+    let mut current = project.project_root.as_path().to_path_buf();
+    let segments = path.as_str().split('/').collect::<Vec<_>>();
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        current.push(segment);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(crate::io_error(&current, error)),
+        };
+        let file_type = metadata.file_type();
+        if crate::metadata_is_link_or_reparse(&metadata) || !file_type.is_dir() {
+            return Err(CheckPoError::InvalidTrackedPath(format!(
+                "{} contains unsafe parent component: {}",
+                path,
+                current.display()
+            )));
+        }
     }
     Ok(())
 }

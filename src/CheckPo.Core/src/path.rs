@@ -51,6 +51,24 @@ impl TrackedUnityFilePath {
             if *segment == "." || *segment == ".." {
                 return Err(invalid_path(input, "dot segments are not allowed"));
             }
+            if segment.ends_with(' ') || segment.ends_with('.') {
+                return Err(invalid_path(
+                    input,
+                    "segments ending with space or dot are not allowed",
+                ));
+            }
+            if segment.chars().any(is_windows_forbidden_character) {
+                return Err(invalid_path(
+                    input,
+                    "Windows-forbidden characters are not allowed",
+                ));
+            }
+            if is_windows_reserved_name(segment) {
+                return Err(invalid_path(
+                    input,
+                    "Windows reserved file names are not allowed",
+                ));
+            }
         }
         Ok(Self(value.to_string()))
     }
@@ -252,6 +270,158 @@ pub fn relative_path_from_project(project_root: &Path, full_path: &Path) -> Resu
     Ok(parts.join("/"))
 }
 
+pub(crate) fn is_checkpo_temporary_file(path: &Path) -> bool {
+    is_checkpo_owned_temporary_file(path)
+}
+
+pub(crate) fn is_checkpo_owned_temporary_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_checkpo_owned_temporary_file_name)
+}
+
+pub(crate) fn is_checkpo_atomic_materialization_temporary_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_checkpo_atomic_materialization_temporary_file_name)
+}
+
+fn is_checkpo_owned_temporary_file_name(name: &str) -> bool {
+    if !name.starts_with('.') || !name.ends_with(".tmp") {
+        return false;
+    }
+    let body = &name[1..name.len() - ".tmp".len()];
+    if let Some(body) = body.strip_prefix("checkpo-") {
+        if is_lowercase_hex_uuid(body) {
+            return true;
+        }
+        return has_generated_suffix(body, '-');
+    }
+    has_generated_suffix(body, '.')
+}
+
+fn is_checkpo_atomic_materialization_temporary_file_name(name: &str) -> bool {
+    name.strip_prefix(".checkpo-")
+        .and_then(|body| body.strip_suffix(".tmp"))
+        .is_some_and(is_lowercase_hex_uuid)
+}
+
+fn is_lowercase_hex_uuid(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn has_generated_suffix(body: &str, separator: char) -> bool {
+    let Some((prefix, suffix)) = body.rsplit_once(separator) else {
+        return false;
+    };
+    !prefix.is_empty() && is_lowercase_hex_uuid(suffix)
+}
+
 fn invalid_path(input: &str, reason: &str) -> CheckPoError {
     CheckPoError::InvalidTrackedPath(format!("{input}: {reason}"))
+}
+
+fn is_windows_reserved_name(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or(segment);
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || upper
+        .strip_prefix("COM")
+        .is_some_and(is_reserved_device_digit)
+        || upper
+            .strip_prefix("LPT")
+            .is_some_and(is_reserved_device_digit)
+}
+
+fn is_reserved_device_digit(value: &str) -> bool {
+    matches!(
+        value,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+    )
+}
+
+fn is_windows_forbidden_character(value: char) -> bool {
+    value <= '\u{1f}' || matches!(value, '<' | '>' | '"' | '|' | '?' | '*')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_checkpo_atomic_materialization_temporary_file, is_checkpo_owned_temporary_file,
+        TrackedUnityFilePath,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn atomic_materialization_temporary_file_name_is_strict() {
+        let owned = Path::new("Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp");
+        assert!(is_checkpo_atomic_materialization_temporary_file(owned));
+        assert!(is_checkpo_owned_temporary_file(owned));
+
+        for path in [
+            "Assets/.checkpo-0123456789abcdef0123456789abcde.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef0.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdeF.tmp",
+            "Assets/.checkpo-note-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/checkpo-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp.txt",
+        ] {
+            assert!(
+                !is_checkpo_atomic_materialization_temporary_file(Path::new(path)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_windows_reserved_names() {
+        for path in [
+            "Assets/CON",
+            "Assets/con.txt",
+            "Assets/Aux.asset",
+            "Assets/COM1.prefab",
+            "Assets/LPT9.meta",
+            "Assets/COM¹.prefab",
+            "Assets/com².asset",
+            "Assets/LPT³.meta",
+            "Assets/CONIN$",
+            "Assets/conout$.txt",
+            "ProjectSettings/NUL",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_windows_forbidden_characters_and_controls() {
+        for path in [
+            "Assets/Foo<Bar.prefab",
+            "Assets/Foo>Bar.prefab",
+            "Assets/Foo\"Bar.prefab",
+            "Assets/Foo|Bar.prefab",
+            "Assets/Foo?Bar.prefab",
+            "Assets/Foo*Bar.prefab",
+            "Assets/Foo\u{0}Bar.prefab",
+            "Assets/Foo\u{1f}Bar.prefab",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_segments_ending_with_dot_or_space() {
+        for path in [
+            "Assets/Foo.",
+            "Assets/Foo ",
+            "Assets/Folder./File.asset",
+            "Assets/Folder /File.asset",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
+        }
+    }
 }

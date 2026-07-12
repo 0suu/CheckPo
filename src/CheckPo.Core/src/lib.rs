@@ -1,6 +1,7 @@
 mod checkpoint;
 mod checkpoint_names;
 mod db;
+mod diagnostics;
 mod diff;
 mod discard;
 mod maintenance;
@@ -16,29 +17,40 @@ mod verify;
 
 pub use checkpoint::{
     create_checkpoint, delete_checkpoint, list_checkpoints, list_checkpoints_for_project,
-    rename_checkpoint,
+    list_checkpoints_with_warnings_for_project, rename_checkpoint,
 };
 pub use db::{
-    checkpoint_summaries_and_storage_summary_from_index, rebuild_index,
+    checkpoint_index_status, checkpoint_summaries_and_storage_summary_from_index, rebuild_index,
     rebuild_index_for_project_with_progress_and_cancellation, storage_summary_from_index,
     CachedFileFingerprint, FileFingerprintUpdate,
 };
-pub use diff::{diff_checkpoint, diff_checkpoint_metadata, diff_checkpoint_with_options};
+pub use diagnostics::{
+    diagnostic_log_directory, init_diagnostics, log_operation_error, DiagnosticsGuard,
+};
+pub use diff::{
+    diff_checkpoint, diff_checkpoint_metadata, diff_checkpoint_metadata_with_cancellation,
+    diff_checkpoint_with_options,
+};
 pub use discard::{
     apply_discard_files_plan, apply_discard_plan_with_progress_and_cancellation,
     preview_discard_files, preview_discard_with_progress_and_cancellation,
 };
-pub use maintenance::{analyze_gc, apply_gc, storage_summary};
+pub use maintenance::{
+    analyze_gc, analyze_orphan_temp_files, apply_gc, cleanup_orphan_temp_files, storage_summary,
+};
 pub use models::CancellationToken;
 pub use models::{
-    ApplyOptions, ApplyResult, CheckpointDeleteResult, CheckpointSummary, CreateCheckpointOptions,
-    DiffOptions, DiffResult, FileOperation, FileOperationType, InvalidObjectLocation,
-    MissingBlobReference, OperationPlan, OperationPlanKind, OperationProgress, PendingTransaction,
-    ProjectContext, ProjectLocationStatus, ProjectMarkerFile, ProjectView, ProjectWarning,
-    ProjectWarningKind, RebuildIndexResult, RegistryFile, RegistryProjectEntry, RepositoryConfig,
+    ApplyOptions, ApplyResult, CheckpointDeleteResult, CheckpointIndexState, CheckpointIndexStatus,
+    CheckpointListResult, CheckpointSummary, CreateCheckpointOptions, DiffOptions, DiffResult,
+    FileOperation, FileOperationType, InvalidObjectLocation, MissingBlobReference, OperationPlan,
+    OperationPlanKind, OperationProgress, OrphanTempFile, PendingTransaction, ProjectContext,
+    ProjectLocationStatus, ProjectMarkerFile, ProjectView, ProjectWarning, ProjectWarningKind,
+    RebuildIndexResult, RegistryFile, RegistryProjectEntry, RepositoryConfig, RepositoryTempFile,
     ScanWarning, ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry, SnapshotFile,
-    StorageGcPlan, StorageGcResult, StorageSummary, TransactionCleanupResult,
-    TransactionRecoveryFailure, TransactionRecoveryResult, UnreferencedBlob, VerificationResult,
+    StorageGcPlan, StorageGcResult, StorageSummary, TempFileCleanupPlan, TempFileCleanupResult,
+    TransactionCleanupResult, TransactionQuarantineResult, TransactionRecoveryFailure,
+    TransactionRecoveryResult, UnreferencedBlob, UnresolvedTransactionQuarantine,
+    VerificationResult,
 };
 pub use path::{
     hash_bytes, parse_tracked_paths, ObjectId, ProjectId, ProjectRoot, SnapshotId, StorageRoot,
@@ -54,14 +66,15 @@ pub use restore::{
     preview_restore_with_progress_and_cancellation,
 };
 pub use storage::{
-    canonical_snapshot_bytes, db_path, load_snapshot, object_path, open_db,
-    put_object_from_file_with_known_hash, read_json, read_latest_snapshot_id, save_snapshot,
-    snapshot_id_from_bytes, snapshot_path,
+    canonical_snapshot_bytes, db_path, file_fingerprint_db_path, load_snapshot, object_path,
+    open_db, put_object_from_file_with_known_hash, read_json, read_latest_snapshot_id,
+    save_snapshot, snapshot_id_from_bytes, snapshot_path,
 };
 pub use storage_root_setting::set_project_storage_root;
 pub use transaction::{
     apply_plan, cleanup_journals, pending_transactions, pending_transactions_for_project,
-    recover_transactions,
+    quarantine_transaction, recover_transactions, unresolved_transaction_quarantines,
+    unresolved_transaction_quarantines_for_project,
 };
 pub use verify::{
     verify_checkpoint, verify_checkpoint_with_progress_and_cancellation, verify_project,
@@ -75,26 +88,32 @@ pub(crate) use checkpoint_names::{
 pub(crate) use db::{
     delete_snapshot_from_index, index_snapshot_with_index_connection, invalidate_file_fingerprints,
     list_checkpoint_summaries_from_index, load_file_fingerprints, open_index_connection,
-    rebuild_index_for_project_unlocked, refresh_file_fingerprints_with_index_connection,
+    rebuild_index_for_project_unlocked, refresh_file_fingerprints,
 };
 pub(crate) use models::{ensure_not_cancelled, report_operation_progress};
-pub(crate) use path::relative_path_from_project;
+pub(crate) use path::{
+    is_checkpo_atomic_materialization_temporary_file, is_checkpo_owned_temporary_file,
+    is_checkpo_temporary_file, relative_path_from_project,
+};
 pub(crate) use project::{
     acquire_registry_lock, ensure_project_location_allows_mutation,
     ensure_repo_outside_tracked_roots, load_project_marker, load_registry, normalize_existing_dir,
     project_location_status_and_warnings, update_registry_locked, validate_unity_project_root,
 };
-pub(crate) use scanner::scan_project_for_checkpoint;
+pub(crate) use scanner::{scan_project_for_checkpoint, scan_project_for_checkpoint_with_baseline};
 pub(crate) use storage::{
     acquire_repository_lock, available_space_bytes, canonical_utc, checkpoint_names_path,
-    copy_file_no_replace, hash_file, init_repo_layout, list_snapshot_ids, load_project_snapshot,
-    load_repo_config, move_file_no_replace, now_utc_string, object_id_from_loose_relative_path,
-    refs_latest_path, repo_root, snapshots_dir, sync_parent_dir, validate_repository_config,
-    verify_file_hash_and_size, write_json_atomic, write_latest_snapshot_id, CopySourceDisposition,
+    create_absolute_dir_all_no_follow, create_dir_all_no_follow,
+    ensure_regular_directory_no_follow, ensure_regular_file_no_follow, hash_file, init_repo_layout,
+    list_snapshot_ids, load_project_snapshot, load_repo_config, metadata_is_link_or_reparse,
+    move_file_no_replace, now_utc_string, object_id_from_loose_relative_path, refs_latest_path,
+    repo_root, snapshots_dir, sync_parent_dir, validate_repository_config,
+    validate_repository_layout_no_follow, write_json_atomic, write_latest_snapshot_id,
     RepositoryLock,
 };
 pub(crate) use transaction::{
     build_plan_with_progress_and_cancellation, ensure_no_pending_transactions,
+    ensure_no_unresolved_transaction_quarantines,
 };
 
 use std::path::PathBuf;
@@ -123,8 +142,16 @@ pub enum CheckPoError {
     RepositoryLocked(String),
     #[error("pending transaction: {0}")]
     PendingTransaction(String),
+    #[error("unresolved transaction quarantine: {0}")]
+    UnresolvedTransactionQuarantine(String),
     #[error("index unavailable: {0}")]
     IndexUnavailable(String),
+    #[error("unsupported {artifact} version {found}; this CheckPo supports version {supported}")]
+    UnsupportedFormat {
+        artifact: String,
+        found: u32,
+        supported: u32,
+    },
     #[error("{0}")]
     CopiedProjectSuspected(String),
     #[error("operation cancelled")]

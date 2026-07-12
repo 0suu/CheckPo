@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          cache-on-failure: true
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install Node.js
+        if: runner.os == 'Linux'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check frontend JavaScript
+        if: runner.os == 'Linux'
+        run: |
+          node --check src/CheckPo.Tauri/frontend/app.js
+          node --check src/CheckPo.Tauri/frontend/config.js
+          node --check src/CheckPo.Tauri/frontend/dialogs.js
+          node --check src/CheckPo.Tauri/frontend/diff-tree.js
+          node --check src/CheckPo.Tauri/frontend/frontend-state.js
+          node --check src/CheckPo.Tauri/frontend/frontend-state.test.js
+          node --check src/CheckPo.Tauri/frontend/i18n.js
+          node --check src/CheckPo.Tauri/frontend/theme.js
+          node --check src/CheckPo.Tauri/frontend/utils.js
+          node --test src/CheckPo.Tauri/frontend/frontend-state.test.js

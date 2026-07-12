@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 pub(crate) fn apply_checkpoint_name_overrides(
     project: &ProjectContext,
     checkpoints: &mut [CheckpointSummary],
-) {
+) -> Vec<String> {
     let (names, warnings) = read_checkpoint_name_overrides(project);
     if !names.is_empty() {
         for checkpoint in checkpoints.iter_mut() {
@@ -14,7 +14,8 @@ pub(crate) fn apply_checkpoint_name_overrides(
             }
         }
     }
-    attach_warnings(checkpoints, warnings);
+    attach_warnings(checkpoints, warnings.clone());
+    warnings
 }
 
 pub(crate) fn read_checkpoint_name_overrides(
@@ -75,15 +76,28 @@ pub(crate) fn write_checkpoint_name_overrides(
     crate::write_json_atomic(&crate::checkpoint_names_path(&project.repo_root), names)
 }
 
+fn read_checkpoint_name_overrides_for_mutation(
+    project: &ProjectContext,
+) -> Result<BTreeMap<String, String>> {
+    let (names, warnings) = read_checkpoint_name_overrides(project);
+    if warnings.is_empty() {
+        return Ok(names);
+    }
+    Err(crate::CheckPoError::Corruption(format!(
+        "checkpoint display names cannot be modified until their metadata is repaired: {}",
+        warnings.join("; ")
+    )))
+}
+
 pub(crate) fn remove_checkpoint_name_override(
     project: &ProjectContext,
     checkpoint_id: &SnapshotId,
 ) -> Result<Vec<String>> {
-    let (mut names, warnings) = read_checkpoint_name_overrides(project);
+    let mut names = read_checkpoint_name_overrides_for_mutation(project)?;
     if names.remove(checkpoint_id.as_str()).is_some() {
         write_checkpoint_name_overrides(project, &names)?;
     }
-    Ok(warnings)
+    Ok(Vec::new())
 }
 
 fn attach_warnings(checkpoints: &mut [CheckpointSummary], warnings: Vec<String>) {

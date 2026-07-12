@@ -1,8 +1,10 @@
+use crate::models::RepositoryTempFile;
 use crate::{
     acquire_repository_lock, ensure_no_pending_transactions, io_error, list_snapshot_ids,
-    load_project, load_snapshot, object_path, sync_parent_dir, CheckPoError, InvalidObjectLocation,
-    MissingBlobReference, ObjectId, Result, SkippedSnapshot, StorageGcPlan, StorageGcResult,
-    StorageSummary, UnreferencedBlob,
+    load_project, load_snapshot, object_path, relative_path_from_project, sync_parent_dir,
+    CheckPoError, InvalidObjectLocation, MissingBlobReference, ObjectId, OrphanTempFile, Result,
+    SkippedSnapshot, StorageGcPlan, StorageGcResult, StorageSummary, TempFileCleanupPlan,
+    TempFileCleanupResult, TrackedUnityFilePath, UnreferencedBlob,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -24,6 +26,7 @@ pub fn apply_gc(project_path: impl AsRef<Path>) -> Result<StorageGcResult> {
     crate::ensure_project_location_allows_mutation(&project)?;
     let _lock = acquire_repository_lock(&project.repo_root, "storage-gc")?;
     ensure_no_pending_transactions(&project)?;
+    crate::ensure_no_unresolved_transaction_quarantines(&project)?;
     let plan = analyze_gc_for_project(&project)?;
     if plan.has_integrity_problems {
         return Err(crate::user_error(
@@ -54,6 +57,270 @@ pub fn apply_gc(project_path: impl AsRef<Path>) -> Result<StorageGcResult> {
         deleted_blob_count,
         deleted_bytes,
     })
+}
+
+pub fn analyze_orphan_temp_files(project_path: impl AsRef<Path>) -> Result<TempFileCleanupPlan> {
+    let project = load_project(project_path)?;
+    analyze_orphan_temp_files_for_project(&project)
+}
+
+pub fn cleanup_orphan_temp_files(
+    project_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
+) -> Result<TempFileCleanupResult> {
+    if !options.yes {
+        return Err(crate::user_error("temporary file cleanup requires --yes."));
+    }
+    let project = load_project(project_path)?;
+    crate::ensure_project_location_allows_mutation(&project)?;
+    let _lock = acquire_repository_lock(&project.repo_root, "temporary-file-cleanup")?;
+    ensure_no_pending_transactions(&project)?;
+    crate::ensure_no_unresolved_transaction_quarantines(&project)?;
+    let plan = analyze_orphan_temp_files_for_project(&project)?;
+    let mut deleted_file_count = 0_usize;
+    let mut deleted_bytes = 0_u64;
+    let mut warnings = Vec::new();
+    for file in &plan.files {
+        crate::project::ensure_project_parent_is_safe(&project, &file.path)?;
+        let path = file.path.to_project_path(project.project_root.as_path());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && crate::is_checkpo_owned_temporary_file(&path) =>
+            {
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        sync_parent_dir(&path)?;
+                        deleted_file_count += 1;
+                        deleted_bytes += metadata.len();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io_error(&path, error)),
+                }
+            }
+            Ok(_) => warnings.push(format!(
+                "{} was not deleted because it is no longer a CheckPo temporary file",
+                file.path
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&path, error)),
+        }
+    }
+    let repository_tmp_dir = if plan.repository_files.is_empty() {
+        None
+    } else {
+        Some(ensure_regular_repository_tmp_dir(&project.repo_root)?)
+    };
+    for file in &plan.repository_files {
+        if !is_repository_object_temp_file_name(&file.file_name) {
+            warnings.push(format!(
+                "{} was not deleted because it is not a CheckPo repository temporary file",
+                file.file_name
+            ));
+            continue;
+        }
+        let relative = Path::new("tmp").join(&file.file_name);
+        let tmp_dir = repository_tmp_dir.as_ref().ok_or_else(|| {
+            CheckPoError::Corruption("repository temporary directory is unavailable".to_string())
+        })?;
+        let path = tmp_dir.join(&file.file_name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => {
+                warnings.push(format!(
+                    "{} was not deleted because it is no longer a regular repository temporary file",
+                    file.file_name
+                ));
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(&path, error)),
+        };
+        let path = match safe_repo_relative_file(&project.repo_root, &relative) {
+            Ok(path) => path,
+            Err(error) => {
+                warnings.push(format!(
+                    "{} was not deleted because its repository location is unsafe: {error}",
+                    file.file_name
+                ));
+                continue;
+            }
+        };
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_parent_dir(&path)?;
+                deleted_file_count += 1;
+                deleted_bytes += metadata.len();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&path, error)),
+        }
+    }
+    Ok(TempFileCleanupResult {
+        plan,
+        deleted_file_count,
+        deleted_bytes,
+        warnings,
+    })
+}
+
+fn analyze_orphan_temp_files_for_project(
+    project: &crate::ProjectContext,
+) -> Result<TempFileCleanupPlan> {
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    for root in ["Assets", "Packages", "ProjectSettings"] {
+        let root_path = project.project_root.as_path().join(root);
+        if !root_path.exists() {
+            continue;
+        }
+        if !root_path.is_dir() {
+            warnings.push(format!("{root}: tracked root is not a directory"));
+            continue;
+        }
+        for entry in WalkDir::new(&root_path).follow_links(false) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    let path = error
+                        .path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| root.to_string());
+                    warnings.push(format!("{path}: {error}"));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() || !crate::is_checkpo_owned_temporary_file(entry.path())
+            {
+                continue;
+            }
+            let relative =
+                match relative_path_from_project(project.project_root.as_path(), entry.path()) {
+                    Ok(relative) => relative,
+                    Err(error) => {
+                        warnings.push(format!("{}: {error}", entry.path().display()));
+                        continue;
+                    }
+                };
+            let path = match TrackedUnityFilePath::parse(&relative) {
+                Ok(path) => path,
+                Err(error) => {
+                    warnings.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+            let metadata = match fs::metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warnings.push(format!("{relative}: {error}"));
+                    continue;
+                }
+            };
+            files.push(OrphanTempFile {
+                path,
+                size_bytes: metadata.len(),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut repository_files = analyze_repository_temp_files(&project.repo_root, &mut warnings);
+    repository_files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    let total_bytes = files
+        .iter()
+        .map(|file| file.size_bytes)
+        .chain(repository_files.iter().map(|file| file.size_bytes))
+        .sum();
+    Ok(TempFileCleanupPlan {
+        file_count: files.len() + repository_files.len(),
+        total_bytes,
+        files,
+        repository_files,
+        warnings,
+    })
+}
+
+fn analyze_repository_temp_files(
+    repo_root: &Path,
+    warnings: &mut Vec<String>,
+) -> Vec<RepositoryTempFile> {
+    let tmp_dir = repo_root.join("tmp");
+    match fs::symlink_metadata(&tmp_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            warnings.push(format!("{}: {error}", tmp_dir.display()));
+            return Vec::new();
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            warnings.push(format!(
+                "{}: repository temporary path is not a directory",
+                tmp_dir.display()
+            ));
+            return Vec::new();
+        }
+    }
+
+    let entries = match fs::read_dir(&tmp_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warnings.push(format!("{}: {error}", tmp_dir.display()));
+            return Vec::new();
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warnings.push(format!("{}: {error}", tmp_dir.display()));
+                continue;
+            }
+        };
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_repository_object_temp_file_name(&file_name) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) => {
+                warnings.push(format!("{}: {error}", entry.path().display()));
+                continue;
+            }
+        };
+        files.push(RepositoryTempFile {
+            file_name,
+            size_bytes: metadata.len(),
+        });
+    }
+    files
+}
+
+fn ensure_regular_repository_tmp_dir(repo_root: &Path) -> Result<PathBuf> {
+    let tmp_dir = repo_root.join("tmp");
+    let metadata = fs::symlink_metadata(&tmp_dir).map_err(|error| io_error(&tmp_dir, error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CheckPoError::Corruption(format!(
+            "repository temporary path is not a regular directory: {}",
+            tmp_dir.display()
+        )));
+    }
+    Ok(tmp_dir)
+}
+
+fn is_repository_object_temp_file_name(file_name: &str) -> bool {
+    let Some(id) = file_name
+        .strip_prefix("object-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn analyze_gc_for_project(project: &crate::ProjectContext) -> Result<StorageGcPlan> {
@@ -142,7 +409,8 @@ fn enumerate_loose_objects(repo_root: &Path) -> Result<ObjectInventory> {
             invalid_locations,
         });
     }
-    for entry in WalkDir::new(&loose_root).follow_links(false) {
+    let mut entries = WalkDir::new(&loose_root).follow_links(false).into_iter();
+    while let Some(entry) = entries.next() {
         let entry = entry.map_err(|error| {
             let path = error
                 .path()
@@ -152,10 +420,13 @@ fn enumerate_loose_objects(repo_root: &Path) -> Result<ObjectInventory> {
         })?;
         let metadata =
             fs::symlink_metadata(entry.path()).map_err(|error| io_error(entry.path(), error))?;
-        if metadata.file_type().is_symlink() {
+        if crate::metadata_is_link_or_reparse(&metadata) {
+            if metadata.is_dir() {
+                entries.skip_current_dir();
+            }
             invalid_locations.push(InvalidObjectLocation {
                 object_path: repo_relative_path(repo_root, entry.path())?,
-                reason: "object storage symlinks are not supported.".to_string(),
+                reason: "object storage symlinks and reparse points are not supported.".to_string(),
             });
             continue;
         }
@@ -198,7 +469,7 @@ fn safe_repo_relative_file(repo_root: &Path, relative: &Path) -> Result<PathBuf>
     }
     let path = repo_root.join(relative);
     let metadata = fs::symlink_metadata(&path).map_err(|error| io_error(&path, error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
         return Err(crate::user_error(format!(
             "repository path is not a regular file: {}",
             path.display()
