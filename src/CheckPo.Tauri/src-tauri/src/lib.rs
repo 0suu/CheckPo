@@ -1079,6 +1079,10 @@ mod tests {
         assert!(app_js.contains(r#"cancel: () => tauriInvoke("cancel_current_operation")"#));
         assert!(app_js.contains("AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS"));
         assert!(!app_js.contains("while (state.autoRefreshInFlight)"));
+        assert!(
+            !app_js.contains("state.autoRefreshGeneration += 1;\n  state.diffRequestSerial += 1;")
+        );
+        assert!(app_js.contains("resetProjectScopedSettingsResults();"));
     }
 }
 

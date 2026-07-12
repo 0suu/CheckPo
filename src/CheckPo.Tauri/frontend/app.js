@@ -198,7 +198,6 @@ function sleep(ms) {
 
 async function preemptAutoRefreshForForeground() {
   state.autoRefreshGeneration += 1;
-  state.diffRequestSerial += 1;
   state.queuedDiffRefreshOptions = null;
   if (!state.autoRefreshInFlight) return;
   await CheckPoFrontendState.cancelAndWaitForIdle({
@@ -555,7 +554,7 @@ function clearCurrentDiff() {
 }
 
 function scheduleFocusRefresh() {
-  if (document.hidden || !state.projectPath || state.busy) return;
+  if (document.hidden || !state.projectPath || state.busy || state.confirming) return;
   const now = Date.now();
   if (now - state.lastAutoRefreshAt < 750) return;
   state.lastAutoRefreshAt = now;
@@ -578,6 +577,7 @@ function renderSnapshot(snapshot) {
   )) {
     Object.assign(state, CheckPoFrontendState.projectScopedStateReset());
     clearCurrentDiff();
+    resetProjectScopedSettingsResults();
   }
   state.projectPath = nextProjectPath;
   state.project = nextProject;
@@ -682,6 +682,15 @@ function renderPending(items) {
     });
   renderTransactionQuarantineAction();
   updateControls();
+}
+
+function resetProjectScopedSettingsResults() {
+  $("gcSummary").textContent = t("gcEmpty");
+  $("gcResult").textContent = "-";
+  $("cleanupSummary").textContent = t("cleanupEmpty");
+  $("tempCleanupSummary").textContent = "未確認";
+  $("tempCleanupResult").textContent = "-";
+  $("rollbackOverlay").hidden = true;
 }
 
 function renderTransactionQuarantineAction() {

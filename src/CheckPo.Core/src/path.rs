@@ -280,26 +280,44 @@ pub(crate) fn is_checkpo_owned_temporary_file(path: &Path) -> bool {
         .is_some_and(is_checkpo_owned_temporary_file_name)
 }
 
+pub(crate) fn is_checkpo_atomic_materialization_temporary_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_checkpo_atomic_materialization_temporary_file_name)
+}
+
 fn is_checkpo_owned_temporary_file_name(name: &str) -> bool {
     if !name.starts_with('.') || !name.ends_with(".tmp") {
         return false;
     }
     let body = &name[1..name.len() - ".tmp".len()];
     if let Some(body) = body.strip_prefix("checkpo-") {
+        if is_lowercase_hex_uuid(body) {
+            return true;
+        }
         return has_generated_suffix(body, '-');
     }
     has_generated_suffix(body, '.')
+}
+
+fn is_checkpo_atomic_materialization_temporary_file_name(name: &str) -> bool {
+    name.strip_prefix(".checkpo-")
+        .and_then(|body| body.strip_suffix(".tmp"))
+        .is_some_and(is_lowercase_hex_uuid)
+}
+
+fn is_lowercase_hex_uuid(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn has_generated_suffix(body: &str, separator: char) -> bool {
     let Some((prefix, suffix)) = body.rsplit_once(separator) else {
         return false;
     };
-    !prefix.is_empty()
-        && suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    !prefix.is_empty() && is_lowercase_hex_uuid(suffix)
 }
 
 fn invalid_path(input: &str, reason: &str) -> CheckPoError {
@@ -333,7 +351,32 @@ fn is_windows_forbidden_character(value: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::TrackedUnityFilePath;
+    use super::{
+        is_checkpo_atomic_materialization_temporary_file, is_checkpo_owned_temporary_file,
+        TrackedUnityFilePath,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn atomic_materialization_temporary_file_name_is_strict() {
+        let owned = Path::new("Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp");
+        assert!(is_checkpo_atomic_materialization_temporary_file(owned));
+        assert!(is_checkpo_owned_temporary_file(owned));
+
+        for path in [
+            "Assets/.checkpo-0123456789abcdef0123456789abcde.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef0.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdeF.tmp",
+            "Assets/.checkpo-note-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/checkpo-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp.txt",
+        ] {
+            assert!(
+                !is_checkpo_atomic_materialization_temporary_file(Path::new(path)),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn tracked_path_rejects_windows_reserved_names() {

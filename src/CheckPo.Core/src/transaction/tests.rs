@@ -70,10 +70,100 @@ fn recovery_after_fault_immediately_after_applying_journal_keeps_original_file()
 
     assert!(matches!(error, CheckPoError::Unexpected(_)));
     assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+    let transaction_root = crate::pending_transactions(&project).unwrap()[0]
+        .journal_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let interrupted_copy =
+        transaction_root.join("backup/Assets/Avatar/.checkpo-0123456789abcdef0123456789abcdef.tmp");
+    fs::create_dir_all(interrupted_copy.parent().unwrap()).unwrap();
+    fs::write(&interrupted_copy, "partial backup").unwrap();
     let recovered = crate::recover_transactions(&project).unwrap();
     assert_eq!(recovered.recovered_transaction_count, 1);
     assert_eq!(recovered.failed_transaction_count, 0);
     assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+}
+
+#[test]
+fn recovery_rejects_near_match_atomic_copy_temporary_file() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+
+    let transaction_root = crate::pending_transactions(&project).unwrap()[0]
+        .journal_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let near_match =
+        transaction_root.join("backup/Assets/Avatar/.checkpo-0123456789abcdef0123456789abcdeF.tmp");
+    fs::create_dir_all(near_match.parent().unwrap()).unwrap();
+    fs::write(&near_match, "not owned").unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 0);
+    assert_eq!(recovered.failed_transaction_count, 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_rejects_atomic_copy_temporary_symlink() {
+    let (_guard, temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+
+    let transaction_root = crate::pending_transactions(&project).unwrap()[0]
+        .journal_path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let outside = temp.path().join("outside");
+    fs::write(&outside, "do not touch").unwrap();
+    let temporary =
+        transaction_root.join("backup/Assets/Avatar/.checkpo-0123456789abcdef0123456789abcdef.tmp");
+    fs::create_dir_all(temporary.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &temporary).unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 0);
+    assert_eq!(recovered.failed_transaction_count, 1);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "do not touch");
 }
 
 #[test]
@@ -278,6 +368,9 @@ fn recovery_after_fault_after_backup_move_restores_missing_project_file() {
         .parent()
         .unwrap()
         .to_path_buf();
+    let interrupted_copy =
+        transaction_root.join("backup/Assets/Avatar/.checkpo-0123456789abcdef0123456789abcdef.tmp");
+    fs::write(&interrupted_copy, "partial backup").unwrap();
     let recovered = crate::recover_transactions(&project).unwrap();
     assert_eq!(recovered.recovered_transaction_count, 1);
     assert_eq!(recovered.failed_transaction_count, 0);

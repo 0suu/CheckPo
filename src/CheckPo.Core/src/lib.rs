@@ -92,7 +92,8 @@ pub(crate) use db::{
 };
 pub(crate) use models::{ensure_not_cancelled, report_operation_progress};
 pub(crate) use path::{
-    is_checkpo_owned_temporary_file, is_checkpo_temporary_file, relative_path_from_project,
+    is_checkpo_atomic_materialization_temporary_file, is_checkpo_owned_temporary_file,
+    is_checkpo_temporary_file, relative_path_from_project,
 };
 pub(crate) use project::{
     acquire_registry_lock, ensure_project_location_allows_mutation,

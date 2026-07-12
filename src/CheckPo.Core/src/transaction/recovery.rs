@@ -607,12 +607,16 @@ fn validate_transaction_payload(
             ))
         })?;
         let path = TrackedUnityFilePath::parse(&relative.replace('\\', "/"))?;
-        if !allowed_paths.contains(&path) {
-            return Err(CheckPoError::Corruption(format!(
-                "transaction payload contains an unexpected path: {path}"
-            )));
+        if allowed_paths.contains(&path) {
+            present.insert(path);
+            continue;
         }
-        present.insert(path);
+        if crate::is_checkpo_atomic_materialization_temporary_file(entry.path()) {
+            continue;
+        }
+        return Err(CheckPoError::Corruption(format!(
+            "transaction payload contains an unexpected path: {path}"
+        )));
     }
     Ok(present)
 }

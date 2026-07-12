@@ -32,6 +32,8 @@ test("project-scoped reset does not share mutable selection state", () => {
   assert.deepEqual([...second.diffTreeOpenPaths], []);
   assert.equal(first.currentDiff, null);
   assert.equal(first.rollbackPlan, null);
+  assert.equal(first.gcPlan, null);
+  assert.equal(first.tempCleanupPlan, null);
   assert.deepEqual(first.pendingTransactions, []);
   assert.deepEqual(first.unresolvedQuarantines, []);
   assert.deepEqual(first.failedTransactions, []);
