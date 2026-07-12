@@ -10,6 +10,7 @@ const {
   projectChanged,
   projectScopedStateReset,
   removeProjectFromHistory,
+  restorableLastProjectPath,
   retainPendingTransactionFailures,
   retainVisibleChangeSelection,
   selectChangePaths,
@@ -155,6 +156,14 @@ test("removing a project from history does not alter the other entries", () => {
 
   assert.deepEqual(removeProjectFromHistory(history, "C:/AvatarA"), [history[1]]);
   assert.equal(history.length, 2);
+});
+
+test("last project is restored only while it remains registered", () => {
+  const history = [{ path: "C:/AvatarA" }, { path: "D:/AvatarB" }];
+
+  assert.equal(restorableLastProjectPath(history, "D:/AvatarB"), "D:/AvatarB");
+  assert.equal(restorableLastProjectPath(history, "E:/Removed"), null);
+  assert.equal(restorableLastProjectPath(history, ""), null);
 });
 
 test("queued diff refresh never weakens an exact request to metadata-only", () => {

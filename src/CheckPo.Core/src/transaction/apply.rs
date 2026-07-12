@@ -123,6 +123,17 @@ pub(super) fn apply_plan_inner(
     journal.updated_at_utc = crate::now_utc_string();
     write_journal(&journal_path, &journal)?;
     inject_transaction_fault(fault_hook, TransactionFaultPoint::ApplyingJournalWritten)?;
+    let backup_total = plan
+        .operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation.operation_type,
+                FileOperationType::Delete | FileOperationType::Replace
+            )
+        })
+        .count();
+    let mut backup_completed = 0_usize;
     for operation in &plan.operations {
         let destination = operation
             .path
@@ -132,6 +143,13 @@ pub(super) fn apply_plan_inner(
             operation.operation_type,
             FileOperationType::Delete | FileOperationType::Replace
         ) {
+            report_operation_progress(
+                progress,
+                "backingUp",
+                backup_completed,
+                backup_total,
+                Some(operation.path.to_string()),
+            );
             ensure_project_parent_is_safe(project, &operation.path)?;
             backup_project_file(
                 project,
@@ -140,15 +158,51 @@ pub(super) fn apply_plan_inner(
                 &backup_path,
                 backup_copy_mode,
             )?;
+            backup_completed += 1;
+            report_operation_progress(
+                progress,
+                "backingUp",
+                backup_completed,
+                backup_total,
+                Some(operation.path.to_string()),
+            );
             inject_transaction_fault(fault_hook, TransactionFaultPoint::ProjectFileBackedUp)?;
         }
     }
-    for directory in &plan.directories_to_remove {
+    for (index, directory) in plan.directories_to_remove.iter().enumerate() {
+        report_operation_progress(
+            progress,
+            "removingDirectories",
+            index,
+            plan.directories_to_remove.len(),
+            Some(directory.to_string()),
+        );
         remove_project_directory(project, directory)?;
+        report_operation_progress(
+            progress,
+            "removingDirectories",
+            index + 1,
+            plan.directories_to_remove.len(),
+            Some(directory.to_string()),
+        );
     }
     inject_transaction_fault(fault_hook, TransactionFaultPoint::ProjectDirectoriesRemoved)?;
-    for directory in &plan.directories_to_create {
+    for (index, directory) in plan.directories_to_create.iter().enumerate() {
+        report_operation_progress(
+            progress,
+            "creatingDirectories",
+            index,
+            plan.directories_to_create.len(),
+            Some(directory.to_string()),
+        );
         create_project_directory(project, directory)?;
+        report_operation_progress(
+            progress,
+            "creatingDirectories",
+            index + 1,
+            plan.directories_to_create.len(),
+            Some(directory.to_string()),
+        );
     }
     inject_transaction_fault(fault_hook, TransactionFaultPoint::ProjectDirectoriesCreated)?;
 
@@ -178,6 +232,7 @@ pub(super) fn apply_plan_inner(
             Some(operation.path.to_string()),
         );
     }
+    report_operation_progress(progress, "finalizing", 0, 0, None);
     sync_directories(&restored_directories)?;
     inject_transaction_fault(
         fault_hook,

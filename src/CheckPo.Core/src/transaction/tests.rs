@@ -847,6 +847,54 @@ fn backup_is_an_independent_copy_of_the_project_file() {
 }
 
 #[test]
+fn apply_progress_moves_past_staging_during_destructive_work() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+    let events = Mutex::new(Vec::new());
+    let cancellation = CancellationToken::new();
+    let progress = |event: OperationProgress| {
+        if event.phase == "backingUp" && event.completed == 0 {
+            cancellation.cancel();
+        }
+        events.lock().unwrap().push(event);
+    };
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        Some(&progress),
+        Some(&cancellation),
+        None,
+    )
+    .unwrap();
+
+    let events = events.into_inner().unwrap();
+    assert!(events
+        .iter()
+        .any(|event| { event.phase == "backingUp" && event.completed == 0 && event.total == 1 }));
+    assert!(events
+        .iter()
+        .any(|event| { event.phase == "backingUp" && event.completed == 1 && event.total == 1 }));
+    let phases =
+        events
+            .into_iter()
+            .map(|event| event.phase)
+            .fold(Vec::new(), |mut phases, phase| {
+                if phases.last() != Some(&phase) {
+                    phases.push(phase);
+                }
+                phases
+            });
+    assert_eq!(
+        phases,
+        ["staging", "backingUp", "applying", "finalizing", "complete"]
+    );
+}
+
+#[test]
 fn recovery_after_fault_after_restore_file_rolls_replace_back_to_before_hash() {
     let (_guard, _temp, project, _view) = setup_project();
     let file = project.join("Assets/Avatar/Foo.prefab");

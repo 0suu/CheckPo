@@ -91,6 +91,9 @@ function forgetProjectFromHistory(projectPath) {
     projectPath,
   );
   state.hiddenProjectPaths.add(projectPath);
+  if (readLocalSetting("lastProjectPath") === projectPath) {
+    removeLocalSetting("lastProjectPath");
+  }
   writeProjectHistory();
   renderProjectHistory();
   setStatus("プロジェクトを一覧から消しました。チェックポイントやプロジェクトのファイルは削除していません。");
@@ -622,6 +625,24 @@ function rememberProject(snapshot) {
   };
   state.projectHistory = [entry, ...state.projectHistory.filter((item) => item.path !== entry.path)].slice(0, 12);
   writeProjectHistory();
+  writeLocalSetting("lastProjectPath", state.projectPath);
+}
+
+async function restoreLastProject() {
+  const projectPath = CheckPoFrontendState.restorableLastProjectPath(
+    state.projectHistory,
+    readLocalSetting("lastProjectPath"),
+  );
+  if (!tauriInvoke || !projectPath) return;
+  const restored = await run("前回のプロジェクトを読み込み中", async () => {
+    const snapshot = await invokeCommand("load_project", { projectPath });
+    renderSnapshot(snapshot);
+    if (!(snapshot.pendingTransactions?.length || snapshot.unresolvedQuarantines?.length)) {
+      await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
+    }
+    return snapshot;
+  });
+  if (!restored) removeLocalSetting("lastProjectPath");
 }
 
 function renderProjectLabels() {
@@ -2060,7 +2081,14 @@ function renderProgressImmediately(progress) {
 
 function operationCanCancelAtProgress(progress) {
   if (state.cancelRequested) return false;
-  if (["applying", "finalizing", "complete"].includes(progress?.phase)) return false;
+  if ([
+    "backingUp",
+    "removingDirectories",
+    "creatingDirectories",
+    "applying",
+    "finalizing",
+    "complete",
+  ].includes(progress?.phase)) return false;
   if (progressCancellableStartCommands.has(state.activeCommand)) {
     return progress?.phase === "scan" || progress?.phase === "storeCheckpoint";
   }
@@ -2073,6 +2101,9 @@ function progressPhaseLabel(phase) {
     storeCheckpoint: "保存中",
     planning: "戻す内容を確認中",
     staging: "復元準備中",
+    backingUp: "変更を適用中",
+    removingDirectories: "ディレクトリ削除中",
+    creatingDirectories: "ディレクトリ作成中",
     applying: "書き戻し中",
     finalizing: "完了処理中",
     verifySnapshots: "チェックポイント確認中",
@@ -2093,7 +2124,7 @@ function compactProgressItem(item) {
   return `${text.slice(0, 34)}...${text.slice(-35)}`;
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   applyTheme();
   applyI18n();
   renderUpdateBanner();
@@ -2107,5 +2138,6 @@ window.addEventListener("DOMContentLoaded", () => {
   if (tauriListen) {
     tauriListen("operation-progress", (event) => renderProgress(event.payload));
   }
+  await restoreLastProject();
   checkForUpdate({ silent: true });
 });

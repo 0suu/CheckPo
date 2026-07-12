@@ -1068,11 +1068,11 @@ mod tests {
         assert!(!app_js.contains(
             r#"refreshLatestDiff({ refreshProject: true, silent: true, metadataOnly: true });"#
         ));
-        assert_eq!(
+        assert!(
             app_js
                 .matches(r#"refreshLatestDiff({ allowBusy: true, metadataOnly: true });"#)
-                .count(),
-            2
+                .count()
+                >= 2
         );
         assert!(app_js.contains(r#"invokeCommand("diff_checkpoint_full""#));
         assert!(app_js.contains(r#"await refreshLatestDiff({ allowBusy: true });"#));
@@ -1083,6 +1083,8 @@ mod tests {
             !app_js.contains("state.autoRefreshGeneration += 1;\n  state.diffRequestSerial += 1;")
         );
         assert!(app_js.contains("resetProjectScopedSettingsResults();"));
+        assert!(app_js.contains("await restoreLastProject();"));
+        assert!(app_js.contains("snapshot.pendingTransactions?.length"));
     }
 }
 

@@ -131,6 +131,14 @@
       .filter((item) => item?.path !== projectPath);
   }
 
+  function restorableLastProjectPath(projectHistory, lastProjectPath) {
+    const path = String(lastProjectPath || "");
+    return (Array.isArray(projectHistory) ? projectHistory : [])
+      .some((item) => item?.path === path)
+      ? path
+      : null;
+  }
+
   function mergeDiffRefreshOptions(previous, next) {
     if (!previous) return { ...next };
     return {
@@ -302,6 +310,7 @@
     projectScopedStateReset,
     mergeDiffRefreshOptions,
     removeProjectFromHistory,
+    restorableLastProjectPath,
     localizedErrorDisplay,
     retainPendingTransactionFailures,
     retainVisibleChangeSelection,
