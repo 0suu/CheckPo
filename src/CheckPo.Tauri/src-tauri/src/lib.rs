@@ -778,43 +778,46 @@ fn project_snapshot(project_path: String) -> AppResult {
     let unresolved_quarantines =
         core::unresolved_transaction_quarantines_for_project(&context).map_err(to_app_error)?;
     let mut warnings = Vec::new();
-    let checkpoints = match core::list_checkpoints_with_warnings_for_project(&context) {
-        Ok(result) => {
-            warnings.extend(result.warnings);
-            result.checkpoints
+    let mut checkpoint_index = core::checkpoint_index_status(&context).map_err(to_app_error)?;
+    let checkpoints = if checkpoint_index.state == core::CheckpointIndexState::Current {
+        match core::list_checkpoints_with_warnings_for_project(&context) {
+            Ok(result) => {
+                warnings.extend(result.warnings);
+                result.checkpoints
+            }
+            Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                checkpoint_index = core::CheckpointIndexStatus {
+                    state: core::CheckpointIndexState::Corrupt,
+                    rebuildable: true,
+                    detail: Some(detail),
+                };
+                Vec::new()
+            }
+            Err(error) => return Err(to_app_error(error)),
         }
-        Err(error)
-            if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                || !pending_transactions.is_empty()
-                || !unresolved_quarantines.is_empty()
-                || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
-        {
-            warnings.push(format!("チェックポイント一覧を読み込めません: {error}"));
-            Vec::new()
-        }
-        Err(error) => return Err(to_app_error(error)),
+    } else {
+        Vec::new()
     };
-    let storage = match core::storage_summary_from_index(&context) {
-        Ok(storage) => Some(storage),
-        Err(error)
-            if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                || !pending_transactions.is_empty()
-                || !unresolved_quarantines.is_empty()
-                || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
-        {
-            let prefix = if pending_transactions.is_empty() {
-                "保存容量の集計を読み込めません"
-            } else {
-                "復旧が完了するまで保存容量の集計を読み込めません"
-            };
-            warnings.push(format!("{prefix}: {error}"));
-            None
+    let storage = if checkpoint_index.state == core::CheckpointIndexState::Current {
+        match core::storage_summary_from_index(&context) {
+            Ok(storage) => Some(storage),
+            Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                checkpoint_index = core::CheckpointIndexStatus {
+                    state: core::CheckpointIndexState::Corrupt,
+                    rebuildable: true,
+                    detail: Some(detail),
+                };
+                None
+            }
+            Err(error) => return Err(to_app_error(error)),
         }
-        Err(error) => return Err(to_app_error(error)),
+    } else {
+        None
     };
     Ok(json!({
         "project": project,
         "projectPath": project_path,
+        "checkpointIndex": checkpoint_index,
         "checkpoints": checkpoints,
         "storage": storage,
         "pendingTransactions": pending_transactions,

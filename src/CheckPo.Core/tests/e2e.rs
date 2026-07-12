@@ -40,7 +40,7 @@ fn init_project_for_test(project: &std::path::Path) -> core::Result<core::Projec
 }
 
 fn fingerprint_count(repo: &std::path::Path, path: &str) -> i64 {
-    let conn = core::open_db(repo).unwrap();
+    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(repo)).unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM file_fingerprints WHERE path = ?1",
         [path],
@@ -339,7 +339,7 @@ fn checkpoint_does_not_trust_cached_object_id_without_latest_snapshot_anchor() {
         .unwrap()
         .content_hash()
         .clone();
-    let conn = core::open_db(&repo).unwrap();
+    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(&repo)).unwrap();
     conn.execute(
         "UPDATE file_fingerprints SET object_id = ?1 WHERE path = ?2",
         rusqlite::params![bar_hash.as_str(), "Assets/Avatar/Foo.prefab"],
@@ -692,11 +692,14 @@ fn journal_cleanup_rejects_linked_repository_directory() {
 }
 
 #[test]
-fn checkpoint_recreates_incompatible_sqlite_index_schema() {
+fn incompatible_sqlite_index_requires_explicit_rebuild_without_dropping_live_db_on_read() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
     let repo = repo_path(&view);
+    core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let index_path = core::db_path(&repo);
+    fs::remove_file(&index_path).unwrap();
     let conn = core::open_db(&repo).unwrap();
     conn.execute_batch(
         "
@@ -708,13 +711,51 @@ fn checkpoint_recreates_incompatible_sqlite_index_schema() {
     .unwrap();
     drop(conn);
 
-    core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let context = core::load_project(&project).unwrap();
+    let status = core::checkpoint_index_status(&context).unwrap();
+    assert_eq!(status.state, core::CheckpointIndexState::Incompatible);
+    assert!(matches!(
+        core::list_checkpoints(&project),
+        Err(core::CheckPoError::IndexUnavailable(_))
+    ));
 
     let conn = core::open_db(&repo).unwrap();
-    let snapshot_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+    let legacy_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'legacy_cache'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
-    assert_eq!(snapshot_count, 1);
+    assert_eq!(legacy_count, 1);
+    drop(conn);
+
+    core::rebuild_index(&project).unwrap();
+
+    let status = core::checkpoint_index_status(&context).unwrap();
+    assert_eq!(status.state, core::CheckpointIndexState::Current);
+    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    let conn = core::open_db(&repo).unwrap();
+    let schema_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(schema_version, 3);
+    let snapshot_entries_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'snapshot_entries'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(snapshot_entries_count, 0);
+    let invalid_ref_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM object_refs WHERE reference_count != 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(invalid_ref_count, 0);
     let legacy_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'legacy_cache'",
@@ -734,7 +775,7 @@ fn checkpoint_recreates_incompatible_sqlite_index_schema() {
 }
 
 #[test]
-fn list_and_storage_summary_rebuild_missing_sqlite_index() {
+fn list_and_storage_summary_do_not_rebuild_missing_sqlite_index() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -744,9 +785,24 @@ fn list_and_storage_summary_rebuild_missing_sqlite_index() {
     let repo = repo_path(&view);
     fs::remove_file(core::db_path(&repo)).unwrap();
 
+    let context = core::load_project(&project).unwrap();
+    assert_eq!(
+        core::checkpoint_index_status(&context).unwrap().state,
+        core::CheckpointIndexState::Missing
+    );
+    assert!(matches!(
+        core::list_checkpoints(&project),
+        Err(core::CheckPoError::IndexUnavailable(_))
+    ));
+    assert!(matches!(
+        core::storage_summary(&project),
+        Err(core::CheckPoError::IndexUnavailable(_))
+    ));
+    assert!(!core::db_path(&repo).exists());
+
+    core::rebuild_index(&project).unwrap();
     let checkpoints = core::list_checkpoints(&project).unwrap();
     let summary = core::storage_summary(&project).unwrap();
-
     assert_eq!(checkpoints.len(), 2);
     assert_eq!(summary.checkpoint_count, 2);
     assert_eq!(summary.unique_blob_count, 3);
@@ -843,7 +899,9 @@ fn negative_sqlite_sizes_are_rejected_instead_of_wrapping() {
     core::create_checkpoint(&project, "one", Default::default()).unwrap();
     let repo = repo_path(&view);
     let conn = core::open_db(&repo).unwrap();
-    conn.execute("UPDATE snapshot_entries SET size_bytes = -1", [])
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+        .unwrap();
+    conn.execute("UPDATE object_refs SET present_size_bytes = -1", [])
         .unwrap();
 
     let error = core::storage_summary(&project).unwrap_err();
@@ -851,7 +909,22 @@ fn negative_sqlite_sizes_are_rejected_instead_of_wrapping() {
 }
 
 #[test]
-fn list_checkpoints_falls_back_when_sqlite_index_is_unreadable() {
+fn invalid_index_row_is_reported_as_index_unavailable() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let conn = core::open_db(&repo).unwrap();
+    conn.execute("UPDATE snapshots SET snapshot_id = 'invalid'", [])
+        .unwrap();
+
+    let error = core::list_checkpoints(&project).unwrap_err();
+    assert!(matches!(error, core::CheckPoError::IndexUnavailable(_)));
+}
+
+#[test]
+fn unreadable_sqlite_index_is_reported_without_snapshot_fallback() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -862,13 +935,15 @@ fn list_checkpoints_falls_back_when_sqlite_index_is_unreadable() {
     fs::create_dir_all(&db_path).unwrap();
 
     let context = core::load_project(&project).unwrap();
-    let result = core::list_checkpoints_with_warnings_for_project(&context).unwrap();
-
-    assert_eq!(result.checkpoints.len(), 1);
-    assert!(result
-        .warnings
-        .iter()
-        .any(|warning| warning.contains("SQLite index was not used")));
+    assert_eq!(
+        core::checkpoint_index_status(&context).unwrap().state,
+        core::CheckpointIndexState::Corrupt
+    );
+    assert!(matches!(
+        core::list_checkpoints_with_warnings_for_project(&context),
+        Err(core::CheckPoError::IndexUnavailable(_))
+    ));
+    assert!(db_path.is_dir());
 }
 
 #[test]
@@ -879,8 +954,10 @@ fn cancelled_rebuild_index_does_not_remove_existing_index_db() {
     core::create_checkpoint(&project, "one", Default::default()).unwrap();
     let repo = repo_path(&view);
     let index_db = core::db_path(&repo);
+    core::rebuild_index(&project).unwrap();
     assert!(index_db.is_file());
     assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    let before = fs::read(&index_db).unwrap();
 
     let token = core::CancellationToken::new();
     token.cancel();
@@ -894,11 +971,30 @@ fn cancelled_rebuild_index_does_not_remove_existing_index_db() {
 
     assert!(matches!(error, core::CheckPoError::Cancelled));
     assert!(index_db.is_file());
+    assert_eq!(fs::read(&index_db).unwrap(), before);
     assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
 }
 
 #[test]
-fn corrupt_snapshot_rebuild_does_not_record_current_fingerprint() {
+fn rebuilding_snapshot_index_does_not_replace_fingerprint_cache() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let cache_path = core::file_fingerprint_db_path(&repo);
+    assert!(cache_path.is_file());
+    assert_eq!(fingerprint_count(&repo, "Assets/Avatar/Foo.prefab"), 1);
+    let before = fs::read(&cache_path).unwrap();
+
+    core::rebuild_index(&project).unwrap();
+
+    assert_eq!(fs::read(&cache_path).unwrap(), before);
+    assert_eq!(fingerprint_count(&repo, "Assets/Avatar/Foo.prefab"), 1);
+}
+
+#[test]
+fn corrupt_snapshot_rebuild_preserves_existing_live_index() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -906,6 +1002,8 @@ fn corrupt_snapshot_rebuild_does_not_record_current_fingerprint() {
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "two").unwrap();
     core::create_checkpoint(&project, "two", Default::default()).unwrap();
     let repo = repo_path(&view);
+    let index_path = core::db_path(&repo);
+    let before = fs::read(&index_path).unwrap();
     fs::write(
         repo.join("snapshots")
             .join(format!("{}.json", first.checkpoint_id)),
@@ -913,17 +1011,48 @@ fn corrupt_snapshot_rebuild_does_not_record_current_fingerprint() {
     )
     .unwrap();
 
-    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    let context = core::load_project(&project).unwrap();
+    assert_eq!(
+        core::checkpoint_index_status(&context).unwrap().state,
+        core::CheckpointIndexState::Stale
+    );
+    assert!(core::rebuild_index(&project).is_err());
+    assert_eq!(fs::read(&index_path).unwrap(), before);
+    assert_eq!(
+        core::checkpoint_index_status(&context).unwrap().state,
+        core::CheckpointIndexState::Stale
+    );
+}
+
+#[test]
+fn object_size_mismatch_does_not_block_checkpoint_index_rebuild() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let snapshot = core::load_snapshot(&repo, &checkpoint.checkpoint_id).unwrap();
+    let object = core::object_path(&repo, snapshot.files[0].content_hash());
+    fs::write(&object, "wrong-size").unwrap();
+
+    let rebuilt = core::rebuild_index(&project).unwrap();
+    assert!(rebuilt.referenced_object_count >= 1);
+    assert_eq!(rebuilt.unavailable_referenced_object_count, 1);
+    let context = core::load_project(&project).unwrap();
+    assert_eq!(
+        core::checkpoint_index_status(&context).unwrap().state,
+        core::CheckpointIndexState::Current
+    );
     assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
     let conn = core::open_db(&repo).unwrap();
-    let fingerprint_count: i64 = conn
+    let present_size: Option<i64> = conn
         .query_row(
-            "SELECT COUNT(*) FROM index_state WHERE key = 'snapshot_dir_fingerprint'",
-            [],
+            "SELECT present_size_bytes FROM object_refs WHERE object_id = ?1",
+            [snapshot.files[0].content_hash().as_str()],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(fingerprint_count, 0);
+    assert_eq!(present_size, None);
 }
 
 #[test]
@@ -1580,7 +1709,7 @@ fn future_latest_snapshot_schema_blocks_checkpoint_creation() {
 }
 
 #[test]
-fn future_snapshot_schema_is_listed_as_a_warning_and_blocks_gc_deletion() {
+fn future_snapshot_schema_marks_index_stale_and_blocks_gc_deletion() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -1601,12 +1730,14 @@ fn future_snapshot_schema_is_listed_as_a_warning_and_blocks_gc_deletion() {
     .unwrap();
 
     let context = core::load_project(&project).unwrap();
-    let listed = core::list_checkpoints_with_warnings_for_project(&context).unwrap();
-    assert_eq!(listed.checkpoints.len(), 1);
-    assert!(listed
-        .warnings
-        .iter()
-        .any(|warning| warning.contains("unsupported snapshot schema version 2")));
+    assert_eq!(
+        core::checkpoint_index_status(&context).unwrap().state,
+        core::CheckpointIndexState::Stale
+    );
+    assert!(matches!(
+        core::list_checkpoints_with_warnings_for_project(&context),
+        Err(core::CheckPoError::IndexUnavailable(_))
+    ));
     let plan = core::analyze_gc(&project).unwrap();
     assert!(plan.has_integrity_problems);
     assert!(plan
@@ -2693,7 +2824,7 @@ fn delete_latest_checkpoint_points_latest_ref_to_newest_remaining_checkpoint() {
 }
 
 #[test]
-fn delete_checkpoint_recovers_when_sqlite_index_is_incomplete_but_marked_current() {
+fn delete_checkpoint_leaves_incomplete_sqlite_index_stale_until_explicit_rebuild() {
     let (_guard, _temp, project, _data) = setup();
     let view = init_project_for_test(&project).unwrap();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
@@ -2705,12 +2836,10 @@ fn delete_checkpoint_recovers_when_sqlite_index_is_incomplete_but_marked_current
     let expected_latest = before[1].checkpoint_id.clone();
     let repo = repo_path(&view);
     let conn = core::open_db(&repo).unwrap();
-    conn.execute("DELETE FROM snapshot_entries", []).unwrap();
-    conn.execute("DELETE FROM snapshots", []).unwrap();
+    conn.execute("DELETE FROM object_refs", []).unwrap();
     drop(conn);
 
     let result = core::delete_checkpoint(&project, deleted.as_str()).unwrap();
-    let after = core::list_checkpoints(&project).unwrap();
 
     assert!(result
         .warnings
@@ -2720,12 +2849,24 @@ fn delete_checkpoint_recovers_when_sqlite_index_is_incomplete_but_marked_current
         core::read_latest_snapshot_id(&repo).unwrap(),
         Some(expected_latest.clone())
     );
+    let context = core::load_project(&project).unwrap();
+    assert_eq!(
+        core::checkpoint_index_status(&context).unwrap().state,
+        core::CheckpointIndexState::Stale
+    );
+    assert!(matches!(
+        core::list_checkpoints(&project),
+        Err(core::CheckPoError::IndexUnavailable(_))
+    ));
+
+    core::rebuild_index(&project).unwrap();
+    let after = core::list_checkpoints(&project).unwrap();
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].checkpoint_id, expected_latest);
 }
 
 #[test]
-fn delete_checkpoint_does_not_mark_incomplete_sqlite_index_current() {
+fn delete_checkpoint_updates_aggregate_object_reference_counts() {
     let (_guard, _temp, project, _data) = setup();
     let view = init_project_for_test(&project).unwrap();
     for index in 0..3 {
@@ -2734,19 +2875,24 @@ fn delete_checkpoint_does_not_mark_incomplete_sqlite_index_current() {
     }
     let before = core::list_checkpoints(&project).unwrap();
     let deleted = before[0].checkpoint_id.clone();
-    let missing_index_row = before[2].checkpoint_id.clone();
     let repo = repo_path(&view);
+    let deleted_snapshot = core::load_snapshot(&repo, &deleted).unwrap();
+    let deleted_file_object = deleted_snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path.as_str() == "Assets/Avatar/Foo.prefab")
+        .unwrap()
+        .content_hash()
+        .to_string();
     let conn = core::open_db(&repo).unwrap();
-    conn.execute(
-        "DELETE FROM snapshot_entries WHERE snapshot_id = ?1",
-        [missing_index_row.as_str()],
-    )
-    .unwrap();
-    conn.execute(
-        "DELETE FROM snapshots WHERE snapshot_id = ?1",
-        [missing_index_row.as_str()],
-    )
-    .unwrap();
+    let before_ref_count: i64 = conn
+        .query_row(
+            "SELECT reference_count FROM object_refs WHERE object_id = ?1",
+            [deleted_file_object.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(before_ref_count, 1);
     drop(conn);
 
     let result = core::delete_checkpoint(&project, deleted.as_str()).unwrap();
@@ -2754,12 +2900,15 @@ fn delete_checkpoint_does_not_mark_incomplete_sqlite_index_current() {
 
     assert!(result.warnings.is_empty());
     assert_eq!(after.len(), 2);
-    assert!(after
-        .iter()
-        .any(|checkpoint| checkpoint.checkpoint_id == before[1].checkpoint_id));
-    assert!(after
-        .iter()
-        .any(|checkpoint| checkpoint.checkpoint_id == missing_index_row));
+    let conn = core::open_db(&repo).unwrap();
+    let deleted_object_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM object_refs WHERE object_id = ?1",
+            [deleted_file_object.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deleted_object_count, 0);
 }
 
 #[test]
@@ -3016,9 +3165,10 @@ fn copied_project_blocks_mutating_operations_until_decided() {
     if index_db.exists() {
         fs::remove_file(&index_db).unwrap();
     }
-    let checkpoints = core::list_checkpoints(&copied).unwrap();
-    assert_eq!(checkpoints.len(), 1);
-    assert_eq!(checkpoints[0].checkpoint_id, checkpoint);
+    assert!(matches!(
+        core::list_checkpoints(&copied),
+        Err(core::CheckPoError::IndexUnavailable(_))
+    ));
     assert!(!index_db.exists());
 
     let tx = repo.join("journals/copiedtx");

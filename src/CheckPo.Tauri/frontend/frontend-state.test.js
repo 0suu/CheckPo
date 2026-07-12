@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const {
   buildChangeTreeModel,
   cancelAndWaitForIdle,
+  checkpointIndexPresentation,
   collectChangeTreeFolderPaths,
   flattenChangeTreeRows,
   localizedErrorDisplay,
@@ -40,6 +41,26 @@ test("project-scoped reset does not share mutable selection state", () => {
   assert.deepEqual(first.failedTransactions, []);
   assert.equal(first.currentDiffFilter, "all");
   assert.equal(first.selectedCheckpointId, null);
+  assert.equal(first.checkpointIndex.state, "current");
+});
+
+test("checkpoint index states distinguish unavailable history from an empty history", () => {
+  const current = checkpointIndexPresentation({ state: "current", rebuildable: false });
+  const missing = checkpointIndexPresentation({
+    state: "missing",
+    rebuildable: true,
+    detail: "index file is absent",
+  });
+  const corrupt = checkpointIndexPresentation({ state: "corrupt", rebuildable: true });
+
+  assert.equal(current.available, true);
+  assert.equal(current.message, "");
+  assert.equal(missing.available, false);
+  assert.equal(missing.rebuildable, true);
+  assert.match(missing.message, /索引がありません/);
+  assert.equal(missing.detail, "index file is absent");
+  assert.equal(corrupt.available, false);
+  assert.match(corrupt.message, /読み込めません/);
 });
 
 test("known backend errors use actionable Japanese text and preserve raw detail", () => {

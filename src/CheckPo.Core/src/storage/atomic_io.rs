@@ -115,12 +115,12 @@ pub(crate) fn sync_parent_chain(_path: &Path, _stop_at: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(super) fn replace_file(temp_path: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(temp_path: &Path, destination: &Path) -> Result<()> {
     fs::rename(temp_path, destination).map_err(|error| io_error(destination, error))
 }
 
 #[cfg(windows)]
-pub(super) fn replace_file(temp_path: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn replace_file(temp_path: &Path, destination: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,

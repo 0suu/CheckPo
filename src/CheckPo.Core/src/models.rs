@@ -372,8 +372,8 @@ pub struct VerificationResult {
 #[serde(rename_all = "camelCase")]
 pub struct RebuildIndexResult {
     pub snapshot_count: usize,
-    pub object_count: usize,
-    pub missing_object_count: usize,
+    pub referenced_object_count: usize,
+    pub unavailable_referenced_object_count: usize,
     pub errors: Vec<String>,
 }
 
@@ -469,6 +469,34 @@ pub struct TransactionRecoveryFailure {
 pub struct TransactionCleanupResult {
     pub deleted_directory_count: usize,
     pub deleted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckpointIndexState {
+    Current,
+    Missing,
+    Stale,
+    Incompatible,
+    Corrupt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointIndexStatus {
+    pub state: CheckpointIndexState,
+    pub rebuildable: bool,
+    pub detail: Option<String>,
+}
+
+impl CheckpointIndexStatus {
+    pub fn current() -> Self {
+        Self {
+            state: CheckpointIndexState::Current,
+            rebuildable: false,
+            detail: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

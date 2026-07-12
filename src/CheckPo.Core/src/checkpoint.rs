@@ -130,6 +130,9 @@ pub fn create_checkpoint(
         ],
         files,
     };
+    // Open a current index before publishing the new snapshot. Once the snapshot is
+    // visible, the old generation is intentionally reported as stale.
+    let snapshot_index = crate::open_index_connection(&project);
     let snapshot_id = save_snapshot(&project.repo_root, &snapshot)?;
     write_latest_snapshot_id(&project.repo_root, &snapshot_id)?;
     let mut warnings = scan_warnings
@@ -140,7 +143,7 @@ pub fn create_checkpoint(
         crate::diagnostics::log_warning("checkpoint-create", &warning);
         warnings.push(warning);
     }
-    match crate::open_index_connection(&project) {
+    match snapshot_index {
         Ok(index) => {
             if let Err(error) = crate::index_snapshot_with_index_connection(
                 &index,
@@ -150,11 +153,21 @@ pub fn create_checkpoint(
             ) {
                 warnings.push(format!("SQLite index update failed: {error}"));
             }
-            if let Err(error) = refresh_fingerprints_after_checkpoint(&index, &project, &scanned) {
-                warnings.push(format!("SQLite fingerprint update failed: {error}"));
+        }
+        Err(error) => {
+            if crate::list_snapshot_ids(&project.repo_root)?.len() == 1 {
+                if let Err(rebuild_error) =
+                    crate::rebuild_index_for_project_unlocked(&project, None, None)
+                {
+                    warnings.push(format!("SQLite index rebuild failed: {rebuild_error}"));
+                }
+            } else {
+                warnings.push(format!("SQLite index update failed: {error}"));
             }
         }
-        Err(error) => warnings.push(format!("SQLite index update failed: {error}")),
+    }
+    if let Err(error) = refresh_fingerprints_after_checkpoint(&project, &scanned) {
+        warnings.push(format!("SQLite fingerprint update failed: {error}"));
     }
     report_operation_progress(progress, "complete", 1, 1, None);
     Ok(CheckpointSummary {
@@ -424,17 +437,8 @@ pub fn list_checkpoints_for_project(
 pub fn list_checkpoints_with_warnings_for_project(
     project: &crate::ProjectContext,
 ) -> Result<CheckpointListResult> {
-    let (mut checkpoints, mut warnings) = match crate::list_checkpoint_summaries_from_index(project)
-    {
-        Ok(checkpoints) => (checkpoints, Vec::new()),
-        Err(index_error) => {
-            let mut direct = list_checkpoints_from_snapshots(project)?;
-            direct
-                .warnings
-                .insert(0, format!("SQLite index was not used: {index_error}"));
-            (direct.checkpoints, direct.warnings)
-        }
-    };
+    let mut checkpoints = crate::list_checkpoint_summaries_from_index(project)?;
+    let mut warnings = Vec::new();
     warnings.extend(crate::apply_checkpoint_name_overrides(
         project,
         &mut checkpoints,
@@ -500,7 +504,11 @@ pub fn delete_checkpoint(
     if !path.is_file() {
         return Err(crate::CheckPoError::SnapshotNotFound(id.to_string()));
     }
-    load_project_snapshot(&project, &id)?;
+    let deleted_snapshot = load_project_snapshot(&project, &id)?;
+    let update_index = matches!(
+        crate::checkpoint_index_status(&project),
+        Ok(status) if status.state == crate::CheckpointIndexState::Current
+    );
     let (_, name_warnings) = crate::read_checkpoint_name_overrides(&project);
     if !name_warnings.is_empty() {
         return Err(crate::CheckPoError::Corruption(format!(
@@ -536,16 +544,17 @@ pub fn delete_checkpoint(
     fs::remove_file(&path).map_err(|error| crate::io_error(&path, error))?;
     crate::sync_parent_dir(&path)?;
     let mut warnings = Vec::new();
-    if let Err(error) = crate::delete_snapshot_from_index(&project, &id) {
-        warnings.push(format!(
-            "SQLite index update failed after checkpoint delete: {error}"
-        ));
-        if let Err(rebuild_error) = crate::rebuild_index_for_project_unlocked(&project, None, None)
-        {
+    if update_index {
+        if let Err(error) = crate::delete_snapshot_from_index(&project, &id, &deleted_snapshot) {
             warnings.push(format!(
-                "SQLite index rebuild failed after checkpoint delete: {rebuild_error}"
+                "SQLite index update failed after checkpoint delete: {error}"
             ));
         }
+    } else {
+        warnings.push(
+            "SQLite index was already unavailable; rebuild it to refresh the checkpoint list"
+                .to_string(),
+        );
     }
     match crate::remove_checkpoint_name_override(&project, &id) {
         Ok(name_warnings) => warnings.extend(name_warnings),
@@ -617,7 +626,6 @@ fn summary_from_snapshot(
 }
 
 fn refresh_fingerprints_after_checkpoint(
-    index: &crate::db::IndexConnection,
     project: &crate::ProjectContext,
     scanned: &[ScannedFile],
 ) -> Result<()> {
@@ -636,5 +644,5 @@ fn refresh_fingerprints_after_checkpoint(
             object_id: file.hash.clone(),
         });
     }
-    crate::refresh_file_fingerprints_with_index_connection(index, project, &updates, &seen_paths)
+    crate::refresh_file_fingerprints(project, &updates, &seen_paths)
 }

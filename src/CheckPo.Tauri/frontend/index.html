@@ -33,6 +33,10 @@
               <span data-i18n="searchCheckpoints">Search checkpoints</span>
               <input id="checkpointSearch" type="text" autocomplete="off" data-i18n-placeholder="searchCheckpointsPlaceholder" />
             </label>
+            <section class="checkpoint-index-notice" id="checkpointIndexNotice" role="region" aria-labelledby="checkpointIndexMessage" hidden>
+              <p id="checkpointIndexMessage" role="status"></p>
+              <button class="button" id="rebuildIndexButton" type="button" data-command="rebuild_index">索引を再構築</button>
+            </section>
           </section>
 
           <div class="checkpoint-list" id="checkpointList" role="listbox" tabindex="0"></div>

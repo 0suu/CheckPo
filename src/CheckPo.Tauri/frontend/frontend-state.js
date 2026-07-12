@@ -42,6 +42,7 @@
 
   function projectScopedStateReset() {
     return {
+      checkpointIndex: { state: "current", rebuildable: false, detail: null },
       selectedCheckpointId: null,
       renamingCheckpointId: null,
       gcPlan: null,
@@ -60,6 +61,26 @@
       diffTreeTouched: false,
       currentDiffSelectedPaths: new Set(),
       lastSelectedChangePath: null,
+    };
+  }
+
+  function checkpointIndexPresentation(status) {
+    const normalized = status && typeof status === "object"
+      ? status
+      : { state: "current", rebuildable: false, detail: null };
+    const state = String(normalized.state || "current");
+    const messages = {
+      missing: "チェックポイント一覧の索引がありません。再構築すると一覧を読み込めます。",
+      stale: "チェックポイントの保存内容が変わったため、一覧の索引を更新する必要があります。",
+      incompatible: "このバージョンで使える一覧索引へ再構築する必要があります。チェックポイント本体は削除されません。",
+      corrupt: "チェックポイント一覧の索引を読み込めません。再構築して復旧してください。",
+    };
+    return {
+      state,
+      available: state === "current",
+      rebuildable: state !== "current" && normalized.rebuildable !== false,
+      message: messages[state] || (state === "current" ? "" : messages.corrupt),
+      detail: normalized.detail || null,
     };
   }
 
@@ -302,6 +323,7 @@
   return {
     buildChangeTreeModel,
     cancelAndWaitForIdle,
+    checkpointIndexPresentation,
     collectChangeTreeFilePaths,
     collectChangeTreeFolderPaths,
     flattenChangeTreeRows,

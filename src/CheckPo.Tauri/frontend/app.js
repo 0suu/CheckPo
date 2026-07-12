@@ -36,6 +36,7 @@ const state = {
   projectWarnings: [],
   projectHistory: readProjectHistory(),
   hiddenProjectPaths: new Set(),
+  checkpointIndex: { state: "current", rebuildable: false, detail: null },
   checkpoints: [],
   selectedCheckpointId: null,
   renamingCheckpointId: null,
@@ -585,6 +586,8 @@ function renderSnapshot(snapshot) {
   state.projectPath = nextProjectPath;
   state.project = nextProject;
   state.projectLocationStatus = state.project?.locationStatus || "current";
+  state.checkpointIndex = snapshot.checkpointIndex
+    || { state: "current", rebuildable: false, detail: null };
   state.checkpoints = sortCheckpoints(snapshot.checkpoints || []);
   state.storage = snapshot.storage || null;
   state.gcPlan = null;
@@ -596,6 +599,7 @@ function renderSnapshot(snapshot) {
   rememberProject(snapshot);
   renderProjectLabels();
   renderProjectHistory();
+  renderCheckpointIndexNotice();
   renderCheckpoints();
   renderStorage();
   renderPending(snapshot.pendingTransactions || []);
@@ -626,6 +630,16 @@ function rememberProject(snapshot) {
   state.projectHistory = [entry, ...state.projectHistory.filter((item) => item.path !== entry.path)].slice(0, 12);
   writeProjectHistory();
   writeLocalSetting("lastProjectPath", state.projectPath);
+}
+
+function renderCheckpointIndexNotice() {
+  const presentation = CheckPoFrontendState.checkpointIndexPresentation(state.checkpointIndex);
+  const notice = $("checkpointIndexNotice");
+  if (!notice) return;
+  notice.hidden = presentation.available;
+  $("checkpointIndexMessage").textContent = presentation.message;
+  $("checkpointIndexMessage").title = presentation.detail || "";
+  $("rebuildIndexButton").hidden = !presentation.rebuildable;
 }
 
 async function restoreLastProject() {
@@ -857,6 +871,14 @@ function renderCheckpoints() {
   const query = $("checkpointSearch").value.trim().toLowerCase();
   const list = $("checkpointList");
   list.replaceChildren();
+  const index = CheckPoFrontendState.checkpointIndexPresentation(state.checkpointIndex);
+  if (!index.available) {
+    const unavailable = document.createElement("p");
+    unavailable.className = "empty-list checkpoint-index-empty";
+    unavailable.textContent = "一覧は索引の再構築後に表示されます。";
+    list.append(unavailable);
+    return;
+  }
   const changeCount = currentChangeCount();
   if (!query && changeCount > 0) {
     const workingSection = document.createElement("section");
@@ -1358,6 +1380,8 @@ function updateControls() {
   const locationMutationBlocked = state.projectLocationStatus === "copiedSuspected";
   const pendingMutationBlocked = state.pendingTransactions.length > 0;
   const quarantineMutationBlocked = state.unresolvedQuarantines.length > 0;
+  const checkpointIndex = CheckPoFrontendState.checkpointIndexPresentation(state.checkpointIndex);
+  const indexUnavailable = !checkpointIndex.available;
   const destructiveBlocked = locationMutationBlocked || pendingMutationBlocked || quarantineMutationBlocked;
   const controlsBlocked = state.busy || state.confirming;
   document.querySelectorAll("button").forEach((button) => {
@@ -1403,13 +1427,21 @@ function updateControls() {
         || !state.rollbackPlan.hasChanges;
       return;
     }
+    if (button.id === "rebuildIndexButton") {
+      button.disabled = controlsBlocked
+        || locationMutationBlocked
+        || pendingMutationBlocked
+        || !hasProject
+        || !checkpointIndex.rebuildable;
+      return;
+    }
     if (button.id === "applyGcButton") {
       button.disabled = controlsBlocked || destructiveBlocked || !hasProject || !state.gcPlan || state.gcPlan.hasIntegrityProblems;
       return;
     }
     if (["previewRollbackButton", "diffButton", "verifyButton"].includes(button.id)) {
       const pendingBlocked = button.id === "previewRollbackButton" && pendingMutationBlocked;
-      button.disabled = controlsBlocked || pendingBlocked || !hasProject || !hasCheckpoint;
+      button.disabled = controlsBlocked || indexUnavailable || pendingBlocked || !hasProject || !hasCheckpoint;
       return;
     }
     if (button.id === "deleteCheckpointButton") {
@@ -1421,7 +1453,7 @@ function updateControls() {
       return;
     }
     if (button.id === "createCheckpointButton") {
-      button.disabled = controlsBlocked || destructiveBlocked || !hasProject || !hasCheckpointName;
+      button.disabled = controlsBlocked || indexUnavailable || destructiveBlocked || !hasProject || !hasCheckpointName;
       return;
     }
     if (button.id === "setStorageRootButton") {
@@ -1812,6 +1844,22 @@ function bindEvents() {
     await refreshProject();
     await refreshLatestDiff({ allowBusy: true });
   }));
+  $("rebuildIndexButton").addEventListener("click", async () => {
+    const projectPath = getProjectPath();
+    await run("一覧の索引を再構築中", async () => {
+      await invokeCommand("rebuild_index", { projectPath });
+      const snapshot = await invokeCommand("refresh_project", { projectPath });
+      if (state.projectPath !== projectPath) return;
+      renderSnapshot(snapshot);
+      const index = CheckPoFrontendState.checkpointIndexPresentation(state.checkpointIndex);
+      if (!index.available) {
+        setStatus("一覧の索引を再構築できませんでした。詳細を確認してください。");
+        return;
+      }
+      setStatus("一覧の索引を再構築しました。");
+      await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
+    });
+  });
   $("confirmProjectLocationButton").addEventListener("click", async () => {
     state.confirming = true;
     updateControls();
@@ -2087,6 +2135,7 @@ function operationCanCancelAtProgress(progress) {
     "creatingDirectories",
     "applying",
     "finalizing",
+    "committingIndex",
     "complete",
   ].includes(progress?.phase)) return false;
   if (progressCancellableStartCommands.has(state.activeCommand)) {
@@ -2109,6 +2158,10 @@ function progressPhaseLabel(phase) {
     verifySnapshots: "チェックポイント確認中",
     verifyObjects: "保存データ確認中",
     rebuildIndex: "一覧を再構築中",
+    readingSnapshots: "チェックポイント一覧を集計中",
+    aggregatingReferences: "保存データの参照を集計中",
+    checkingObjects: "保存データの存在を確認中",
+    committingIndex: "一覧の更新を確定中",
     complete: "完了",
   })[phase] || phase || "";
 }

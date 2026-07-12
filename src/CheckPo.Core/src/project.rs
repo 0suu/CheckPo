@@ -353,6 +353,11 @@ fn init_project_internal(
         location_status: ProjectLocationStatus::Current,
         warnings: Vec::new(),
     };
+    if !crate::db_path(&context.repo_root).exists()
+        && crate::list_snapshot_ids(&context.repo_root)?.is_empty()
+    {
+        crate::rebuild_index_for_project_unlocked(&context, None, None)?;
+    }
     project_view(&context)
 }
 

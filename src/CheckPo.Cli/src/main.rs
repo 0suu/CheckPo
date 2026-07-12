@@ -260,37 +260,46 @@ fn run() -> Result<u8, String> {
                 core::unresolved_transaction_quarantines_for_project(&context)
                     .map_err(to_message)?;
             let mut warnings = Vec::new();
-            let checkpoints = match core::list_checkpoints_with_warnings_for_project(&context) {
-                Ok(result) => {
-                    warnings.extend(result.warnings);
-                    result.checkpoints
+            let mut checkpoint_index =
+                core::checkpoint_index_status(&context).map_err(to_message)?;
+            let checkpoints = if checkpoint_index.state == core::CheckpointIndexState::Current {
+                match core::list_checkpoints_with_warnings_for_project(&context) {
+                    Ok(result) => {
+                        warnings.extend(result.warnings);
+                        Some(result.checkpoints)
+                    }
+                    Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                        checkpoint_index = core::CheckpointIndexStatus {
+                            state: core::CheckpointIndexState::Corrupt,
+                            rebuildable: true,
+                            detail: Some(detail),
+                        };
+                        None
+                    }
+                    Err(error) => return Err(to_message(error)),
                 }
-                Err(error)
-                    if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                        || !pending_transactions.is_empty()
-                        || !unresolved_quarantines.is_empty()
-                        || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
-                {
-                    warnings.push(format!("Failed to load checkpoints: {error}"));
-                    Vec::new()
-                }
-                Err(error) => return Err(to_message(error)),
+            } else {
+                None
             };
-            let storage = match core::storage_summary_from_index(&context) {
-                Ok(storage) => Some(storage),
-                Err(error)
-                    if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                        || !pending_transactions.is_empty()
-                        || !unresolved_quarantines.is_empty()
-                        || matches!(&error, core::CheckPoError::IndexUnavailable(_)) =>
-                {
-                    warnings.push(format!("Failed to load storage summary: {error}"));
-                    None
+            let storage = if checkpoint_index.state == core::CheckpointIndexState::Current {
+                match core::storage_summary_from_index(&context) {
+                    Ok(storage) => Some(storage),
+                    Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                        checkpoint_index = core::CheckpointIndexStatus {
+                            state: core::CheckpointIndexState::Corrupt,
+                            rebuildable: true,
+                            detail: Some(detail),
+                        };
+                        None
+                    }
+                    Err(error) => return Err(to_message(error)),
                 }
-                Err(error) => return Err(to_message(error)),
+            } else {
+                None
             };
             let value = serde_json::json!({
                 "project": project,
+                "checkpointIndex": checkpoint_index,
                 "checkpoints": checkpoints,
                 "storage": storage,
                 "pendingTransactions": pending_transactions,
@@ -300,7 +309,10 @@ fn run() -> Result<u8, String> {
             print_or_json(cli.json, &value, || {
                 println!("Project: {}", project.project_root_path.display());
                 println!("Storage: {}", project.storage_root_path.display());
-                println!("Checkpoints: {}", checkpoints.len());
+                match &checkpoints {
+                    Some(checkpoints) => println!("Checkpoints: {}", checkpoints.len()),
+                    None => println!("Checkpoints: unavailable ({:?})", checkpoint_index.state),
+                }
                 for warning in &project.warnings {
                     println!("Warning: {}", project_warning_text(warning));
                 }
@@ -482,8 +494,11 @@ fn run() -> Result<u8, String> {
                 print_or_json(cli.json, &result, || {
                     println!("Rebuilt index.");
                     println!("Snapshots: {}", result.snapshot_count);
-                    println!("Objects: {}", result.object_count);
-                    println!("Missing objects: {}", result.missing_object_count);
+                    println!("Referenced objects: {}", result.referenced_object_count);
+                    println!(
+                        "Unavailable referenced objects: {}",
+                        result.unavailable_referenced_object_count
+                    );
                 })?;
                 return Ok(if ok { 0 } else { 1 });
             }

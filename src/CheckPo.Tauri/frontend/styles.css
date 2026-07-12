@@ -1948,6 +1948,35 @@ body {
   display: none;
 }
 
+.checkpoint-index-notice {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  border: 1px solid var(--warning-border, #f59e0b);
+  border-radius: 8px;
+  background: var(--warning-soft, #fffbeb);
+  padding: 10px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.checkpoint-index-notice[hidden] {
+  display: none;
+}
+
+.checkpoint-index-notice p {
+  margin: 0;
+}
+
+.checkpoint-index-notice .button {
+  justify-self: start;
+}
+
+.checkpoint-index-empty {
+  padding: 16px 10px;
+}
+
 .field-label {
   display: block;
   margin-bottom: 6px;

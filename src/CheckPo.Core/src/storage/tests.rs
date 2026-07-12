@@ -13,6 +13,24 @@ fn open_db_sets_busy_timeout() {
     assert_eq!(timeout_ms, 5000);
 }
 
+#[cfg(unix)]
+#[test]
+fn fingerprint_database_open_rejects_leaf_symlink_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("indexes")).unwrap();
+    let target = temp.path().join("outside.db");
+    fs::write(&target, b"outside-must-not-change").unwrap();
+    let cache = file_fingerprint_db_path(&repo);
+    symlink(&target, &cache).unwrap();
+    let before = fs::read(&target).unwrap();
+
+    assert!(open_file_fingerprint_db(&repo).is_err());
+    assert_eq!(fs::read(&target).unwrap(), before);
+}
+
 #[test]
 fn move_file_no_replace_preserves_existing_destination() {
     let temp = tempfile::tempdir().unwrap();

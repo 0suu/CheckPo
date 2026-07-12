@@ -20,7 +20,7 @@ pub use checkpoint::{
     list_checkpoints_with_warnings_for_project, rename_checkpoint,
 };
 pub use db::{
-    checkpoint_summaries_and_storage_summary_from_index, rebuild_index,
+    checkpoint_index_status, checkpoint_summaries_and_storage_summary_from_index, rebuild_index,
     rebuild_index_for_project_with_progress_and_cancellation, storage_summary_from_index,
     CachedFileFingerprint, FileFingerprintUpdate,
 };
@@ -40,14 +40,14 @@ pub use maintenance::{
 };
 pub use models::CancellationToken;
 pub use models::{
-    ApplyOptions, ApplyResult, CheckpointDeleteResult, CheckpointListResult, CheckpointSummary,
-    CreateCheckpointOptions, DiffOptions, DiffResult, FileOperation, FileOperationType,
-    InvalidObjectLocation, MissingBlobReference, OperationPlan, OperationPlanKind,
-    OperationProgress, OrphanTempFile, PendingTransaction, ProjectContext, ProjectLocationStatus,
-    ProjectMarkerFile, ProjectView, ProjectWarning, ProjectWarningKind, RebuildIndexResult,
-    RegistryFile, RegistryProjectEntry, RepositoryConfig, RepositoryTempFile, ScanWarning,
-    ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry, SnapshotFile, StorageGcPlan,
-    StorageGcResult, StorageSummary, TempFileCleanupPlan, TempFileCleanupResult,
+    ApplyOptions, ApplyResult, CheckpointDeleteResult, CheckpointIndexState, CheckpointIndexStatus,
+    CheckpointListResult, CheckpointSummary, CreateCheckpointOptions, DiffOptions, DiffResult,
+    FileOperation, FileOperationType, InvalidObjectLocation, MissingBlobReference, OperationPlan,
+    OperationPlanKind, OperationProgress, OrphanTempFile, PendingTransaction, ProjectContext,
+    ProjectLocationStatus, ProjectMarkerFile, ProjectView, ProjectWarning, ProjectWarningKind,
+    RebuildIndexResult, RegistryFile, RegistryProjectEntry, RepositoryConfig, RepositoryTempFile,
+    ScanWarning, ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry, SnapshotFile,
+    StorageGcPlan, StorageGcResult, StorageSummary, TempFileCleanupPlan, TempFileCleanupResult,
     TransactionCleanupResult, TransactionQuarantineResult, TransactionRecoveryFailure,
     TransactionRecoveryResult, UnreferencedBlob, UnresolvedTransactionQuarantine,
     VerificationResult,
@@ -66,9 +66,9 @@ pub use restore::{
     preview_restore_with_progress_and_cancellation,
 };
 pub use storage::{
-    canonical_snapshot_bytes, db_path, load_snapshot, object_path, open_db,
-    put_object_from_file_with_known_hash, read_json, read_latest_snapshot_id, save_snapshot,
-    snapshot_id_from_bytes, snapshot_path,
+    canonical_snapshot_bytes, db_path, file_fingerprint_db_path, load_snapshot, object_path,
+    open_db, put_object_from_file_with_known_hash, read_json, read_latest_snapshot_id,
+    save_snapshot, snapshot_id_from_bytes, snapshot_path,
 };
 pub use storage_root_setting::set_project_storage_root;
 pub use transaction::{
@@ -88,7 +88,7 @@ pub(crate) use checkpoint_names::{
 pub(crate) use db::{
     delete_snapshot_from_index, index_snapshot_with_index_connection, invalidate_file_fingerprints,
     list_checkpoint_summaries_from_index, load_file_fingerprints, open_index_connection,
-    rebuild_index_for_project_unlocked, refresh_file_fingerprints_with_index_connection,
+    rebuild_index_for_project_unlocked, refresh_file_fingerprints,
 };
 pub(crate) use models::{ensure_not_cancelled, report_operation_progress};
 pub(crate) use path::{
@@ -108,8 +108,8 @@ pub(crate) use storage::{
     list_snapshot_ids, load_project_snapshot, load_repo_config, metadata_is_link_or_reparse,
     move_file_no_replace, now_utc_string, object_id_from_loose_relative_path, refs_latest_path,
     repo_root, snapshots_dir, sync_parent_dir, validate_repository_config,
-    validate_repository_layout_no_follow, verify_file_hash_and_size, write_json_atomic,
-    write_latest_snapshot_id, RepositoryLock,
+    validate_repository_layout_no_follow, write_json_atomic, write_latest_snapshot_id,
+    RepositoryLock,
 };
 pub(crate) use transaction::{
     build_plan_with_progress_and_cancellation, ensure_no_pending_transactions,

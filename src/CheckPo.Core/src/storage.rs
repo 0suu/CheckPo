@@ -20,13 +20,12 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
-use atomic_io::replace_file;
 pub(crate) use atomic_io::{
-    copy_file_no_replace, move_file_no_replace, reflink_or_copy_file_no_replace, sync_parent_chain,
-    write_json_atomic_new, write_text_atomic, CopySourceDisposition,
+    copy_file_no_replace, move_file_no_replace, reflink_or_copy_file_no_replace, replace_file,
+    sync_parent_chain, write_json_atomic_new, write_text_atomic, CopySourceDisposition,
 };
 pub use atomic_io::{read_json, sync_parent_dir, write_bytes_atomic, write_json_atomic};
-pub use db_file::{db_path, open_db};
+pub use db_file::{db_path, file_fingerprint_db_path, open_db, open_file_fingerprint_db};
 pub(crate) use fs_safety::{
     create_absolute_dir_all_no_follow, create_dir_all_no_follow,
     ensure_regular_directory_no_follow, ensure_regular_file_no_follow, metadata_is_link_or_reparse,
@@ -41,9 +40,7 @@ pub use layout::{
 pub(crate) use lock::FileLock;
 pub use lock::{acquire_repository_lock, RepositoryLock};
 pub(crate) use object_store::{copy_object_to_file, object_path_no_follow};
-pub use object_store::{
-    hash_file, put_object_from_file_with_known_hash, verify_file_hash_and_size,
-};
+pub use object_store::{hash_file, put_object_from_file_with_known_hash};
 pub(crate) use platform::available_space_bytes;
 pub use snapshot_store::{
     canonical_snapshot_bytes, list_snapshot_ids, load_project_snapshot, load_snapshot,
