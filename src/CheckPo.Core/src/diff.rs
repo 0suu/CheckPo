@@ -15,6 +15,7 @@ pub fn diff_checkpoint_with_options(
     options: DiffOptions,
 ) -> Result<DiffResult> {
     let project = load_project(project_path)?;
+    let _lock = crate::acquire_project_repository_shared_lock(&project, "checkpoint-diff")?;
     let snapshot_id = SnapshotId::parse(checkpoint_id)?;
     let snapshot = load_project_snapshot(&project, &snapshot_id)?;
     let progress = options.progress.as_deref().map(|f| f as &dyn Fn(_));
@@ -27,11 +28,16 @@ pub fn diff_checkpoint_with_options(
     let snapshot_map = snapshot
         .files
         .iter()
-        .map(|file| (file.path.clone(), file.content_hash().clone()))
+        .map(|file| {
+            (
+                file.path.clone(),
+                (file.content_hash().clone(), file.modified_at_utc.clone()),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let working_map = working
         .into_iter()
-        .map(|file| (file.path, file.hash))
+        .map(|file| (file.path, (file.hash, file.modified_at_utc)))
         .collect::<BTreeMap<_, _>>();
     let mut diff = compare_maps(&snapshot_map, &working_map);
     diff.warnings = warnings
@@ -55,6 +61,8 @@ pub fn diff_checkpoint_metadata_with_cancellation(
 ) -> Result<DiffResult> {
     crate::ensure_not_cancelled(cancellation)?;
     let project = load_project(project_path)?;
+    let _lock =
+        crate::acquire_project_repository_shared_lock(&project, "checkpoint-metadata-diff")?;
     let snapshot_id = SnapshotId::parse(checkpoint_id)?;
     let snapshot = load_project_snapshot(&project, &snapshot_id)?;
     let snapshot_map = snapshot

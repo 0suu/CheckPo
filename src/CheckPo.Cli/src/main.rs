@@ -77,6 +77,9 @@ enum CheckpointCommand {
         name: String,
         #[arg(long)]
         init_if_needed: bool,
+        /// Include detailed checkpoint creation timings in the result.
+        #[arg(long)]
+        timings: bool,
     },
     List {
         project_path: PathBuf,
@@ -169,6 +172,8 @@ enum StorageGcCommand {
     Apply {
         project_path: PathBuf,
         #[arg(long)]
+        expected_plan: PathBuf,
+        #[arg(long)]
         yes: bool,
     },
 }
@@ -192,9 +197,8 @@ enum TransactionsCommand {
 #[derive(Debug, Subcommand)]
 enum MaintenanceCommand {
     CleanupJournals {
-        project_path: PathBuf,
-        #[arg(long)]
-        yes: bool,
+        #[command(subcommand)]
+        command: CleanupJournalsCommand,
     },
     TempFiles {
         #[command(subcommand)]
@@ -203,12 +207,28 @@ enum MaintenanceCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum CleanupJournalsCommand {
+    Analyze {
+        project_path: PathBuf,
+    },
+    Apply {
+        project_path: PathBuf,
+        #[arg(long)]
+        expected_plan: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum TempFilesCommand {
     Analyze {
         project_path: PathBuf,
     },
-    Cleanup {
+    Apply {
         project_path: PathBuf,
+        #[arg(long)]
+        expected_plan: PathBuf,
         #[arg(long)]
         yes: bool,
     },
@@ -252,13 +272,16 @@ fn run() -> Result<u8, String> {
             })?;
         }
         Command::Status { project_path } => {
-            let context = core::load_project(&project_path).map_err(to_message)?;
+            let mut context = core::load_project(&project_path).map_err(to_message)?;
+            if context.location_status != core::ProjectLocationStatus::CopiedSuspected {
+                core::recover_checkpoint_deletions(&project_path).map_err(to_message)?;
+                context = core::load_project(&project_path).map_err(to_message)?;
+            }
             let project = core::project_view(&context).map_err(to_message)?;
             let pending_transactions =
-                core::pending_transactions_for_project(&context).map_err(to_message)?;
+                core::pending_transactions(&project_path).map_err(to_message)?;
             let unresolved_quarantines =
-                core::unresolved_transaction_quarantines_for_project(&context)
-                    .map_err(to_message)?;
+                core::unresolved_transaction_quarantines(&project_path).map_err(to_message)?;
             let mut warnings = Vec::new();
             let mut checkpoint_index =
                 core::checkpoint_index_status(&context).map_err(to_message)?;
@@ -332,23 +355,34 @@ fn run() -> Result<u8, String> {
                 project_path,
                 name,
                 init_if_needed,
+                timings,
             } => {
-                let summary = core::create_checkpoint(
-                    project_path,
-                    &name,
-                    core::CreateCheckpointOptions {
-                        init_if_needed,
-                        ..Default::default()
-                    },
-                )
-                .map_err(to_message)?;
-                print_or_json(cli.json, &summary, || {
-                    println!("Created checkpoint: {}", summary.checkpoint_id);
-                    println!("Files: {}", summary.file_count);
-                    for warning in &summary.warnings {
-                        println!("Warning: {warning}");
-                    }
-                })?;
+                let options = core::CreateCheckpointOptions {
+                    init_if_needed,
+                    ..Default::default()
+                };
+                if timings {
+                    let result = core::create_checkpoint_profiled(project_path, &name, options)
+                        .map_err(to_message)?;
+                    print_or_json(cli.json, &result, || {
+                        println!("Created checkpoint: {}", result.summary.checkpoint_id);
+                        println!("Files: {}", result.summary.file_count);
+                        print_checkpoint_create_metrics(&result.create_metrics);
+                        for warning in &result.summary.warnings {
+                            println!("Warning: {warning}");
+                        }
+                    })?;
+                } else {
+                    let summary = core::create_checkpoint(project_path, &name, options)
+                        .map_err(to_message)?;
+                    print_or_json(cli.json, &summary, || {
+                        println!("Created checkpoint: {}", summary.checkpoint_id);
+                        println!("Files: {}", summary.file_count);
+                        for warning in &summary.warnings {
+                            println!("Warning: {warning}");
+                        }
+                    })?;
+                }
             }
             CheckpointCommand::List { project_path } => {
                 let summaries = core::list_checkpoints(project_path).map_err(to_message)?;
@@ -527,18 +561,44 @@ fn run() -> Result<u8, String> {
                         println!("Objects: {}", plan.object_file_count);
                         println!("Referenced: {}", plan.referenced_blob_count);
                         println!("Unreferenced: {}", plan.unreferenced_blob_count);
-                        println!("Reclaimable bytes: {}", plan.unreferenced_logical_bytes);
+                        println!(
+                            "Unreferenced manifest chunks: {}",
+                            plan.unreferenced_manifest_chunk_count
+                        );
+                        println!(
+                            "Reclaimable object bytes: {}",
+                            plan.unreferenced_logical_bytes
+                        );
+                        println!(
+                            "Reclaimable manifest bytes: {}",
+                            plan.unreferenced_manifest_chunk_bytes
+                        );
+                        println!(
+                            "Reclaimable bytes: {}",
+                            plan.unreferenced_logical_bytes
+                                .saturating_add(plan.unreferenced_manifest_chunk_bytes)
+                        );
                     })?;
                     return Ok(if plan.has_integrity_problems { 1 } else { 0 });
                 }
-                StorageGcCommand::Apply { project_path, yes } => {
+                StorageGcCommand::Apply {
+                    project_path,
+                    expected_plan,
+                    yes,
+                } => {
                     if !yes {
                         return Err("storage gc apply requires --yes.".to_string());
                     }
-                    let result = core::apply_gc(project_path).map_err(to_message)?;
+                    let plan = read_storage_gc_plan(&expected_plan)?;
+                    let result = core::apply_gc_with_expected_plan(project_path, &plan.plan_id)
+                        .map_err(to_message)?;
                     print_or_json(cli.json, &result, || {
                         println!("GC applied.");
                         println!("Deleted objects: {}", result.deleted_blob_count);
+                        println!(
+                            "Deleted manifest chunks: {}",
+                            result.deleted_manifest_chunk_count
+                        );
                         println!("Deleted bytes: {}", result.deleted_bytes);
                     })?;
                 }
@@ -592,14 +652,37 @@ fn run() -> Result<u8, String> {
             }
         },
         Command::Maintenance { command } => match command {
-            MaintenanceCommand::CleanupJournals { project_path, yes } => {
-                let result = core::cleanup_journals(project_path, core::ApplyOptions { yes })
+            MaintenanceCommand::CleanupJournals { command } => match command {
+                CleanupJournalsCommand::Analyze { project_path } => {
+                    let plan =
+                        core::analyze_transaction_cleanup(project_path).map_err(to_message)?;
+                    print_or_json(cli.json, &plan, || {
+                        println!("Completed journals: {}", plan.directory_count);
+                        println!("Files: {}", plan.file_count);
+                        println!("Bytes: {}", plan.total_bytes);
+                    })?;
+                }
+                CleanupJournalsCommand::Apply {
+                    project_path,
+                    expected_plan,
+                    yes,
+                } => {
+                    if !yes {
+                        return Err("journal cleanup apply requires --yes.".to_string());
+                    }
+                    let plan = read_json_file::<core::TransactionCleanupPlan>(&expected_plan)?;
+                    let result = core::cleanup_journals_with_expected_plan(
+                        project_path,
+                        &plan,
+                        core::ApplyOptions { yes },
+                    )
                     .map_err(to_message)?;
-                print_or_json(cli.json, &result, || {
-                    println!("Deleted journals: {}", result.deleted_directory_count);
-                    println!("Deleted bytes: {}", result.deleted_bytes);
-                })?;
-            }
+                    print_or_json(cli.json, &result, || {
+                        println!("Deleted journals: {}", result.deleted_directory_count);
+                        println!("Deleted bytes: {}", result.deleted_bytes);
+                    })?;
+                }
+            },
             MaintenanceCommand::TempFiles { command } => match command {
                 TempFilesCommand::Analyze { project_path } => {
                     let plan = core::analyze_orphan_temp_files(project_path).map_err(to_message)?;
@@ -611,13 +694,21 @@ fn run() -> Result<u8, String> {
                         }
                     })?;
                 }
-                TempFilesCommand::Cleanup { project_path, yes } => {
+                TempFilesCommand::Apply {
+                    project_path,
+                    expected_plan,
+                    yes,
+                } => {
                     if !yes {
                         return Err("temporary file cleanup requires --yes.".to_string());
                     }
-                    let result =
-                        core::cleanup_orphan_temp_files(project_path, core::ApplyOptions { yes })
-                            .map_err(to_message)?;
+                    let plan = read_temp_file_cleanup_plan(&expected_plan)?;
+                    let result = core::cleanup_orphan_temp_files_with_expected_plan(
+                        project_path,
+                        &plan.plan_id,
+                        core::ApplyOptions { yes },
+                    )
+                    .map_err(to_message)?;
                     print_or_json(cli.json, &result, || {
                         println!("Deleted temporary files: {}", result.deleted_file_count);
                         println!("Deleted bytes: {}", result.deleted_bytes);
@@ -696,6 +787,48 @@ fn project_warning_text(warning: &core::ProjectWarning) -> String {
 }
 
 fn read_operation_plan(path: &PathBuf) -> Result<core::OperationPlan, String> {
+    read_json_file(path)
+}
+
+fn read_storage_gc_plan(path: &PathBuf) -> Result<core::StorageGcPlan, String> {
+    let plan = read_json_file::<core::StorageGcPlan>(path)?;
+    if plan.schema_version != core::STORAGE_GC_PLAN_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported storage GC plan schema version {}; expected {}",
+            plan.schema_version,
+            core::STORAGE_GC_PLAN_SCHEMA_VERSION
+        ));
+    }
+    validate_maintenance_plan_id(&plan.plan_id)?;
+    Ok(plan)
+}
+
+fn read_temp_file_cleanup_plan(path: &PathBuf) -> Result<core::TempFileCleanupPlan, String> {
+    let plan = read_json_file::<core::TempFileCleanupPlan>(path)?;
+    if plan.schema_version != core::TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported temporary file cleanup plan schema version {}; expected {}",
+            plan.schema_version,
+            core::TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION
+        ));
+    }
+    validate_maintenance_plan_id(&plan.plan_id)?;
+    Ok(plan)
+}
+
+fn validate_maintenance_plan_id(plan_id: &str) -> Result<(), String> {
+    if plan_id.len() == 64
+        && plan_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err("maintenance planId must be a 64 character lowercase hexadecimal value".to_string())
+    }
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("failed to read expected plan {}: {error}", path.display()))?;
     serde_json::from_str(&text)
@@ -704,6 +837,71 @@ fn read_operation_plan(path: &PathBuf) -> Result<core::OperationPlan, String> {
 
 fn to_message(error: core::CheckPoError) -> String {
     error.to_string()
+}
+
+fn print_checkpoint_create_metrics(metrics: &core::CheckpointCreateMetrics) {
+    let millis = |micros: u64| micros as f64 / 1_000.0;
+    println!("Timing total: {:.3} ms", millis(metrics.total_micros));
+    println!(
+        "Timing phases: setup {:.3} ms, baseline load {:.3} ms, object preload/integrity validation {:.3} ms, object store {:.3} ms (parallelism {}), object cache {:.3} ms, durability barrier {:.3} ms, final object readback {:.3} ms, snapshot root/journal/inventory/ref commit {:.3} ms, snapshot index {:.3} ms, fingerprints {:.3} ms, unattributed {:.3} ms",
+        millis(metrics.setup_micros),
+        millis(metrics.baseline_load_micros),
+        millis(metrics.object_preload_micros),
+        millis(metrics.object_store_micros),
+        metrics.object_store_parallelism,
+        millis(metrics.object_integrity_cache_update_micros),
+        millis(metrics.durability_barrier_micros),
+        millis(metrics.object_readback_micros),
+        millis(metrics.root_journal_ref_commit_micros),
+        millis(metrics.snapshot_index_update_micros),
+        millis(metrics.file_fingerprint_update_micros),
+        millis(metrics.unattributed_micros),
+    );
+    println!(
+        "Timing scan: {:.3} ms (enumerate {:.3}, fingerprint {:.3}, hash {:.3}, finalize {:.3}; hashed {} files / {} bytes, reused {} files / {} bytes)",
+        millis(metrics.scan_total_micros),
+        millis(metrics.scan.enumerate_micros),
+        millis(metrics.scan.fingerprint_assessment_micros),
+        millis(metrics.scan.hash_wall_micros),
+        millis(metrics.scan.finalize_micros),
+        metrics.scan.hashed_file_count,
+        metrics.scan.hashed_bytes,
+        metrics.scan.reused_file_count,
+        metrics.scan.reused_bytes,
+    );
+    println!(
+        "Timing manifest: build {:.3} ms, store {:.3} ms",
+        millis(metrics.manifest_build_micros),
+        millis(metrics.manifest_store_micros),
+    );
+    for (label, io) in [
+        ("loose objects", &metrics.io.loose_objects),
+        ("manifest chunks", &metrics.io.manifest_chunks),
+        ("snapshot root", &metrics.io.snapshot_root),
+    ] {
+        println!(
+            "Timing {label}: exists {:.3} ms, dir-prepare {:.3} ms, source-read {:.3} ms, hash {:.3} ms, write {:.3} ms, file-fsync {:.3} ms, publish {:.3} ms, dir-fsync {:.3} ms, existing-read+hash {:.3} ms, readback {:.3} ms; checked {}, existing {}, written {}, repaired {}, dirs-created {}, hash-ops {}, file-fsyncs {}, dir-fsyncs {}, readbacks {}",
+            millis(io.existence_check_micros),
+            millis(io.directory_prepare_micros),
+            millis(io.source_read_micros),
+            millis(io.hash_micros),
+            millis(io.write_micros),
+            millis(io.file_fsync_micros),
+            millis(io.publish_micros),
+            millis(io.directory_fsync_micros),
+            millis(io.existing_validation_read_micros),
+            millis(io.post_write_readback_micros),
+            io.checked_count,
+            io.existing_count,
+            io.written_count,
+            io.repaired_count,
+            io.directory_create_count,
+            io.hash_operation_count,
+            io.file_fsync_count,
+            io.directory_fsync_count,
+            io.post_write_readback_count,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -729,23 +927,149 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_journals_accepts_explicit_confirmation() {
+    fn cleanup_journals_analyze_parses_without_confirmation() {
         let cli = Cli::try_parse_from([
+            "checkpo",
+            "maintenance",
+            "cleanup-journals",
+            "analyze",
+            "project",
+        ])
+        .unwrap();
+
+        let Command::Maintenance {
+            command:
+                MaintenanceCommand::CleanupJournals {
+                    command: CleanupJournalsCommand::Analyze { .. },
+                },
+        } = cli.command
+        else {
+            panic!("expected cleanup-journals analyze command");
+        };
+    }
+
+    #[test]
+    fn cleanup_journals_apply_requires_expected_plan_and_confirmation() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "maintenance",
+            "cleanup-journals",
+            "apply",
+            "project",
+            "--expected-plan",
+            "cleanup-plan.json",
+            "--yes",
+        ])
+        .unwrap();
+
+        let Command::Maintenance {
+            command:
+                MaintenanceCommand::CleanupJournals {
+                    command:
+                        CleanupJournalsCommand::Apply {
+                            expected_plan, yes, ..
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("expected cleanup-journals apply command");
+        };
+        assert_eq!(expected_plan, PathBuf::from("cleanup-plan.json"));
+        assert!(yes);
+    }
+
+    #[test]
+    fn cleanup_journals_rejects_the_old_one_shot_syntax() {
+        assert!(Cli::try_parse_from([
             "checkpo",
             "maintenance",
             "cleanup-journals",
             "project",
             "--yes",
         ])
+        .is_err());
+    }
+
+    #[test]
+    fn storage_gc_apply_requires_expected_plan_and_confirmation() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "storage",
+            "gc",
+            "apply",
+            "project",
+            "--expected-plan",
+            "gc-plan.json",
+            "--yes",
+        ])
+        .unwrap();
+
+        let Command::Storage {
+            command:
+                StorageCommand::Gc {
+                    command:
+                        StorageGcCommand::Apply {
+                            expected_plan, yes, ..
+                        },
+                },
+        } = cli.command
+        else {
+            panic!("expected storage gc apply command");
+        };
+        assert_eq!(expected_plan, PathBuf::from("gc-plan.json"));
+        assert!(yes);
+
+        assert!(
+            Cli::try_parse_from(["checkpo", "storage", "gc", "apply", "project", "--yes"]).is_err()
+        );
+    }
+
+    #[test]
+    fn temporary_file_apply_requires_expected_plan_and_rejects_cleanup_verb() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "maintenance",
+            "temp-files",
+            "apply",
+            "project",
+            "--expected-plan",
+            "temp-plan.json",
+            "--yes",
+        ])
         .unwrap();
 
         let Command::Maintenance {
-            command: MaintenanceCommand::CleanupJournals { yes, .. },
+            command:
+                MaintenanceCommand::TempFiles {
+                    command:
+                        TempFilesCommand::Apply {
+                            expected_plan, yes, ..
+                        },
+                },
         } = cli.command
         else {
-            panic!("expected cleanup-journals command");
+            panic!("expected temporary file apply command");
         };
+        assert_eq!(expected_plan, PathBuf::from("temp-plan.json"));
         assert!(yes);
+
+        assert!(Cli::try_parse_from([
+            "checkpo",
+            "maintenance",
+            "temp-files",
+            "cleanup",
+            "project",
+            "--yes",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn maintenance_plan_id_requires_lowercase_blake3_shape() {
+        assert!(validate_maintenance_plan_id(&"a".repeat(64)).is_ok());
+        assert!(validate_maintenance_plan_id(&"A".repeat(64)).is_err());
+        assert!(validate_maintenance_plan_id(&"a".repeat(63)).is_err());
+        assert!(validate_maintenance_plan_id(&"g".repeat(64)).is_err());
     }
 
     #[test]

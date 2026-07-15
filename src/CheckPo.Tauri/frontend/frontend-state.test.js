@@ -4,19 +4,47 @@ const {
   buildChangeTreeModel,
   cancelAndWaitForIdle,
   checkpointIndexPresentation,
+  checkpointNavigationIndex,
+  checkpointSearchText,
   collectChangeTreeFolderPaths,
+  diffChangeCount,
+  diffResultIsComplete,
+  diffResultIsProvisionalZero,
+  detectedDiffCountText,
   flattenChangeTreeRows,
+  filterCheckpoints,
+  gcPlanPresentation,
+  isCancellationKind,
+  latestDiffState,
+  latestDiffCountText,
   localizedErrorDisplay,
   mergeDiffRefreshOptions,
+  normalizedPathInput,
+  operationProgressPercent,
   projectChanged,
   projectScopedStateReset,
+  pathConfirmationPreview,
+  progressPhaseCanCancel,
   removeProjectFromHistory,
   restorableLastProjectPath,
   retainPendingTransactionFailures,
   retainVisibleChangeSelection,
+  restorePlanHasChanges,
+  restorePlanCanApply,
+  samePathInput,
   selectChangePaths,
+  storageSummaryWithRetainedSize,
+  transactionCleanupPlanHasCandidates,
   virtualTreeWindowRange,
+  visibleProgressPhase,
+  warningBannerText,
 } = require("./frontend-state.js");
+
+test("zero-change restore remains available to resolve an unresolved quarantine", () => {
+  const zeroPlan = { hasChanges: false };
+  assert.equal(restorePlanCanApply(zeroPlan, 0), false);
+  assert.equal(restorePlanCanApply(zeroPlan, 1), true);
+});
 
 test("project identity changes when either id or path changes", () => {
   const project = { projectId: "project-a", projectRootPath: "C:/avatar" };
@@ -33,15 +61,207 @@ test("project-scoped reset does not share mutable selection state", () => {
   assert.deepEqual([...second.currentDiffSelectedPaths], []);
   assert.deepEqual([...second.diffTreeOpenPaths], []);
   assert.equal(first.currentDiff, null);
+  assert.equal(first.latestDiffCheckpointId, null);
+  assert.equal(first.latestDiffChangeCount, null);
+  assert.equal(first.latestDiffRefreshFailure, null);
+  assert.deepEqual(first.latestDiffWarnings, []);
   assert.equal(first.rollbackPlan, null);
   assert.equal(first.gcPlan, null);
   assert.equal(first.tempCleanupPlan, null);
+  assert.equal(first.transactionCleanupPlan, null);
   assert.deepEqual(first.pendingTransactions, []);
   assert.deepEqual(first.unresolvedQuarantines, []);
   assert.deepEqual(first.failedTransactions, []);
   assert.equal(first.currentDiffFilter, "all");
   assert.equal(first.selectedCheckpointId, null);
   assert.equal(first.checkpointIndex.state, "current");
+  assert.deepEqual(first.snapshotWarnings, []);
+  assert.deepEqual(first.operationWarnings, []);
+  assert.equal(first.diffRefreshFailure, null);
+});
+
+test("stale or warned diffs cannot drive destructive file operations", () => {
+  const complete = { added: ["Assets/A.asset"], warnings: [] };
+  assert.equal(diffResultIsComplete(complete, null), true);
+  assert.equal(diffResultIsComplete({ ...complete, warnings: ["scan failed"] }, null), false);
+  assert.equal(diffResultIsComplete(complete, "refresh failed"), false);
+  assert.equal(diffResultIsComplete(null, null), false);
+});
+
+test("warning banner output is deduplicated and bounded", () => {
+  const result = warningBannerText([
+    ["one", "two", "one"],
+    ["three", "four"],
+  ], 2);
+  assert.equal(result.count, 4);
+  assert.equal(result.text, "one / two / 他 2 件");
+});
+
+test("GC presentation includes manifest-only reclaimable data", () => {
+  const result = gcPlanPresentation({
+    unreferencedBlobCount: 0,
+    unreferencedLogicalBytes: 0,
+    unreferencedManifestChunkCount: 1,
+    unreferencedManifestChunkBytes: 4096,
+  });
+  assert.deepEqual(result, {
+    objectCount: 0,
+    objectBytes: 0,
+    manifestChunkCount: 1,
+    manifestChunkBytes: 4096,
+    totalCount: 1,
+    totalBytes: 4096,
+  });
+});
+
+test("diff counts and cancellation outcomes are classified explicitly", () => {
+  assert.equal(diffChangeCount({
+    added: ["A"],
+    modified: ["B", "C"],
+    deleted: ["D"],
+  }), 4);
+  assert.equal(diffChangeCount(null), 0);
+  assert.equal(isCancellationKind("cancelled"), true);
+  assert.equal(isCancellationKind("io"), false);
+});
+
+test("storage input comparison trims whitespace and trailing separators only", () => {
+  assert.equal(normalizedPathInput(" /Volumes/Data/// "), "/Volumes/Data");
+  assert.equal(samePathInput("/Volumes/Data/", "/Volumes/Data"), true);
+  assert.equal(samePathInput("/Volumes/Data", "/volumes/data"), false);
+  assert.equal(samePathInput("", ""), false);
+});
+
+test("checkpoint search is case-insensitive and preserves matching object identity", () => {
+  const checkpoints = Array.from({ length: 10_000 }, (_, index) => ({
+    checkpointId: `checkpoint-${index}`,
+    name: index === 9_999 ? "Milestone Final" : `checkpoint ${index}`,
+    createdAtUtc: "2026-07-14T00:00:00Z",
+  }));
+  const result = filterCheckpoints(checkpoints, "  MILESTONE final ");
+  assert.deepEqual(result, [checkpoints[9_999]]);
+  assert.equal(result[0], checkpoints[9_999]);
+  assert.equal(filterCheckpoints(checkpoints, "").length, 10_000);
+  assert.match(checkpointSearchText(checkpoints[9_999]), /milestone final/);
+});
+
+test("cleanup and restore plans require real targets", () => {
+  assert.equal(transactionCleanupPlanHasCandidates({
+    directoryCount: 1,
+    candidates: [{ transactionId: "tx" }],
+  }), true);
+  assert.equal(transactionCleanupPlanHasCandidates({ directoryCount: 0, candidates: [] }), false);
+  assert.equal(restorePlanHasChanges({
+    hasChanges: true,
+    restoreCount: 0,
+    replaceCount: 0,
+    deleteCount: 0,
+    metadataCount: 0,
+  }), false);
+  assert.equal(restorePlanHasChanges({ hasChanges: true, restoreCount: 1 }), true);
+  assert.equal(restorePlanHasChanges({ hasChanges: true, metadataCount: 1 }), true);
+  assert.equal(restorePlanHasChanges({
+    hasChanges: true,
+    directoriesToRemove: ["Assets/EmptyFolder"],
+  }), true);
+});
+
+test("large path confirmations do not include every path", () => {
+  const paths = Array.from({ length: 5000 }, (_, index) => `Assets/Folder/File${index}.asset`);
+  const preview = pathConfirmationPreview(paths, 20);
+  assert.equal(preview.total, 5000);
+  assert.equal(preview.omitted, 4980);
+  assert.match(preview.text, /他 4980 件/);
+  assert.ok(preview.text.length < 1000);
+  assert.doesNotMatch(preview.text, /File4999/);
+});
+
+test("backend completion stays distinct from whole UI completion", () => {
+  assert.equal(visibleProgressPhase("complete"), "backendComplete");
+  assert.equal(visibleProgressPhase("complete", true), "uiComplete");
+  assert.equal(visibleProgressPhase("scan"), "scan");
+});
+
+test("checkpoint progress is monotonic and reaches 100 only after UI completion", () => {
+  const phases = [
+    ["scan", 25],
+    ["storeCheckpoint", 70],
+    ["writeCheckpointMetadata", 75],
+    ["syncCheckpoint", 85],
+    ["readbackCheckpoint", 95],
+    ["commitCheckpoint", 99],
+  ];
+  let previous = -1;
+  for (const [phase, expectedEnd] of phases) {
+    const start = operationProgressPercent("create_checkpoint", { phase, completed: 0, total: 10 });
+    const end = operationProgressPercent("create_checkpoint", { phase, completed: 10, total: 10 });
+    assert.ok(start >= previous, `${phase} must not move progress backwards`);
+    assert.equal(end, expectedEnd);
+    previous = end;
+  }
+  assert.equal(operationProgressPercent("create_checkpoint", {
+    phase: "complete",
+    completed: 1,
+    total: 1,
+  }), 99);
+  assert.equal(operationProgressPercent("create_checkpoint", {
+    phase: "commitCheckpoint",
+    completed: 1,
+    total: 1,
+  }, true), 100);
+  assert.equal(operationProgressPercent("verify_project", {
+    phase: "verifyObjects",
+    completed: 10,
+    total: 10,
+  }), 99);
+  assert.equal(operationProgressPercent("create_checkpoint", {
+    phase: "readbackCheckpoint",
+    completed: 0,
+    total: 0,
+  }), 95);
+});
+
+test("initial project checkpoint commands use the monotonic checkpoint phase ranges", () => {
+  for (const command of ["init_project", "start_as_separate_project"]) {
+    assert.equal(operationProgressPercent(command, {
+      phase: "scan",
+      completed: 10,
+      total: 10,
+    }), 25);
+    assert.equal(operationProgressPercent(command, {
+      phase: "storeCheckpoint",
+      completed: 0,
+      total: 10,
+    }), 25);
+    assert.equal(operationProgressPercent(command, {
+      phase: "commitCheckpoint",
+      completed: 10,
+      total: 10,
+    }), 99);
+    assert.equal(operationProgressPercent(command, {
+      phase: "complete",
+      completed: 1,
+      total: 1,
+    }), 99);
+  }
+});
+
+test("virtual checkpoint history supports logical keyboard navigation", () => {
+  assert.equal(checkpointNavigationIndex(1000, -1, "ArrowDown"), 0);
+  assert.equal(checkpointNavigationIndex(1000, -1, "ArrowUp"), 999);
+  assert.equal(checkpointNavigationIndex(1000, 499, "Home"), 0);
+  assert.equal(checkpointNavigationIndex(1000, 499, "End"), 999);
+  assert.equal(checkpointNavigationIndex(1000, 499, "PageDown", 20), 519);
+  assert.equal(checkpointNavigationIndex(1000, 499, "PageUp", 20), 479);
+  assert.equal(checkpointNavigationIndex(0, -1, "ArrowDown"), -1);
+});
+
+test("checkpoint commit and mutation phases cannot be cancelled", () => {
+  assert.equal(progressPhaseCanCancel("readbackCheckpoint"), true);
+  assert.equal(progressPhaseCanCancel("commitCheckpoint"), false);
+  assert.equal(progressPhaseCanCancel("backingUp"), false);
+  assert.equal(progressPhaseCanCancel("scan", true), true);
+  assert.equal(progressPhaseCanCancel("planning", true), false);
 });
 
 test("checkpoint index states distinguish unavailable history from an empty history", () => {
@@ -63,6 +283,18 @@ test("checkpoint index states distinguish unavailable history from an empty hist
   assert.match(corrupt.message, /読み込めません/);
 });
 
+test("missing checkpoint index can render without dereferencing a null storage summary", () => {
+  assert.equal(storageSummaryWithRetainedSize(null, 2048), null);
+  assert.deepEqual(
+    storageSummaryWithRetainedSize({ checkpointCount: 3, storedSizeBytes: null }, 2048),
+    { checkpointCount: 3, storedSizeBytes: 2048 },
+  );
+  assert.deepEqual(
+    storageSummaryWithRetainedSize({ checkpointCount: 3, storedSizeBytes: 1024 }, 2048),
+    { checkpointCount: 3, storedSizeBytes: 1024 },
+  );
+});
+
 test("known backend errors use actionable Japanese text and preserve raw detail", () => {
   const display = localizedErrorDisplay(
     "unsupportedFormat",
@@ -72,6 +304,15 @@ test("known backend errors use actionable Japanese text and preserve raw detail"
   assert.match(display.message, /CheckPoを更新/);
   assert.match(display.detail, /snapshot schema/);
   assert.equal(display.kind, "unsupportedFormat");
+});
+
+test("folder metadata rejection has a specific user-facing error", () => {
+  const display = localizedErrorDisplay(
+    "unsafeFolderMetaOperation",
+    "folder metadata cannot be changed independently: Assets/Folder.meta",
+  );
+  assert.match(display.message, /\.meta だけを戻すことはできません/);
+  assert.match(display.detail, /Assets\/Folder\.meta/);
 });
 
 test("unknown errors keep their original message", () => {
@@ -196,6 +437,61 @@ test("queued diff refresh never weakens an exact request to metadata-only", () =
   assert.equal(queued.refreshProject, true);
   assert.equal(queued.metadataOnly, false);
   assert.equal(queued.silent, false);
+});
+
+test("metadata-only zero diff remains unknown instead of claiming exact zero", () => {
+  assert.deepEqual(latestDiffState({
+    added: [],
+    modified: [],
+    deleted: [],
+    warnings: [],
+  }, false), {
+    warnings: [],
+    exact: false,
+    changeCount: null,
+  });
+});
+
+test("metadata-only zero diff is presented as provisional", () => {
+  const diff = {
+    added: [], modified: [], deleted: [], warnings: [], exact: false,
+  };
+  assert.equal(diffResultIsProvisionalZero(diff), true);
+  assert.equal(diffResultIsProvisionalZero({ ...diff, exact: true }), false);
+  assert.equal(diffResultIsProvisionalZero({
+    ...diff, added: ["Assets/New.asset"],
+  }), false);
+  assert.equal(diffResultIsProvisionalZero({
+    ...diff, exact: true, warnings: ["Assets/Unreadable.asset"],
+  }), true);
+});
+
+test("exact zero diff and visible metadata changes keep useful counts", () => {
+  assert.equal(latestDiffState({
+    added: [], modified: [], deleted: [], warnings: [],
+  }, true).changeCount, 0);
+  assert.equal(latestDiffState({
+    added: ["Assets/New.asset"], modified: [], deleted: [], warnings: [],
+  }, false).changeCount, 1);
+  assert.equal(latestDiffCountText(0, true), "0");
+  assert.equal(latestDiffCountText(0, false), "…");
+  assert.equal(latestDiffCountText(1, false), "1+");
+  assert.equal(detectedDiffCountText(2), "2");
+  assert.equal(detectedDiffCountText(2, "+"), "2+");
+  assert.equal(detectedDiffCountText(2, "?"), "2?");
+});
+
+test("diff warnings make the latest change count unknown", () => {
+  assert.deepEqual(latestDiffState({
+    added: ["Assets/New.asset"],
+    modified: [],
+    deleted: [],
+    warnings: ["Assets/Unreadable.asset"],
+  }, true), {
+    warnings: ["Assets/Unreadable.asset"],
+    exact: false,
+    changeCount: null,
+  });
 });
 
 test("queued metadata refresh stays metadata-only only when every request is metadata-only", () => {

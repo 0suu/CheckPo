@@ -7,6 +7,8 @@ const immediatelyCancellableCommands = new Set([
   "apply_discard_files",
   "verify_project",
   "rebuild_index",
+  "analyze_gc",
+  "apply_gc",
 ]);
 
 const progressCancellableStartCommands = new Set([

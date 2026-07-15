@@ -1,4 +1,107 @@
+// DirectorySyncBatch remains as coverage for the legacy path-based atomic
+// move helpers. Production repository publication uses held parent handles.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use super::*;
+use std::collections::BTreeSet;
+
+/// Collects directory-entry mutations that must become durable before a
+/// checkpoint root is published. Files are individually synced before they are
+/// added to this batch; flushing it is therefore the publish barrier for those
+/// already-synced files.
+pub(crate) struct DirectorySyncBatch {
+    trusted_root: PathBuf,
+    directories: BTreeSet<PathBuf>,
+}
+
+impl DirectorySyncBatch {
+    pub(crate) fn new(trusted_root: &Path) -> Result<Self> {
+        ensure_regular_directory_no_follow(trusted_root)?;
+        Ok(Self {
+            trusted_root: trusted_root.to_path_buf(),
+            directories: BTreeSet::new(),
+        })
+    }
+
+    pub(crate) fn record_parent(&mut self, path: &Path) -> Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            CheckPoError::Unexpected(format!("path has no parent directory: {}", path.display()))
+        })?;
+        self.record_directory(parent)
+    }
+
+    pub(crate) fn record_directory(&mut self, directory: &Path) -> Result<()> {
+        if !directory.starts_with(&self.trusted_root) {
+            return Err(CheckPoError::Unexpected(format!(
+                "directory sync is outside trusted root {}: {}",
+                self.trusted_root.display(),
+                directory.display()
+            )));
+        }
+        self.directories.insert(directory.to_path_buf());
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn merge(&mut self, other: Self) -> Result<()> {
+        if self.trusted_root != other.trusted_root {
+            return Err(CheckPoError::Unexpected(format!(
+                "cannot merge directory sync batches for different roots: {} and {}",
+                self.trusted_root.display(),
+                other.trusted_root.display()
+            )));
+        }
+        self.directories.extend(other.directories);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush(
+        &mut self,
+        recorder: Option<&crate::checkpoint_metrics::ArtifactIoRecorder>,
+    ) -> Result<()> {
+        self.flush_with_progress(recorder, |_, _| Ok(()))
+    }
+
+    pub(crate) fn flush_with_progress(
+        &mut self,
+        recorder: Option<&crate::checkpoint_metrics::ArtifactIoRecorder>,
+        mut progress: impl FnMut(usize, usize) -> Result<()>,
+    ) -> Result<()> {
+        // Children must be made durable before the directory entry that makes
+        // the child reachable. Sorting deepest-first preserves that ordering.
+        let mut directories = std::mem::take(&mut self.directories)
+            .into_iter()
+            .collect::<Vec<_>>();
+        directories.sort_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| left.cmp(right))
+        });
+        let total = directories.len();
+        for (index, directory) in directories.into_iter().enumerate() {
+            ensure_regular_directory_no_follow(&directory)?;
+            match recorder {
+                Some(recorder) => recorder.measure(
+                    crate::checkpoint_metrics::IoTimingKind::DirectoryFsync,
+                    || sync_directory(&directory),
+                )?,
+                None => sync_directory(&directory)?,
+            }
+            if let Some(recorder) = recorder {
+                recorder.directory_fsync();
+            }
+            progress(index + 1, total)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.directories.len()
+    }
+}
 
 pub(crate) fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
@@ -39,6 +142,14 @@ pub(crate) fn ensure_regular_file_no_follow(path: &Path) -> Result<fs::Metadata>
 }
 
 pub(crate) fn create_dir_all_no_follow(base: &Path, target: &Path) -> Result<()> {
+    create_dir_all_no_follow_profiled(base, target, None)
+}
+
+pub(crate) fn create_dir_all_no_follow_profiled(
+    base: &Path,
+    target: &Path,
+    recorder: Option<&crate::checkpoint_metrics::ArtifactIoRecorder>,
+) -> Result<()> {
     let relative = target.strip_prefix(base).map_err(|_| {
         CheckPoError::Unexpected(format!(
             "directory is outside trusted base {}: {}",
@@ -46,7 +157,7 @@ pub(crate) fn create_dir_all_no_follow(base: &Path, target: &Path) -> Result<()>
             target.display()
         ))
     })?;
-    ensure_regular_directory_no_follow(base)?;
+    measure_directory_prepare(recorder, || ensure_regular_directory_no_follow(base))?;
     let mut current = base.to_path_buf();
     for component in relative.components() {
         let Component::Normal(component) = component else {
@@ -56,7 +167,7 @@ pub(crate) fn create_dir_all_no_follow(base: &Path, target: &Path) -> Result<()>
             )));
         };
         current.push(component);
-        match fs::symlink_metadata(&current) {
+        match measure_directory_prepare(recorder, || fs::symlink_metadata(&current)) {
             Ok(metadata) if metadata.is_dir() && !metadata_is_link_or_reparse(&metadata) => {}
             Ok(_) => {
                 return Err(CheckPoError::Corruption(format!(
@@ -65,10 +176,26 @@ pub(crate) fn create_dir_all_no_follow(base: &Path, target: &Path) -> Result<()>
                 )))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&current) {
-                    Ok(()) => sync_parent_dir(&current)?,
+                match measure_directory_prepare(recorder, || fs::create_dir(&current)) {
+                    Ok(()) => {
+                        if let Some(recorder) = recorder {
+                            recorder.directory_created();
+                        }
+                        match recorder {
+                            Some(recorder) => recorder.measure(
+                                crate::checkpoint_metrics::IoTimingKind::DirectoryFsync,
+                                || sync_parent_dir(&current),
+                            )?,
+                            None => sync_parent_dir(&current)?,
+                        }
+                        if let Some(recorder) = recorder {
+                            recorder.directory_fsync();
+                        }
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        ensure_regular_directory_no_follow(&current)?;
+                        measure_directory_prepare(recorder, || {
+                            ensure_regular_directory_no_follow(&current)
+                        })?;
                     }
                     Err(error) => return Err(io_error(&current, error)),
                 }
@@ -77,6 +204,73 @@ pub(crate) fn create_dir_all_no_follow(base: &Path, target: &Path) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn create_dir_all_no_follow_batched(
+    base: &Path,
+    target: &Path,
+    recorder: Option<&crate::checkpoint_metrics::ArtifactIoRecorder>,
+    sync_batch: &mut DirectorySyncBatch,
+) -> Result<()> {
+    let relative = target.strip_prefix(base).map_err(|_| {
+        CheckPoError::Unexpected(format!(
+            "directory is outside trusted base {}: {}",
+            base.display(),
+            target.display()
+        ))
+    })?;
+    measure_directory_prepare(recorder, || ensure_regular_directory_no_follow(base))?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(CheckPoError::Corruption(format!(
+                "unsafe directory component in {}",
+                target.display()
+            )));
+        };
+        current.push(component);
+        match measure_directory_prepare(recorder, || fs::symlink_metadata(&current)) {
+            Ok(metadata) if metadata.is_dir() && !metadata_is_link_or_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(CheckPoError::Corruption(format!(
+                    "unsafe directory path: {}",
+                    current.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match measure_directory_prepare(recorder, || fs::create_dir(&current)) {
+                    Ok(()) => {
+                        if let Some(recorder) = recorder {
+                            recorder.directory_created();
+                        }
+                        sync_batch.record_parent(&current)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        measure_directory_prepare(recorder, || {
+                            ensure_regular_directory_no_follow(&current)
+                        })?;
+                    }
+                    Err(error) => return Err(io_error(&current, error)),
+                }
+            }
+            Err(error) => return Err(io_error(&current, error)),
+        }
+    }
+    Ok(())
+}
+
+fn measure_directory_prepare<T>(
+    recorder: Option<&crate::checkpoint_metrics::ArtifactIoRecorder>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    match recorder {
+        Some(recorder) => recorder.measure(
+            crate::checkpoint_metrics::IoTimingKind::DirectoryPrepare,
+            operation,
+        ),
+        None => operation(),
+    }
 }
 
 #[cfg(windows)]
@@ -189,10 +383,22 @@ pub(crate) fn validate_repository_layout_no_follow(repo_root: &Path) -> Result<(
     for relative in [
         "refs",
         "snapshots",
+        "snapshots/v2",
+        "inventory",
+        "inventory/snapshots",
+        "inventory/snapshots/states",
+        "inventory/snapshots/sets",
+        "inventory/snapshots/sets/roots",
+        "inventory/snapshots/sets/leaves",
+        "manifests",
+        "manifests/v2",
+        "manifests/v2/nodes",
+        "manifests/v2/leaves",
         "objects",
         "objects/loose",
         "indexes",
         "journals",
+        "journals/transactions",
         "tmp",
         "locks",
     ] {
@@ -216,6 +422,57 @@ pub(crate) fn validate_repository_layout_no_follow(repo_root: &Path) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn profiled_directory_creation_separates_prepare_and_fsync() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let recorder = crate::checkpoint_metrics::ArtifactIoRecorder::default();
+
+        create_dir_all_no_follow_profiled(&base, &base.join("first/second"), Some(&recorder))
+            .unwrap();
+
+        let metrics = recorder.snapshot();
+        assert_eq!(metrics.directory_create_count, 2);
+        assert_eq!(metrics.directory_fsync_count, 2);
+        assert_eq!(metrics.existence_check_micros, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batched_directory_creation_syncs_each_mutated_parent_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        fs::create_dir(&base).unwrap();
+        let recorder = crate::checkpoint_metrics::ArtifactIoRecorder::default();
+        let mut batch = DirectorySyncBatch::new(&base).unwrap();
+
+        create_dir_all_no_follow_batched(
+            &base,
+            &base.join("first/second"),
+            Some(&recorder),
+            &mut batch,
+        )
+        .unwrap();
+        create_dir_all_no_follow_batched(
+            &base,
+            &base.join("first/third"),
+            Some(&recorder),
+            &mut batch,
+        )
+        .unwrap();
+
+        assert_eq!(batch.pending_count(), 2);
+        assert_eq!(recorder.snapshot().directory_fsync_count, 0);
+        batch.flush(Some(&recorder)).unwrap();
+
+        let metrics = recorder.snapshot();
+        assert_eq!(metrics.directory_create_count, 3);
+        assert_eq!(metrics.directory_fsync_count, 2);
+        assert_eq!(batch.pending_count(), 0);
+    }
 
     #[cfg(unix)]
     #[test]

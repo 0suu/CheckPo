@@ -1,3 +1,102 @@
+const MODAL_OVERLAY_SELECTOR = [
+  ".settings-overlay",
+  ".advanced-overlay",
+  ".project-registration-overlay",
+  ".project-selection-overlay",
+  ".rollback-overlay",
+  ".confirm-overlay",
+  ".error-overlay",
+  ".busy-overlay",
+].join(",");
+
+const MODAL_CLOSE_BUTTON_IDS = Object.freeze({
+  settingsOverlay: "closeSettingsButton",
+  advancedOverlay: "closeAdvancedButton",
+  projectRegistrationOverlay: "closeProjectRegistrationButton",
+  projectSelectionOverlay: "closeProjectSelectionButton",
+  rollbackOverlay: "closeRollbackDialogButton",
+  errorOverlay: "dismissErrorDialogButton",
+});
+
+const MODAL_FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "a[href]",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function setupModalAccessibility() {
+  let activeOverlay = null;
+  let returnFocus = null;
+
+  const visibleOverlays = () => Array.from(document.querySelectorAll(MODAL_OVERLAY_SELECTOR))
+    .filter((overlay) => !overlay.hidden);
+  const update = () => {
+    const overlays = visibleOverlays();
+    const nextOverlay = overlays.find((overlay) => overlay.id === "errorOverlay")
+      || overlays.find((overlay) => overlay.id === "confirmOverlay")
+      || overlays.at(-1)
+      || null;
+    const overlayChanged = activeOverlay !== nextOverlay;
+    if (!activeOverlay && nextOverlay) returnFocus = document.activeElement;
+    for (const child of document.body.children) {
+      if (child.tagName === "SCRIPT") continue;
+      const blocked = Boolean(nextOverlay) && child !== nextOverlay;
+      child.inert = blocked;
+      if (blocked) child.setAttribute("aria-hidden", "true");
+      else child.removeAttribute("aria-hidden");
+    }
+    activeOverlay = nextOverlay;
+    if (overlayChanged && activeOverlay && !activeOverlay.contains(document.activeElement)) {
+      const first = activeOverlay.querySelector(MODAL_FOCUSABLE_SELECTOR);
+      if (first) queueMicrotask(() => first.focus());
+    }
+    if (!activeOverlay && returnFocus?.isConnected) {
+      returnFocus.focus();
+      returnFocus = null;
+    }
+  };
+
+  const observer = new MutationObserver(update);
+  for (const overlay of document.querySelectorAll(MODAL_OVERLAY_SELECTOR)) {
+    observer.observe(overlay, { attributes: true, attributeFilter: ["hidden"] });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && activeOverlay) {
+      const closeButtonId = MODAL_CLOSE_BUTTON_IDS[activeOverlay.id];
+      if (closeButtonId) {
+        event.preventDefault();
+        $(closeButtonId)?.click();
+        return;
+      }
+    }
+    if (event.key !== "Tab" || !activeOverlay) return;
+    const focusable = Array.from(activeOverlay.querySelectorAll(MODAL_FOCUSABLE_SELECTOR))
+      .filter((element) => !element.hidden && element.getClientRects().length > 0);
+    if (!focusable.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    } else if (!activeOverlay.contains(document.activeElement)) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  update();
+}
+
+window.addEventListener("DOMContentLoaded", setupModalAccessibility);
+
 function confirmAction(message, okLabel = "戻す", options = {}) {
   return new Promise((resolve) => {
     const overlay = $("confirmOverlay");
@@ -12,6 +111,8 @@ function confirmAction(message, okLabel = "戻す", options = {}) {
       resetInitialCheckpointChoice("confirmInitialCheckpoint");
     }
     overlay.hidden = false;
+    okButton.disabled = false;
+    cancelButton.disabled = false;
 
     const finish = (value) => {
       overlay.hidden = true;
@@ -54,6 +155,8 @@ function chooseCopiedProjectAction(message) {
     initialCheckpointChoice.hidden = false;
     resetInitialCheckpointChoice("confirmInitialCheckpoint");
     overlay.hidden = false;
+    okButton.disabled = false;
+    cancelButton.disabled = false;
 
     const finish = (value) => {
       overlay.hidden = true;

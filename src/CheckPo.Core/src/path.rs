@@ -115,6 +115,14 @@ impl SnapshotId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_digest_bytes(bytes: [u8; 32]) -> Self {
+        Self(encode_lower_hex(&bytes))
+    }
+
+    pub(crate) fn digest_bytes(&self) -> [u8; 32] {
+        decode_lower_hex(self.as_str()).expect("SnapshotId is validated at construction")
+    }
 }
 
 impl<'de> Deserialize<'de> for SnapshotId {
@@ -146,6 +154,14 @@ impl ObjectId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_digest_bytes(bytes: [u8; 32]) -> Self {
+        Self(encode_lower_hex(&bytes))
+    }
+
+    pub(crate) fn digest_bytes(&self) -> [u8; 32] {
+        decode_lower_hex(self.as_str()).expect("ObjectId is validated at construction")
+    }
 }
 
 impl ProjectId {
@@ -156,6 +172,14 @@ impl ProjectId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn uuid_bytes(&self) -> [u8; 16] {
+        decode_lower_hex(self.as_str()).expect("ProjectId is validated at construction")
+    }
+
+    pub(crate) fn from_uuid_bytes(bytes: [u8; 16]) -> Self {
+        Self(encode_lower_hex(&bytes))
     }
 }
 
@@ -248,6 +272,35 @@ pub fn validate_project_id(input: &str) -> Result<()> {
     Ok(())
 }
 
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_lower_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
 pub fn relative_path_from_project(project_root: &Path, full_path: &Path) -> Result<String> {
     let relative = full_path
         .strip_prefix(project_root)
@@ -287,17 +340,14 @@ pub(crate) fn is_checkpo_atomic_materialization_temporary_file(path: &Path) -> b
 }
 
 fn is_checkpo_owned_temporary_file_name(name: &str) -> bool {
-    if !name.starts_with('.') || !name.ends_with(".tmp") {
-        return false;
-    }
-    let body = &name[1..name.len() - ".tmp".len()];
-    if let Some(body) = body.strip_prefix("checkpo-") {
-        if is_lowercase_hex_uuid(body) {
-            return true;
-        }
-        return has_generated_suffix(body, '-');
-    }
-    has_generated_suffix(body, '.')
+    is_checkpo_atomic_materialization_temporary_file_name(name)
+        || name
+            .strip_prefix(".checkpo-r-")
+            .and_then(|body| body.strip_suffix(".tmp"))
+            .and_then(|body| body.split_once('-'))
+            .is_some_and(|(digest, transaction_id)| {
+                is_lowercase_hex(digest, 16) && is_lowercase_hex_uuid(transaction_id)
+            })
 }
 
 fn is_checkpo_atomic_materialization_temporary_file_name(name: &str) -> bool {
@@ -307,17 +357,14 @@ fn is_checkpo_atomic_materialization_temporary_file_name(name: &str) -> bool {
 }
 
 fn is_lowercase_hex_uuid(value: &str) -> bool {
-    value.len() == 32
+    is_lowercase_hex(value, 32)
+}
+
+fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-fn has_generated_suffix(body: &str, separator: char) -> bool {
-    let Some((prefix, suffix)) = body.rsplit_once(separator) else {
-        return false;
-    };
-    !prefix.is_empty() && is_lowercase_hex_uuid(suffix)
 }
 
 fn invalid_path(input: &str, reason: &str) -> CheckPoError {
@@ -375,6 +422,29 @@ mod tests {
                 !is_checkpo_atomic_materialization_temporary_file(Path::new(path)),
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn owned_temporary_file_name_is_limited_to_generated_formats() {
+        for path in [
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdef-0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            assert!(is_checkpo_owned_temporary_file(Path::new(path)), "{path}");
+        }
+
+        for path in [
+            "Assets/.Foo.prefab.0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-Foo.prefab-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-anything-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcde-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdef0-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdeF-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdef-0123456789abcdef0123456789abcdeF.tmp",
+            "Assets/.checkpo-r-extra-0123456789abcdef-0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            assert!(!is_checkpo_owned_temporary_file(Path::new(path)), "{path}");
         }
     }
 

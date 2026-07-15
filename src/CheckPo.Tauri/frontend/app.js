@@ -2,6 +2,7 @@ const tauriInvoke = window.__TAURI__?.core?.invoke;
 const tauriListen = window.__TAURI__?.event?.listen;
 const RESULT_OUTPUT_MAX_CHARS = 20000;
 const ROLLBACK_OPERATION_RENDER_LIMIT = 500;
+const CONFIRM_PATH_RENDER_LIMIT = 30;
 const OPERATION_BUSY_RETRY_DELAYS_MS = [150, 300, 600, 1000, 1500];
 const AUTO_REFRESH_WAIT_INTERVAL_MS = 100;
 const AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS = 1000;
@@ -41,8 +42,11 @@ const state = {
   selectedCheckpointId: null,
   renamingCheckpointId: null,
   storage: null,
+  storageSizeLoadedProjectPath: null,
+  storageSizeLoadingProjectPath: null,
   gcPlan: null,
   tempCleanupPlan: null,
+  transactionCleanupPlan: null,
   rollbackPlan: null,
   rollbackPlanContext: null,
   rollbackRequestSerial: 0,
@@ -51,6 +55,14 @@ const state = {
   failedTransactions: [],
   confirming: false,
   currentDiff: null,
+  diffRefreshFailure: null,
+  latestDiffCheckpointId: null,
+  latestDiffChangeCount: null,
+  latestDiffExact: false,
+  latestDiffRefreshFailure: null,
+  latestDiffWarnings: [],
+  snapshotWarnings: [],
+  operationWarnings: [],
   diffRequestSerial: 0,
   currentDiffFilter: "all",
   diffTreeOpenPaths: new Set(),
@@ -169,10 +181,7 @@ async function invokeCommand(command, args = {}, options = {}) {
     while (true) {
       try {
         const result = await tauriInvoke(command, args);
-        if (trackOperation && state.activeCommand === command) {
-          renderProgressImmediately({ phase: "complete", completed: 1, total: 1 });
-        }
-        setResult(result);
+        if (!options.silentResult) setResult(result);
         return result;
       } catch (error) {
         const canRetryBusy = command !== "cancel_current_operation"
@@ -227,12 +236,21 @@ async function run(title, task, options = {}) {
   setBusyIndeterminate(options.initialBusyLabel || t("starting"));
   updateControls();
   try {
-    return await task();
+    const result = await task();
+    renderProgressImmediately({ phase: "complete", completed: 1, total: 1 }, true);
+    return result;
   } catch (error) {
-    if (!options.suppressError) {
+    const cancelled = CheckPoFrontendState.isCancellationKind(errorKind(error));
+    if (cancelled) {
+      const display = displayError(error);
+      clearVisibleError();
+      setStatus(display.message);
+      setResult({ cancelled: true, message: display.message });
+      options.onCancelled?.(display);
+    } else if (!options.suppressError) {
       showError(error);
     }
-    if (options.rethrow) {
+    if (options.rethrow && !cancelled) {
       throw error;
     }
   } finally {
@@ -290,8 +308,16 @@ function showError(error) {
   if (["workingTreeChanged", "pendingTransaction"].includes(display.kind)) {
     state.rollbackPlan = null;
     state.rollbackPlanContext = null;
+    state.transactionCleanupPlan = null;
+    state.gcPlan = null;
+    state.tempCleanupPlan = null;
     state.rollbackRequestSerial += 1;
     if ($("rollbackConfirm")) $("rollbackConfirm").checked = false;
+    if ($("cleanupSummary")) $("cleanupSummary").textContent = t("cleanupEmpty");
+    if ($("gcSummary")) $("gcSummary").textContent = t("gcEmpty");
+    if ($("tempCleanupSummary")) $("tempCleanupSummary").textContent = "未確認";
+    if ($("gcResult")) $("gcResult").textContent = "-";
+    if ($("tempCleanupResult")) $("tempCleanupResult").textContent = "-";
     updateControls();
   }
 }
@@ -299,15 +325,54 @@ function showError(error) {
 function showVisibleError(message) {
   $("errorBannerText").textContent = message;
   $("errorBanner").hidden = false;
+  const modalNeedsForegroundError = [
+    "settingsOverlay",
+    "advancedOverlay",
+    "projectRegistrationOverlay",
+    "projectSelectionOverlay",
+  ].some((id) => !$(id)?.hidden);
+  if (modalNeedsForegroundError) {
+    $("errorDialogText").textContent = message;
+    $("errorOverlay").hidden = false;
+  }
 }
 
 function clearVisibleError() {
   if ($("errorBanner")) $("errorBanner").hidden = true;
   if ($("errorBannerText")) $("errorBannerText").textContent = "";
+  if ($("errorOverlay")) $("errorOverlay").hidden = true;
+  if ($("errorDialogText")) $("errorDialogText").textContent = "";
   if ($("rollbackError")) {
     $("rollbackError").hidden = true;
     $("rollbackError").textContent = "";
   }
+}
+
+function renderWarningBanner() {
+  const currentDiffIsLatest = state.currentDiff?.checkpointId
+    && state.currentDiff.checkpointId === state.latestDiffCheckpointId;
+  const staleWarning = state.diffRefreshFailure ? [t("diffRefreshFailedStale")] : [];
+  const latestStaleWarning = state.latestDiffRefreshFailure && !currentDiffIsLatest
+    ? ["最新チェックポイントとの差分を更新できませんでした。未保存件数は未確定です。"]
+    : [];
+  const latestDiffWarnings = (currentDiffIsLatest ? [] : state.latestDiffWarnings || [])
+    .map((warning) => `最新チェックポイントとの差分: ${warning}`);
+  const diffWarnings = Array.isArray(state.currentDiff?.warnings) ? state.currentDiff.warnings : [];
+  const presentation = CheckPoFrontendState.warningBannerText([
+    state.snapshotWarnings,
+    state.operationWarnings,
+    diffWarnings,
+    staleWarning,
+    latestStaleWarning,
+    latestDiffWarnings,
+  ]);
+  $("warningBanner").hidden = presentation.count === 0;
+  $("warningBannerText").textContent = presentation.text;
+}
+
+function setOperationWarnings(warnings) {
+  state.operationWarnings = Array.isArray(warnings) ? warnings.map(String) : [];
+  renderWarningBanner();
 }
 
 function shouldStartProjectAfterLoadError(error) {
@@ -327,6 +392,10 @@ function resetBusyProgress() {
   progress.max = 100;
   progress.removeAttribute("value");
   $("busyProgressText").textContent = "";
+  if ($("busyCloseNotice")) {
+    $("busyCloseNotice").hidden = true;
+    $("busyCloseNotice").textContent = "";
+  }
   state.activeCommand = null;
   state.cancelRequested = false;
   state.currentOperationCancellable = false;
@@ -337,6 +406,21 @@ function setBusyIndeterminate(label, detail = "") {
   $("busyCommand").textContent = label;
   $("busyProgress").removeAttribute("value");
   $("busyProgressText").textContent = detail;
+}
+
+function renderPendingClose(payload) {
+  const message = payload?.cancellationRequested
+    ? "安全に中止できる地点で処理を止め、その後アプリを終了します。"
+    : "現在の処理が安全に完了してからアプリを終了します。";
+  if (state.busy && $("busyCloseNotice")) {
+    $("busyCloseNotice").textContent = message;
+    $("busyCloseNotice").hidden = false;
+    state.cancelRequested = Boolean(payload?.cancellationRequested);
+    updateControls();
+  } else {
+    showVisibleError(message);
+    setStatus(message);
+  }
 }
 
 function appendLog(text) {
@@ -461,6 +545,7 @@ function getCheckpointId() {
 }
 
 async function refreshProject(options = {}) {
+  if (state.busy) setBusyIndeterminate(t("refreshingCheckpointList"));
   const snapshot = await invokeCommand(
     "refresh_project",
     { projectPath: getProjectPath() },
@@ -468,6 +553,58 @@ async function refreshProject(options = {}) {
   );
   if (options.render !== false) renderSnapshot(snapshot);
   return snapshot;
+}
+
+async function loadDiffForDisplay(projectPath, checkpointId, metadataOnly) {
+  const args = { projectPath, checkpointId };
+  const diff = await invokeCommand(
+    metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint",
+    args,
+    { fromAutoRefresh: true },
+  );
+  return { diff, exact: !metadataOnly };
+}
+
+async function refreshLatestCheckpointChangeCount({
+  projectPath,
+  selectedCheckpointId,
+  generation,
+  backgroundRefresh,
+  startedUserOperationSerial,
+}) {
+  const latestId = latestCheckpointId();
+  if (!latestId || latestId === selectedCheckpointId) return;
+  let loaded;
+  try {
+    loaded = await loadDiffForDisplay(projectPath, latestId, true);
+  } catch (error) {
+    if (generation !== state.autoRefreshGeneration
+      || projectPath !== state.projectPath
+      || latestId !== latestCheckpointId()
+      || CheckPoFrontendState.isCancellationKind(errorKind(error))) return;
+    state.latestDiffCheckpointId = latestId;
+    state.latestDiffChangeCount = null;
+    state.latestDiffExact = false;
+    state.latestDiffRefreshFailure = errorText(error);
+    state.latestDiffWarnings = [];
+    renderPendingFileCount();
+    updateWorkingCheckpointRow();
+    renderWarningBanner();
+    return;
+  }
+  if (generation !== state.autoRefreshGeneration
+    || (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial)
+    || projectPath !== state.projectPath
+    || latestId !== latestCheckpointId()) return;
+  state.latestDiffCheckpointId = latestId;
+  const latest = CheckPoFrontendState.latestDiffState(loaded.diff, loaded.exact);
+  state.latestDiffWarnings = latest.warnings;
+  state.latestDiffExact = latest.exact;
+  state.latestDiffRefreshFailure = null;
+  state.latestDiffChangeCount = latest.changeCount;
+  renderPendingFileCount();
+  updateWorkingCheckpointRow();
+  renderWarningBanner();
 }
 
 async function refreshLatestDiff(options = {}) {
@@ -482,6 +619,7 @@ async function refreshLatestDiff(options = {}) {
   const backgroundRefresh = !options.allowBusy;
   const startedUserOperationSerial = state.userOperationSerial;
   const generation = state.autoRefreshGeneration;
+  let requestedCheckpointId = null;
   state.autoRefreshInFlight = true;
   updateAutoRefreshStatus();
   try {
@@ -495,28 +633,29 @@ async function refreshLatestDiff(options = {}) {
     const requestSerial = ++state.diffRequestSerial;
     const projectPath = getProjectPath();
     const checkpointId = diffBaselineCheckpointId();
+    requestedCheckpointId = checkpointId;
     if (!checkpointId) {
       if (generation !== state.autoRefreshGeneration
         || (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial)) return;
       state.currentDiff = null;
+      state.latestDiffCheckpointId = null;
+      state.latestDiffChangeCount = 0;
+      state.latestDiffExact = true;
+      state.latestDiffRefreshFailure = null;
+      state.latestDiffWarnings = [];
       $("diffSummary").textContent = t("diffEmpty");
       resetVirtualDiffTree();
-      $("pendingFileCount").textContent = `0${t("fileUnit")}`;
+      renderPendingFileCount();
+      updateWorkingCheckpointRow();
       updateFilterChips(0, 0, 0);
       return;
     }
     if (!backgroundRefresh) {
       $("diffSummary").textContent = t("diffLoading");
     }
-    const diffCommand = options.metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint";
-    const diff = await invokeCommand(
-      diffCommand,
-      {
-        projectPath: getProjectPath(),
-        checkpointId,
-      },
-      { fromAutoRefresh: true },
-    );
+    if (options.allowBusy && state.busy) setBusyIndeterminate(t("refreshingDiffView"));
+    const loaded = await loadDiffForDisplay(projectPath, checkpointId, options.metadataOnly);
+    const { diff } = loaded;
     if (generation !== state.autoRefreshGeneration
       || (backgroundRefresh && startedUserOperationSerial !== state.userOperationSerial)) {
       return;
@@ -524,14 +663,38 @@ async function refreshLatestDiff(options = {}) {
     if (requestSerial !== state.diffRequestSerial
       || projectPath !== state.projectPath
       || checkpointId !== diffBaselineCheckpointId()) return;
-    renderDiff(diff, checkpointId);
+    renderDiff(diff, checkpointId, { exact: loaded.exact });
+    await refreshLatestCheckpointChangeCount({
+      projectPath,
+      selectedCheckpointId: checkpointId,
+      generation,
+      backgroundRefresh,
+      startedUserOperationSerial,
+    });
     if (Array.isArray(diff?.warnings) && diff.warnings.length) {
       setStatus(`高速確認で一部確認できませんでした:\n${diff.warnings.join("\n")}`);
     }
   } catch (error) {
     if (generation !== state.autoRefreshGeneration || errorKind(error) === "cancelled") return;
-    clearCurrentDiff();
-    if (!options.silent) showError(error);
+    if (options.silent) {
+      const failure = errorText(error);
+      state.diffRefreshFailure = failure;
+      const latestId = latestCheckpointId();
+      if (latestId && (!requestedCheckpointId || requestedCheckpointId === latestId)) {
+        state.latestDiffCheckpointId = latestId;
+        state.latestDiffChangeCount = null;
+        state.latestDiffExact = false;
+        state.latestDiffRefreshFailure = failure;
+        state.latestDiffWarnings = [];
+        renderPendingFileCount();
+        updateWorkingCheckpointRow();
+      }
+      renderWarningBanner();
+      updateControls();
+    } else {
+      clearCurrentDiff();
+      showError(error);
+    }
   } finally {
     state.autoRefreshInFlight = false;
     updateAutoRefreshStatus();
@@ -546,14 +709,16 @@ async function refreshLatestDiff(options = {}) {
 function clearCurrentDiff() {
   state.diffRequestSerial += 1;
   state.currentDiff = null;
+  state.diffRefreshFailure = null;
   state.rollbackPlan = null;
   state.currentDiffSelectedPaths.clear();
   state.lastSelectedChangePath = null;
   $("diffSummary").textContent = t("diffEmpty");
   resetVirtualDiffTree();
-  $("pendingFileCount").textContent = `0${t("fileUnit")}`;
+  renderPendingFileCount();
   updateFilterChips(0, 0, 0);
   updateSelectedDiffButton();
+  renderWarningBanner();
   updateControls();
 }
 
@@ -573,15 +738,19 @@ function renderSnapshot(snapshot) {
   const nextProjectPath = snapshot.projectPath || snapshot.project?.projectRootPath || state.projectPath;
   const nextProject = snapshot.project
     || (nextProjectPath === state.projectPath ? state.project : null);
-  if (CheckPoFrontendState.projectChanged(
+  const changedProject = CheckPoFrontendState.projectChanged(
     state.projectPath,
     state.project,
     nextProjectPath,
     nextProject,
-  )) {
+  );
+  const previousStoredSize = changedProject ? null : state.storage?.storedSizeBytes;
+  if (changedProject) {
     Object.assign(state, CheckPoFrontendState.projectScopedStateReset());
+    state.storageSizeLoadedProjectPath = null;
+    state.storageSizeLoadingProjectPath = null;
     clearCurrentDiff();
-    resetProjectScopedSettingsResults();
+    resetProjectScopedDom();
   }
   state.projectPath = nextProjectPath;
   state.project = nextProject;
@@ -589,9 +758,22 @@ function renderSnapshot(snapshot) {
   state.checkpointIndex = snapshot.checkpointIndex
     || { state: "current", rebuildable: false, detail: null };
   state.checkpoints = sortCheckpoints(snapshot.checkpoints || []);
-  state.storage = snapshot.storage || null;
+  const nextLatestCheckpointId = latestCheckpointId();
+  if (state.latestDiffCheckpointId !== nextLatestCheckpointId) {
+    state.latestDiffCheckpointId = null;
+    state.latestDiffChangeCount = nextLatestCheckpointId ? null : 0;
+    state.latestDiffExact = !nextLatestCheckpointId;
+    state.latestDiffRefreshFailure = null;
+    state.latestDiffWarnings = [];
+  }
+  state.storage = CheckPoFrontendState.storageSummaryWithRetainedSize(
+    snapshot.storage,
+    previousStoredSize,
+  );
   state.gcPlan = null;
   state.tempCleanupPlan = null;
+  state.transactionCleanupPlan = null;
+  state.snapshotWarnings = Array.isArray(snapshot.warnings) ? snapshot.warnings.map(String) : [];
   if (!state.checkpoints.some((checkpoint) => checkpoint.checkpointId === state.selectedCheckpointId)) {
     state.selectedCheckpointId = state.checkpoints[0]?.checkpointId || null;
   }
@@ -608,7 +790,9 @@ function renderSnapshot(snapshot) {
   if (snapshot.warnings?.length) {
     setStatus(snapshot.warnings.join("\n"));
   }
+  renderWarningBanner();
   updateControls();
+  scheduleStorageSizeRefresh();
 }
 
 function sortCheckpoints(checkpoints) {
@@ -687,9 +871,52 @@ function updateProjectEmptyState() {
 function renderStorage() {
   $("checkpointCount").textContent = String(state.storage?.checkpointCount ?? state.checkpoints.length);
   $("logicalSize").textContent = formatBytes(state.storage?.logicalSizeBytes ?? 0);
-  $("storedSize").textContent = formatBytes(state.storage?.storedSizeBytes ?? 0);
+  $("storedSize").textContent = state.storage?.storedSizeBytes == null
+    ? "-"
+    : formatBytes(state.storage.storedSizeBytes);
   $("uniqueBlobs").textContent = String(state.storage?.uniqueBlobCount ?? "-");
   $("packCount").textContent = "-";
+}
+
+function invalidateStoredSize() {
+  state.storageSizeLoadedProjectPath = null;
+  if (state.storage) state.storage.storedSizeBytes = null;
+  renderStorage();
+}
+
+function scheduleStorageSizeRefresh(options = {}) {
+  const projectPath = state.projectPath;
+  if (!tauriInvoke || !projectPath) return;
+  if (!options.force && state.storageSizeLoadedProjectPath === projectPath) return;
+  if (state.storageSizeLoadingProjectPath === projectPath) return;
+  state.storageSizeLoadingProjectPath = projectPath;
+  window.setTimeout(async () => {
+    let retryWhenIdle = false;
+    try {
+      const summary = await invokeCommand(
+        "calculate_storage_summary",
+        { projectPath },
+        { fromAutoRefresh: true, silentResult: true },
+      );
+      if (state.projectPath !== projectPath) return;
+      state.storage = { ...(state.storage || {}), ...summary };
+      state.storageSizeLoadedProjectPath = projectPath;
+      renderStorage();
+    } catch (error) {
+      retryWhenIdle = errorKind(error) === "operationBusy"
+        && state.projectPath === projectPath;
+      if (!retryWhenIdle) {
+        console.warn("保存容量のバックグラウンド集計に失敗しました", error);
+      }
+    } finally {
+      if (state.storageSizeLoadingProjectPath === projectPath) {
+        state.storageSizeLoadingProjectPath = null;
+      }
+    }
+    if (retryWhenIdle) {
+      window.setTimeout(() => scheduleStorageSizeRefresh(options), 500);
+    }
+  }, 0);
 }
 
 function renderPending(items) {
@@ -726,6 +953,16 @@ function resetProjectScopedSettingsResults() {
   $("tempCleanupSummary").textContent = "未確認";
   $("tempCleanupResult").textContent = "-";
   $("rollbackOverlay").hidden = true;
+}
+
+function resetProjectScopedDom() {
+  resetProjectScopedSettingsResults();
+  $("checkpointSearch").value = "";
+  $("checkpointName").value = "";
+  $("verificationSummary").textContent = t("notRun");
+  $("cleanupResult").textContent = "-";
+  $("logList").replaceChildren();
+  setResult({});
 }
 
 function renderTransactionQuarantineAction() {
@@ -867,10 +1104,331 @@ function projectWarningText(warning) {
   return warning?.message || "プロジェクトの状態に警告があります。";
 }
 
-function renderCheckpoints() {
+let checkpointSearchTimer = null;
+let checkpointScrollFrame = null;
+const checkpointRowCache = new Map();
+const CHECKPOINT_SEARCH_DEBOUNCE_MS = 80;
+const CHECKPOINT_ROW_HEIGHT_PX = 32;
+const CHECKPOINT_VIRTUAL_OVERSCAN = 8;
+let filteredCheckpoints = [];
+
+function createWorkingCheckpointSection(changeCount) {
+  const section = document.createElement("section");
+  section.className = "checkpoint-section working-section";
+  section.setAttribute("role", "group");
+  const heading = document.createElement("div");
+  heading.className = "checkpoint-section-label";
+  heading.textContent = t("workingFolder");
+  const working = document.createElement("button");
+  working.type = "button";
+  working.className = "checkpoint-row working-row";
+  working.setAttribute("role", "option");
+  working.setAttribute("aria-selected", "false");
+  working.innerHTML = `
+    <span class="checkpoint-id mono">now</span>
+    <strong class="checkpoint-title">未保存の変更</strong>
+    <span class="checkpoint-meta"></span>
+  `;
+  working.querySelector(".checkpoint-meta").textContent =
+    `${CheckPoFrontendState.latestDiffCountText(changeCount, state.latestDiffExact)}${t("fileUnit")}`;
+  working.addEventListener("click", async () => {
+    await run("再読み込み中", async () => {
+      await refreshProject();
+      await refreshLatestDiff({ allowBusy: true });
+    });
+  });
+  section.append(heading, working);
+  return section;
+}
+
+function updateWorkingCheckpointRow() {
+  const list = $("checkpointList");
+  if (!list) return;
+  const changeCount = latestChangeCount();
+  let section = list.querySelector(".working-section");
+  if (changeCount <= 0) {
+    if (section) {
+      section.remove();
+      scheduleCheckpointVirtualWindowRender();
+    }
+    return;
+  }
+  if (!section) {
+    section = createWorkingCheckpointSection(changeCount);
+    list.prepend(section);
+    scheduleCheckpointVirtualWindowRender();
+  } else {
+    section.querySelector(".checkpoint-meta").textContent =
+      `${CheckPoFrontendState.latestDiffCountText(changeCount, state.latestDiffExact)}${t("fileUnit")}`;
+  }
+  section.hidden = Boolean($("checkpointSearch").value.trim());
+}
+
+function renderCheckpointVirtualWindow() {
+  const list = $("checkpointList");
+  const section = list?.querySelector(".saved-section");
+  const spacer = section?.querySelector(":scope > .checkpoint-virtual-spacer");
+  if (!list || !spacer) return;
+  const sectionScrollTop = Math.max(0, list.scrollTop - spacer.offsetTop);
+  const range = CheckPoFrontendState.virtualTreeWindowRange(
+    filteredCheckpoints.length,
+    sectionScrollTop,
+    list.clientHeight,
+    CHECKPOINT_ROW_HEIGHT_PX,
+    CHECKPOINT_VIRTUAL_OVERSCAN,
+  );
+  const fragment = document.createDocumentFragment();
+  for (let index = range.start; index < range.end; index += 1) {
+    const row = checkpointRow(filteredCheckpoints[index]);
+    row.classList.add("checkpoint-virtual-row");
+    row.style.transform = `translateY(${index * CHECKPOINT_ROW_HEIGHT_PX}px)`;
+    row.setAttribute("aria-posinset", String(index + 1));
+    row.setAttribute("aria-setsize", String(filteredCheckpoints.length));
+    fragment.append(row);
+  }
+  spacer.style.height = `${filteredCheckpoints.length * CHECKPOINT_ROW_HEIGHT_PX}px`;
+  spacer.replaceChildren(fragment);
+  updateCheckpointListActiveDescendant();
+}
+
+function scheduleCheckpointVirtualWindowRender() {
+  if (checkpointScrollFrame !== null) return;
+  checkpointScrollFrame = requestAnimationFrame(() => {
+    checkpointScrollFrame = null;
+    renderCheckpointVirtualWindow();
+  });
+}
+
+function applyCheckpointSearchFilter(options = {}) {
+  if (checkpointSearchTimer !== null) clearTimeout(checkpointSearchTimer);
+  checkpointSearchTimer = null;
   const query = $("checkpointSearch").value.trim().toLowerCase();
   const list = $("checkpointList");
+  const section = list.querySelector(".saved-section");
+  if (!section) return;
+  const empty = section.querySelector(":scope > .checkpoint-search-empty");
+  filteredCheckpoints = CheckPoFrontendState.filterCheckpoints(state.checkpoints, query);
+  if (options.resetScroll !== false) list.scrollTop = 0;
+  const working = list.querySelector(".working-section");
+  if (working) working.hidden = Boolean(query);
+  if (empty) {
+    empty.textContent = query && state.checkpoints.length > 0
+      ? t("checkpointSearchNoMatches")
+      : t("checkpointListEmpty");
+    empty.hidden = filteredCheckpoints.length > 0;
+  }
+  renderCheckpointVirtualWindow();
+}
+
+function scheduleCheckpointSearchFilter() {
+  if (checkpointSearchTimer !== null) clearTimeout(checkpointSearchTimer);
+  checkpointSearchTimer = setTimeout(applyCheckpointSearchFilter, CHECKPOINT_SEARCH_DEBOUNCE_MS);
+}
+
+function updateCheckpointSelectionInDom() {
+  $("checkpointList")?.querySelectorAll(".checkpoint-row[data-checkpoint-id]").forEach((row) => {
+    const selected = row.dataset.checkpointId === state.selectedCheckpointId;
+    row.classList.toggle("is-selected", selected);
+    row.setAttribute("aria-selected", String(selected));
+  });
+  updateCheckpointListActiveDescendant();
+}
+
+function checkpointOptionId(checkpointId) {
+  return `checkpoint-option-${checkpointId}`;
+}
+
+function updateCheckpointListActiveDescendant() {
+  const list = $("checkpointList");
+  if (!list) return;
+  const selected = list.querySelector(
+    `.checkpoint-row[data-checkpoint-id="${CSS.escape(state.selectedCheckpointId || "")}"]`,
+  );
+  if (selected) list.setAttribute("aria-activedescendant", selected.id);
+  else list.removeAttribute("aria-activedescendant");
+}
+
+function checkpointById(checkpointId) {
+  return state.checkpoints.find((checkpoint) => checkpoint.checkpointId === checkpointId) || null;
+}
+
+function checkpointSearchText(checkpoint) {
+  return CheckPoFrontendState.checkpointSearchText(checkpoint);
+}
+
+function checkpointRow(checkpoint) {
+  const existing = checkpointRowCache.get(checkpoint.checkpointId);
+  const shouldRename = checkpoint.checkpointId === state.renamingCheckpointId;
+  const isRenaming = existing?.classList.contains("is-renaming") || false;
+  if (!existing || shouldRename !== isRenaming) {
+    const created = createCheckpointRow(checkpoint);
+    checkpointRowCache.set(checkpoint.checkpointId, created);
+    return created;
+  }
+  const selected = checkpoint.checkpointId === state.selectedCheckpointId;
+  existing.hidden = false;
+  existing.classList.toggle("is-selected", selected);
+  existing.setAttribute("aria-selected", String(selected));
+  existing.dataset.searchText = checkpointSearchText(checkpoint);
+  if (!isRenaming) {
+    existing.querySelector(".checkpoint-id").textContent =
+      String(checkpoint.checkpointId || "").slice(0, 4) || "----";
+    existing.querySelector(".checkpoint-title").textContent = checkpoint.name || checkpoint.checkpointId;
+    existing.querySelector(".checkpoint-meta").textContent =
+      `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0} files`;
+  }
+  return existing;
+}
+
+function createCheckpointRow(checkpoint) {
+  const isRenaming = checkpoint.checkpointId === state.renamingCheckpointId;
+  const row = document.createElement(isRenaming ? "div" : "button");
+  if (!isRenaming) row.type = "button";
+  row.className = `checkpoint-row${checkpoint.checkpointId === state.selectedCheckpointId ? " is-selected" : ""}${isRenaming ? " is-renaming" : ""}`;
+  row.id = checkpointOptionId(checkpoint.checkpointId);
+  row.dataset.checkpointId = checkpoint.checkpointId;
+  row.dataset.searchText = checkpointSearchText(checkpoint);
+  row.setAttribute("role", "option");
+  row.setAttribute("aria-selected", String(checkpoint.checkpointId === state.selectedCheckpointId));
+  if (isRenaming) row.tabIndex = 0;
+  row.innerHTML = `
+    <span class="checkpoint-id mono"></span>
+    <strong class="checkpoint-title"></strong>
+    <span class="checkpoint-meta"></span>
+  `;
+  row.querySelector(".checkpoint-id").textContent = String(checkpoint.checkpointId || "").slice(0, 4) || "----";
+  row.querySelector(".checkpoint-meta").textContent =
+    `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0} files`;
+  if (isRenaming) {
+    const title = row.querySelector(".checkpoint-title");
+    const input = document.createElement("input");
+    input.className = "checkpoint-rename-input";
+    input.type = "text";
+    input.value = checkpoint.name || checkpoint.checkpointId;
+    input.setAttribute("aria-label", "チェックポイント名");
+    title.replaceChildren(input);
+    setupCheckpointRenameInput(input, checkpoint);
+    requestAnimationFrame(() => {
+      input.focus();
+      input.select();
+    });
+  } else {
+    row.querySelector(".checkpoint-title").textContent = checkpoint.name || checkpoint.checkpointId;
+  }
+  return row;
+}
+
+function patchCheckpointRow(checkpointId) {
+  const checkpoint = checkpointById(checkpointId);
+  const existing = $("checkpointList")?.querySelector(
+    `.checkpoint-row[data-checkpoint-id="${CSS.escape(checkpointId)}"]`,
+  );
+  if (!checkpoint) {
+    renderCheckpoints();
+    return;
+  }
+  checkpointRowCache.delete(checkpointId);
+  const replacement = checkpointRow(checkpoint);
+  const query = $("checkpointSearch").value.trim().toLowerCase();
+  const matchesQuery = !query || checkpointSearchText(checkpoint).includes(query);
+  if (existing && matchesQuery) {
+    filteredCheckpoints = filteredCheckpoints.map((item) => (
+      item.checkpointId === checkpointId ? checkpoint : item
+    ));
+    replacement.classList.add("checkpoint-virtual-row");
+    replacement.style.transform = existing.style.transform;
+    replacement.setAttribute("aria-posinset", existing.getAttribute("aria-posinset") || "1");
+    replacement.setAttribute("aria-setsize", existing.getAttribute("aria-setsize") || String(filteredCheckpoints.length));
+    existing.replaceWith(replacement);
+    return;
+  }
+  applyCheckpointSearchFilter({ resetScroll: false });
+}
+
+async function handleCheckpointListClick(event) {
+  if (event.target.closest(".checkpoint-rename-input")) return;
+  const row = event.target.closest(".checkpoint-row[data-checkpoint-id]");
+  if (!row || !$("checkpointList").contains(row) || row.classList.contains("is-renaming")) return;
+  const checkpointId = row.dataset.checkpointId;
+  if (!checkpointById(checkpointId)) return;
+  selectCheckpoint(checkpointId);
+  await refreshLatestDiff({ metadataOnly: true });
+}
+
+function scrollCheckpointIndexIntoView(index) {
+  const list = $("checkpointList");
+  const spacer = list?.querySelector(".checkpoint-virtual-spacer");
+  if (!list || !spacer || index < 0) return;
+  const rowTop = spacer.offsetTop + (index * CHECKPOINT_ROW_HEIGHT_PX);
+  const rowBottom = rowTop + CHECKPOINT_ROW_HEIGHT_PX;
+  if (rowTop < list.scrollTop) list.scrollTop = rowTop;
+  else if (rowBottom > list.scrollTop + list.clientHeight) {
+    list.scrollTop = Math.max(0, rowBottom - list.clientHeight);
+  }
+  renderCheckpointVirtualWindow();
+}
+
+async function handleCheckpointListKeyDown(event) {
+  if (event.target.closest(".checkpoint-rename-input")) return;
+  const navigationKeys = new Set(["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp"]);
+  if (navigationKeys.has(event.key)) {
+    event.preventDefault();
+    const currentIndex = filteredCheckpoints.findIndex(
+      (checkpoint) => checkpoint.checkpointId === state.selectedCheckpointId,
+    );
+    const pageSize = Math.max(1, Math.floor($("checkpointList").clientHeight / CHECKPOINT_ROW_HEIGHT_PX));
+    const index = CheckPoFrontendState.checkpointNavigationIndex(
+      filteredCheckpoints.length,
+      currentIndex,
+      event.key,
+      pageSize,
+    );
+    const checkpoint = filteredCheckpoints[index];
+    if (!checkpoint) return;
+    selectCheckpoint(checkpoint.checkpointId, { render: false });
+    scrollCheckpointIndexIntoView(index);
+    updateCheckpointSelectionInDom();
+    await refreshLatestDiff({ metadataOnly: true });
+    return;
+  }
+  if (event.key === "F2" && state.selectedCheckpointId) {
+    event.preventDefault();
+    const index = filteredCheckpoints.findIndex(
+      (checkpoint) => checkpoint.checkpointId === state.selectedCheckpointId,
+    );
+    if (index >= 0) scrollCheckpointIndexIntoView(index);
+    beginRenameCheckpoint(state.selectedCheckpointId);
+    return;
+  }
+  if ((event.key === "ContextMenu" || (event.shiftKey && event.key === "F10"))
+    && state.selectedCheckpointId) {
+    event.preventDefault();
+    const checkpoint = checkpointById(state.selectedCheckpointId);
+    const row = document.getElementById(checkpointOptionId(state.selectedCheckpointId));
+    if (!checkpoint || !row) return;
+    const rect = row.getBoundingClientRect();
+    showCheckpointContextMenu(rect.left + 16, rect.bottom, checkpoint);
+  }
+}
+
+function handleCheckpointListContextMenu(event) {
+  if (event.target.closest(".checkpoint-rename-input")) return;
+  const row = event.target.closest(".checkpoint-row[data-checkpoint-id]");
+  if (!row || !$("checkpointList").contains(row)) return;
+  const checkpoint = checkpointById(row.dataset.checkpointId);
+  if (!checkpoint) return;
+  event.preventDefault();
+  selectCheckpoint(checkpoint.checkpointId, { render: !row.classList.contains("is-renaming") });
+  showCheckpointContextMenu(event.clientX, event.clientY, checkpoint);
+}
+
+function renderCheckpoints() {
+  const list = $("checkpointList");
   list.replaceChildren();
+  const currentCheckpointIds = new Set(state.checkpoints.map((checkpoint) => checkpoint.checkpointId));
+  for (const checkpointId of checkpointRowCache.keys()) {
+    if (!currentCheckpointIds.has(checkpointId)) checkpointRowCache.delete(checkpointId);
+  }
   const index = CheckPoFrontendState.checkpointIndexPresentation(state.checkpointIndex);
   if (!index.available) {
     const unavailable = document.createElement("p");
@@ -879,96 +1437,26 @@ function renderCheckpoints() {
     list.append(unavailable);
     return;
   }
-  const changeCount = currentChangeCount();
-  if (!query && changeCount > 0) {
-    const workingSection = document.createElement("section");
-    workingSection.className = "checkpoint-section working-section";
-    const heading = document.createElement("div");
-    heading.className = "checkpoint-section-label";
-    heading.textContent = t("workingFolder");
-    const working = document.createElement("button");
-    working.type = "button";
-    working.className = "checkpoint-row working-row";
-    working.innerHTML = `
-      <span class="checkpoint-id mono">now</span>
-      <strong class="checkpoint-title">未保存の変更</strong>
-      <span class="checkpoint-meta">${changeCount}${t("fileUnit")}</span>
-    `;
-    working.addEventListener("click", async () => {
-      await run("再読み込み中", async () => {
-        await refreshProject();
-        await refreshLatestDiff({ allowBusy: true });
-      });
-    });
-    workingSection.append(heading, working);
-    list.append(workingSection);
-  }
-  const checkpoints = state.checkpoints.filter((checkpoint) => {
-    const haystack = `${checkpoint.name} ${checkpoint.checkpointId} ${checkpoint.createdAtUtc}`.toLowerCase();
-    return !query || haystack.includes(query);
-  });
+  const changeCount = latestChangeCount();
+  if (changeCount > 0) list.append(createWorkingCheckpointSection(changeCount));
+  const checkpoints = state.checkpoints;
   const checkpointSection = document.createElement("section");
   checkpointSection.className = "checkpoint-section saved-section";
-  if (!query && changeCount > 0) {
+  checkpointSection.setAttribute("role", "group");
+  if (changeCount > 0) {
     const heading = document.createElement("div");
     heading.className = "checkpoint-section-label";
     heading.textContent = "チェックポイント";
     checkpointSection.append(heading);
   }
-  if (checkpoints.length === 0) {
-    const empty = document.createElement("p");
-    empty.className = "empty-list";
-    empty.textContent = "チェックポイントはありません。";
-    checkpointSection.append(empty);
-    list.append(checkpointSection);
-    return;
-  }
-  for (const checkpoint of checkpoints) {
-    const isRenaming = checkpoint.checkpointId === state.renamingCheckpointId;
-    const row = document.createElement(isRenaming ? "div" : "button");
-    if (!isRenaming) row.type = "button";
-    row.className = `checkpoint-row${checkpoint.checkpointId === state.selectedCheckpointId ? " is-selected" : ""}${isRenaming ? " is-renaming" : ""}`;
-    row.dataset.checkpointId = checkpoint.checkpointId;
-    if (isRenaming) {
-      row.setAttribute("role", "option");
-      row.tabIndex = 0;
-    }
-    row.innerHTML = `
-      <span class="checkpoint-id mono"></span>
-      <strong class="checkpoint-title"></strong>
-      <span class="checkpoint-meta"></span>
-    `;
-    row.querySelector(".checkpoint-id").textContent = String(checkpoint.checkpointId || "").slice(0, 4) || "----";
-    row.querySelector(".checkpoint-meta").textContent =
-      `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0} files`;
-    if (isRenaming) {
-      const title = row.querySelector(".checkpoint-title");
-      const input = document.createElement("input");
-      input.className = "checkpoint-rename-input";
-      input.type = "text";
-      input.value = checkpoint.name || checkpoint.checkpointId;
-      input.setAttribute("aria-label", "チェックポイント名");
-      title.replaceChildren(input);
-      setupCheckpointRenameInput(input, checkpoint);
-      requestAnimationFrame(() => {
-        input.focus();
-        input.select();
-      });
-    } else {
-      row.querySelector(".checkpoint-title").textContent = checkpoint.name || checkpoint.checkpointId;
-      row.addEventListener("click", async () => {
-        selectCheckpoint(checkpoint.checkpointId);
-        await refreshLatestDiff({ metadataOnly: true });
-      });
-    }
-    row.addEventListener("contextmenu", (event) => {
-      event.preventDefault();
-      selectCheckpoint(checkpoint.checkpointId, { render: !isRenaming });
-      showCheckpointContextMenu(event.clientX, event.clientY, checkpoint);
-    });
-    checkpointSection.append(row);
-  }
+  const empty = document.createElement("p");
+  empty.className = "empty-list checkpoint-search-empty";
+  checkpointSection.append(empty);
+  const spacer = document.createElement("div");
+  spacer.className = "checkpoint-virtual-spacer";
+  checkpointSection.append(spacer);
   list.append(checkpointSection);
+  applyCheckpointSearchFilter();
 }
 
 function selectCheckpoint(checkpointId, options = {}) {
@@ -978,7 +1466,7 @@ function selectCheckpoint(checkpointId, options = {}) {
   state.rollbackPlanContext = null;
   if (changed) state.rollbackRequestSerial += 1;
   if (changed) clearCurrentDiff();
-  if (options.render !== false) renderCheckpoints();
+  if (options.render !== false) updateCheckpointSelectionInDom();
   renderProjectLabels();
   updateControls();
 }
@@ -993,8 +1481,12 @@ function beginRenameCheckpoint(checkpointId) {
     setStatus("安全を確認できるまでチェックポイント名は変更できません。既知のチェックポイントへ全体復元してください。");
     return;
   }
+  const previouslyRenaming = state.renamingCheckpointId;
   state.renamingCheckpointId = checkpointId;
-  renderCheckpoints();
+  if (previouslyRenaming && previouslyRenaming !== checkpointId) {
+    patchCheckpointRow(previouslyRenaming);
+  }
+  patchCheckpointRow(checkpointId);
 }
 
 function setupCheckpointRenameInput(input, checkpoint) {
@@ -1003,7 +1495,7 @@ function setupCheckpointRenameInput(input, checkpoint) {
   const cancel = () => {
     if (committing) return;
     state.renamingCheckpointId = null;
-    renderCheckpoints();
+    patchCheckpointRow(checkpoint.checkpointId);
   };
   const commit = async () => {
     if (committing) return;
@@ -1032,7 +1524,7 @@ function setupCheckpointRenameInput(input, checkpoint) {
         state.currentDiff.checkpoint.name = updated.name || name;
       }
       state.renamingCheckpointId = null;
-      renderCheckpoints();
+      patchCheckpointRow(updatedId);
       renderProjectLabels();
       setStatus("チェックポイント名を変更しました。");
     });
@@ -1061,6 +1553,13 @@ function setupCheckpointRenameInput(input, checkpoint) {
   });
 }
 
+function checkpointHasKnownExactNoChanges(checkpointId) {
+  return state.currentDiff?.checkpointId === checkpointId
+    && state.currentDiff?.exact
+    && CheckPoFrontendState.diffResultIsComplete(state.currentDiff, state.diffRefreshFailure)
+    && currentChangeCount() === 0;
+}
+
 function showCheckpointContextMenu(x, y, checkpoint) {
   const locationBlocked = state.projectLocationStatus === "copiedSuspected";
   const pendingBlocked = state.pendingTransactions.length > 0;
@@ -1073,7 +1572,9 @@ function showCheckpointContextMenu(x, y, checkpoint) {
     },
     {
       label: "この状態に戻す",
-      disabled: locationBlocked || pendingBlocked,
+      disabled: locationBlocked
+        || pendingBlocked
+        || checkpointHasKnownExactNoChanges(checkpoint.checkpointId),
       action: () => previewRestoreCheckpoint(checkpoint.checkpointId),
     },
     { separator: true },
@@ -1208,6 +1709,7 @@ async function deleteCheckpointById(checkpointId) {
   if (!confirmed) return;
   await run("削除中", async () => {
     await invokeCommand("delete_checkpoint", { projectPath: getProjectPath(), checkpointId, confirmed: true });
+    invalidateStoredSize();
     state.selectedCheckpointId = null;
     state.renamingCheckpointId = null;
     await refreshProject();
@@ -1238,6 +1740,8 @@ function renderProjectHistory() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `project-dialog-item${project.path === state.projectPath ? " is-active" : ""}`;
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(project.path === state.projectPath));
     button.innerHTML = "<strong></strong><span></span>";
     button.querySelector("strong").textContent = project.name || basename(project.path);
     button.querySelector("span").textContent = project.path;
@@ -1266,6 +1770,7 @@ function openProjectRegistration() {
   $("registrationStorageRootPath").value = state.defaultStorageRootPath || "";
   resetInitialCheckpointChoice("registrationInitialCheckpoint");
   $("projectRegistrationOverlay").hidden = false;
+  updateControls();
 }
 
 function resetInitialCheckpointChoice(name) {
@@ -1293,19 +1798,25 @@ function renderStartedProject(snapshot, successMessage) {
     updateControls();
     const warningText = checkpointWarningsText(snapshot.initialCheckpoint?.warnings);
     if (warningText) {
+      setOperationWarnings(snapshot.initialCheckpoint.warnings);
       setStatus(`初回チェックポイントを作成しましたが、警告があります。${warningText}`);
       setResult({
         warning: "初回チェックポイントを作成しましたが、警告があります。",
         details: snapshot.initialCheckpoint.warnings,
       });
     } else {
+      setOperationWarnings([]);
       setStatus("初回チェックポイントを作成しました。");
     }
   } else if (snapshot.initialCheckpointError) {
-    setStatus(`プロジェクトは開始しましたが、初回チェックポイント作成に失敗しました: ${errorText(snapshot.initialCheckpointError)}`);
+    const message = `プロジェクトは開始しましたが、初回チェックポイント作成に失敗しました: ${errorText(snapshot.initialCheckpointError)}`;
+    setOperationWarnings([message]);
+    setStatus(message);
   } else if (snapshot.initialCheckpointCancelled) {
+    setOperationWarnings([]);
     setStatus("初回チェックポイントの作成を中止しました。");
   } else if (successMessage) {
+    setOperationWarnings([]);
     setStatus(successMessage);
   }
 }
@@ -1324,18 +1835,39 @@ async function runExactDiff() {
     if (requestSerial !== state.diffRequestSerial
       || projectPath !== state.projectPath
       || checkpointId !== diffBaselineCheckpointId()) return;
-    renderDiff(diff, checkpointId);
+    renderDiff(diff, checkpointId, { exact: true });
     setStatus(t("diffUpdated"));
   });
 }
 
 function renderRollbackPlan(plan, context) {
+  if (!CheckPoFrontendState.restorePlanCanApply(
+    plan,
+    state.unresolvedQuarantines.length,
+  ) && !(plan?.warnings?.length)) {
+    state.rollbackPlan = null;
+    state.rollbackPlanContext = null;
+    $("rollbackOverlay").hidden = true;
+    const checkpoint = state.checkpoints.find((item) => item.checkpointId === context?.checkpointId);
+    if (checkpoint) {
+      renderDiff({
+        added: [],
+        modified: [],
+        deleted: [],
+        unchangedCount: checkpoint.fileCount ?? 0,
+        warnings: [],
+      }, context.checkpointId, { exact: true });
+    }
+    setStatus("戻す変更はありません。");
+    updateControls();
+    return;
+  }
   state.rollbackPlan = plan;
   state.rollbackPlanContext = context;
   clearVisibleError();
   const operations = plan.operations || [];
   $("rollbackSummary").textContent =
-    `復元 ${plan.restoreCount ?? 0} / 置換 ${plan.replaceCount ?? 0} / 削除 ${plan.deleteCount ?? 0} / 一時容量 約${formatBytes(plan.estimatedTemporaryBytes ?? 0)} / 対象 ${operations.length} 件`;
+    `復元 ${plan.restoreCount ?? 0} / 置換 ${plan.replaceCount ?? 0} / 日時 ${plan.metadataCount ?? 0} / 削除 ${plan.deleteCount ?? 0} / 一時容量 約${formatBytes(plan.estimatedTemporaryBytes ?? 0)} / 対象 ${operations.length} 件`;
   $("rollbackWarnings").replaceChildren();
   for (const warning of plan.warnings || []) {
     const item = document.createElement("p");
@@ -1358,7 +1890,12 @@ function renderRollbackPlan(plan, context) {
       <span class="operation-type"></span>
       <span class="operation-path"></span>
     `;
-    row.querySelector(".operation-type").textContent = operation.operationType;
+    row.querySelector(".operation-type").textContent = ({
+      restore: "復元",
+      replace: "置換",
+      delete: "削除",
+      setMetadata: "日時",
+    })[operation.operationType] || operation.operationType;
     row.querySelector(".operation-path").textContent = operation.path;
     list.append(row);
   }
@@ -1377,6 +1914,12 @@ function updateControls() {
   const hasProject = Boolean(state.projectPath);
   const hasCheckpoint = Boolean(state.selectedCheckpointId);
   const hasCheckpointName = Boolean($("checkpointName").value.trim());
+  const hasRegistrationProjectPath = Boolean($("projectPath").value.trim());
+  const newStorageRootPath = $("settingsNewStorageRootPath").value.trim();
+  const storageRootUnchanged = CheckPoFrontendState.samePathInput(
+    newStorageRootPath,
+    $("settingsStorageRootPath").value,
+  );
   const locationMutationBlocked = state.projectLocationStatus === "copiedSuspected";
   const pendingMutationBlocked = state.pendingTransactions.length > 0;
   const quarantineMutationBlocked = state.unresolvedQuarantines.length > 0;
@@ -1386,7 +1929,7 @@ function updateControls() {
   const controlsBlocked = state.busy || state.confirming;
   document.querySelectorAll("button").forEach((button) => {
     if (["confirmOkButton", "confirmCancelButton"].includes(button.id)) {
-      button.disabled = state.busy;
+      button.disabled = state.busy && $("confirmOverlay").hidden;
       return;
     }
     if (button.id === "cancelOperationButton") {
@@ -1408,12 +1951,15 @@ function updateControls() {
       "closeProjectRegistrationButton",
       "pickProjectButton",
       "pickRegistrationStorageRootButton",
-      "openProjectButton",
       "settingsButton",
       "closeSettingsButton",
       "pickDefaultStorageRootButton",
     ].includes(button.id)) {
       button.disabled = controlsBlocked;
+      return;
+    }
+    if (button.id === "openProjectButton") {
+      button.disabled = controlsBlocked || !hasRegistrationProjectPath;
       return;
     }
     if (button.id === "applyRollbackButton") {
@@ -1424,7 +1970,10 @@ function updateControls() {
         || !state.rollbackPlanContext
         || Boolean(state.rollbackPlan.warnings?.length)
         || !$("rollbackConfirm").checked
-        || !state.rollbackPlan.hasChanges;
+        || !CheckPoFrontendState.restorePlanCanApply(
+          state.rollbackPlan,
+          state.unresolvedQuarantines.length,
+        );
       return;
     }
     if (button.id === "rebuildIndexButton") {
@@ -1436,12 +1985,26 @@ function updateControls() {
       return;
     }
     if (button.id === "applyGcButton") {
-      button.disabled = controlsBlocked || destructiveBlocked || !hasProject || !state.gcPlan || state.gcPlan.hasIntegrityProblems;
+      const gc = CheckPoFrontendState.gcPlanPresentation(state.gcPlan);
+      button.disabled = controlsBlocked
+        || destructiveBlocked
+        || !hasProject
+        || !state.gcPlan
+        || state.gcPlan.hasIntegrityProblems
+        || gc.totalCount === 0;
       return;
     }
     if (["previewRollbackButton", "diffButton", "verifyButton"].includes(button.id)) {
       const pendingBlocked = button.id === "previewRollbackButton" && pendingMutationBlocked;
-      button.disabled = controlsBlocked || indexUnavailable || pendingBlocked || !hasProject || !hasCheckpoint;
+      const exactNoChanges = button.id === "previewRollbackButton"
+        && checkpointHasKnownExactNoChanges(state.selectedCheckpointId)
+        && state.unresolvedQuarantines.length === 0;
+      button.disabled = controlsBlocked
+        || indexUnavailable
+        || pendingBlocked
+        || exactNoChanges
+        || !hasProject
+        || !hasCheckpoint;
       return;
     }
     if (button.id === "deleteCheckpointButton") {
@@ -1457,10 +2020,23 @@ function updateControls() {
       return;
     }
     if (button.id === "setStorageRootButton") {
-      button.disabled = controlsBlocked || destructiveBlocked || !hasProject;
+      button.disabled = controlsBlocked
+        || destructiveBlocked
+        || !hasProject
+        || !newStorageRootPath
+        || storageRootUnchanged;
       return;
     }
-    if (["recoverTransactionsButton", "quarantineTransactionButton", "applyCleanupButton"].includes(button.id)) {
+    if (button.id === "applyCleanupButton") {
+      button.disabled = controlsBlocked
+        || locationMutationBlocked
+        || !hasProject
+        || !CheckPoFrontendState.transactionCleanupPlanHasCandidates(
+          state.transactionCleanupPlan,
+        );
+      return;
+    }
+    if (["recoverTransactionsButton", "quarantineTransactionButton"].includes(button.id)) {
       button.disabled = controlsBlocked || locationMutationBlocked || !hasProject;
       return;
     }
@@ -1469,7 +2045,9 @@ function updateControls() {
       return;
     }
     if (button.dataset.destructive === "true") {
-      button.disabled = controlsBlocked || destructiveBlocked || !hasProject;
+      const diffBlocked = (button.id === "discardSelectedDiffButton" || button.classList.contains("tree-op"))
+        && !CheckPoFrontendState.diffResultIsComplete(state.currentDiff, state.diffRefreshFailure);
+      button.disabled = controlsBlocked || destructiveBlocked || diffBlocked || !hasProject;
       return;
     }
     button.disabled = controlsBlocked || (!hasProject && button.dataset.command);
@@ -1589,6 +2167,13 @@ async function discardPaths(paths) {
     showError({ kind: "pendingTransaction", message: "A transaction must be recovered first" });
     return;
   }
+  if (!CheckPoFrontendState.diffResultIsComplete(state.currentDiff, state.diffRefreshFailure)) {
+    showError({
+      kind: "workingTreeChanged",
+      message: "差分を完全に確認できていません。警告を解消して再読み込みしてください。",
+    });
+    return;
+  }
   const projectPath = getProjectPath();
   const checkpointId = state.currentDiff?.checkpointId;
   const diffRequestSerial = state.diffRequestSerial;
@@ -1618,8 +2203,12 @@ async function discardPaths(paths) {
   let confirmed = false;
   try {
     const effectivePaths = plan.selectedPaths || paths;
+    const preview = CheckPoFrontendState.pathConfirmationPreview(
+      effectivePaths,
+      CONFIRM_PATH_RENDER_LIMIT,
+    );
     confirmed = await confirmAction(
-      `${effectivePaths.length} 件の変更を戻します。\n\n${effectivePaths.join("\n")}\n\n続行しますか？`,
+      `${preview.total} 件の変更を戻します。\n\n${preview.text}\n\n続行しますか？`,
       "戻す",
     );
   } finally {
@@ -1651,6 +2240,7 @@ async function discardPaths(paths) {
 
 function bindEvents() {
   $("dismissErrorButton").addEventListener("click", clearVisibleError);
+  $("dismissErrorDialogButton").addEventListener("click", clearVisibleError);
   $("projectMenuButton").addEventListener("click", () => {
     renderProjectHistory();
     $("projectSelectionOverlay").hidden = false;
@@ -1681,7 +2271,10 @@ function bindEvents() {
   });
   $("closeProjectSelectionButton").addEventListener("click", () => $("projectSelectionOverlay").hidden = true);
   $("closeProjectRegistrationButton").addEventListener("click", () => $("projectRegistrationOverlay").hidden = true);
-  $("settingsButton").addEventListener("click", () => $("settingsOverlay").hidden = false);
+  $("settingsButton").addEventListener("click", () => {
+    $("settingsOverlay").hidden = false;
+    updateControls();
+  });
   $("closeSettingsButton").addEventListener("click", () => $("settingsOverlay").hidden = true);
   $("advancedButton").addEventListener("click", () => $("advancedOverlay").hidden = false);
   $("closeAdvancedButton").addEventListener("click", () => $("advancedOverlay").hidden = true);
@@ -1694,8 +2287,14 @@ function bindEvents() {
     });
   });
   $("clearResultButton").addEventListener("click", () => setResult({}));
-  $("checkpointSearch").addEventListener("input", renderCheckpoints);
+  $("checkpointSearch").addEventListener("input", scheduleCheckpointSearchFilter);
+  $("checkpointList").addEventListener("click", handleCheckpointListClick);
+  $("checkpointList").addEventListener("contextmenu", handleCheckpointListContextMenu);
+  $("checkpointList").addEventListener("keydown", handleCheckpointListKeyDown);
+  $("checkpointList").addEventListener("scroll", scheduleCheckpointVirtualWindowRender, { passive: true });
   $("checkpointName").addEventListener("input", updateControls);
+  $("projectPath").addEventListener("input", updateControls);
+  $("settingsNewStorageRootPath").addEventListener("input", updateControls);
   document.querySelectorAll("[data-diff-filter]").forEach((button) => {
     button.addEventListener("click", () => {
       state.currentDiffFilter = button.dataset.diffFilter || "all";
@@ -1727,6 +2326,7 @@ function bindEvents() {
   $("pickProjectButton").addEventListener("click", async () => {
     const path = await pickFolder("Unity project");
     if (path) $("projectPath").value = path;
+    updateControls();
   });
   $("pickRegistrationStorageRootButton").addEventListener("click", async () => {
     const path = await pickFolder("Checkpoint storage");
@@ -1745,6 +2345,7 @@ function bindEvents() {
   $("pickStorageRootButton").addEventListener("click", async () => {
     const path = await pickFolder("Checkpoint storage");
     if (path) $("settingsNewStorageRootPath").value = path;
+    updateControls();
   });
   $("setStorageRootButton").addEventListener("click", async () => {
     const storageRootPath = $("settingsNewStorageRootPath").value.trim();
@@ -1753,17 +2354,24 @@ function bindEvents() {
       return;
     }
     const current = $("settingsStorageRootPath").value;
+    if (CheckPoFrontendState.samePathInput(storageRootPath, current)) {
+      setStatus("現在とは異なるチェックポイント保存先を選んでください。");
+      updateControls();
+      return;
+    }
     const confirmed = await confirmAction(
       `保存先情報だけを変更します。ファイル移動は行いません。先に ${current} の repos フォルダ内にあるこのプロジェクトの保存データを、新しい保存先へ手動で移動してください。移動済みなら続行します。`,
       "保存先を変更",
     );
     if (!confirmed) return;
     await run("保存先を変更中", async () => {
-      renderSnapshot(await invokeCommand("set_storage_root", {
+      const snapshot = await invokeCommand("set_storage_root", {
         projectPath: getProjectPath(),
         storageRootPath,
         confirmed: true,
-      }));
+      });
+      invalidateStoredSize();
+      renderSnapshot(snapshot);
       await refreshLatestDiff({ allowBusy: true });
       setStatus("チェックポイント保存先を変更しました。");
     });
@@ -1772,8 +2380,11 @@ function bindEvents() {
     await run("不要データを確認中", async () => {
       const plan = await invokeCommand("analyze_gc", { projectPath: getProjectPath() });
       state.gcPlan = plan;
+      const gc = CheckPoFrontendState.gcPlanPresentation(plan);
       $("gcSummary").textContent =
-        `不要 object ${plan.unreferencedBlobCount ?? 0} 件 / ${formatBytes(plan.unreferencedLogicalBytes ?? 0)}`;
+        `不要 object ${gc.objectCount} 件 / ${formatBytes(gc.objectBytes)}、` +
+        `manifest chunk ${gc.manifestChunkCount} 件 / ${formatBytes(gc.manifestChunkBytes)}、` +
+        `合計 ${formatBytes(gc.totalBytes)}`;
       $("gcResult").textContent = plan.hasIntegrityProblems
         ? "破損または読み取れない checkpoint があるため削除できません。"
         : "削除前の確認が完了しました。";
@@ -1789,12 +2400,19 @@ function bindEvents() {
       setStatus("破損または読み取れない checkpoint があるため削除できません。");
       return;
     }
+    const gc = CheckPoFrontendState.gcPlanPresentation(state.gcPlan);
+    if (gc.totalCount === 0) {
+      setStatus("削除できる不要データはありません。");
+      updateControls();
+      return;
+    }
     state.confirming = true;
     updateControls();
     let confirmed = false;
     try {
       confirmed = await confirmAction(
-        `${state.gcPlan.unreferencedBlobCount ?? 0} 件の不要 object を削除します。続行しますか？`,
+        `不要 object ${gc.objectCount} 件とmanifest chunk ${gc.manifestChunkCount} 件` +
+        `（合計 ${formatBytes(gc.totalBytes)}）を削除します。続行しますか？`,
         "削除",
       );
     } finally {
@@ -1803,15 +2421,28 @@ function bindEvents() {
     }
     if (!confirmed) return;
     await run("不要データを削除中", async () => {
-      const result = await invokeCommand("apply_gc", { projectPath: getProjectPath(), confirmed: true });
+      const result = await invokeCommand("apply_gc", {
+        projectPath: getProjectPath(),
+        expectedPlanId: state.gcPlan.planId,
+        confirmed: true,
+      });
+      invalidateStoredSize();
       state.gcPlan = null;
-      $("gcSummary").textContent = `削除 ${result.deletedBlobCount ?? 0} 件 / ${formatBytes(result.deletedBytes ?? 0)}`;
+      $("gcSummary").textContent =
+        `削除 object ${result.deletedBlobCount ?? 0} 件、` +
+        `manifest chunk ${result.deletedManifestChunkCount ?? 0} 件 / ` +
+        `${formatBytes(result.deletedBytes ?? 0)}`;
       $("gcResult").textContent = "不要データを削除しました。";
       await refreshProject();
     });
   });
   $("openProjectButton").addEventListener("click", async () => {
     const projectPath = $("projectPath").value.trim();
+    if (!projectPath) {
+      setStatus("Unity プロジェクトを選択してください。");
+      updateControls();
+      return;
+    }
     state.hiddenProjectPaths.delete(projectPath);
     const storageRootPath = $("registrationStorageRootPath").value.trim();
     const createInitialCheckpoint = wantsInitialCheckpoint("registrationInitialCheckpoint");
@@ -1821,6 +2452,24 @@ function bindEvents() {
           renderSnapshot(await invokeCommand("load_project", { projectPath }));
           setStatus("プロジェクトを開きました。");
         } catch (error) {
+          if (error?.kind === "storageRootUnavailable" && storageRootPath) {
+            const reconnect = await confirmAction(
+              `登録済みの保存先を読み込めません。選択した保存先 ${storageRootPath} に既存のチェックポイントデータがある場合、このプロジェクトを再接続します。`,
+              "保存先へ再接続",
+            );
+            if (!reconnect) throw error;
+            const snapshot = await invokeCommand("set_storage_root", {
+              projectPath,
+              storageRootPath,
+              confirmed: true,
+            });
+            invalidateStoredSize();
+            renderSnapshot(snapshot);
+            setStatus("チェックポイント保存先へ再接続しました。");
+            await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
+            $("projectRegistrationOverlay").hidden = true;
+            return;
+          }
           if (!shouldStartProjectAfterLoadError(error)) throw error;
           const snapshot = await invokeCommand("init_project", {
             projectPath,
@@ -1921,6 +2570,7 @@ function bindEvents() {
         name,
         initIfNeeded: false,
       });
+      invalidateStoredSize();
       state.selectedCheckpointId = created.checkpointId || created.checkpoint_id || null;
       $("checkpointName").value = "";
       updateControls();
@@ -1928,12 +2578,14 @@ function bindEvents() {
       await refreshLatestDiff({ allowBusy: true });
       const warningText = checkpointWarningsText(created.warnings);
       if (warningText) {
+        setOperationWarnings(created.warnings);
         setStatus(`チェックポイントを作成しましたが、警告があります。${warningText}`);
         setResult({
           warning: "チェックポイントを作成しましたが、警告があります。",
           details: created.warnings,
         });
       } else {
+        setOperationWarnings([]);
         setStatus("チェックポイントを作成しました。");
       }
     });
@@ -1980,6 +2632,10 @@ function bindEvents() {
         full: true,
       });
       $("verificationSummary").textContent = result.isValid ? "問題は見つかりませんでした。" : `問題があります: ${result.errors?.length ?? 0}`;
+    }, {
+      onCancelled: () => {
+        $("verificationSummary").textContent = "検証を中止しました。";
+      },
     });
   });
   $("verifyProjectButton").addEventListener("click", async () => {
@@ -1990,21 +2646,42 @@ function bindEvents() {
         full: true,
       });
       $("verificationSummary").textContent = result.isValid ? "問題は見つかりませんでした。" : `問題があります: ${result.errors?.length ?? 0}`;
+    }, {
+      onCancelled: () => {
+        $("verificationSummary").textContent = "検証を中止しました。";
+      },
     });
   });
   $("previewCleanupButton").addEventListener("click", async () => {
     await run("確認中", async () => {
-      const result = await invokeCommand("list_transactions", { projectPath: getProjectPath() });
-      $("cleanupSummary").textContent = `${result.length ?? 0} 件の未完了 transaction`;
+      const plan = await invokeCommand("analyze_transaction_cleanup", {
+        projectPath: getProjectPath(),
+      });
+      state.transactionCleanupPlan = plan;
+      $("cleanupSummary").textContent =
+        `削除対象 ${plan.directoryCount ?? 0} 件 / `
+        + `${plan.fileCount ?? 0} ファイル / ${formatBytes(plan.totalBytes ?? 0)}`;
+      $("cleanupResult").textContent = plan.directoryCount
+        ? "完了・復旧済み transaction の削除対象を確認しました。"
+        : "削除できる完了・復旧済み transaction はありません。";
+      updateControls();
     });
   });
   $("applyCleanupButton").addEventListener("click", async () => {
+    const plan = state.transactionCleanupPlan;
+    if (!CheckPoFrontendState.transactionCleanupPlanHasCandidates(plan)) {
+      setStatus("先にtransaction cleanupの削除対象を確認してください。");
+      updateControls();
+      return;
+    }
     state.confirming = true;
     updateControls();
     let confirmed = false;
     try {
       confirmed = await confirmAction(
-        "完了・復旧済み transaction の journal と backup を削除します。削除後は参照できません。続行しますか？",
+        `確認済みの完了・復旧済み transaction ${plan.directoryCount} 件`
+        + `（${formatBytes(plan.totalBytes ?? 0)}）のjournalとbackupを削除します。`
+        + "削除後は参照できません。続行しますか？",
         "削除",
       );
     } finally {
@@ -2015,9 +2692,14 @@ function bindEvents() {
     await run("片付け中", async () => {
       const result = await invokeCommand("cleanup_journals", {
         projectPath: getProjectPath(),
+        expectedPlan: plan,
         confirmed: true,
       });
-      $("cleanupResult").textContent = `削除 ${result.deletedDirectoryCount ?? 0} 件`;
+      state.transactionCleanupPlan = null;
+      $("cleanupSummary").textContent = t("cleanupEmpty");
+      $("cleanupResult").textContent =
+        `削除 ${result.deletedDirectoryCount ?? 0} 件 / ${formatBytes(result.deletedBytes ?? 0)}`;
+      updateControls();
     });
   });
   $("previewTempCleanupButton").addEventListener("click", async () => {
@@ -2052,6 +2734,7 @@ function bindEvents() {
     await run("一時ファイルを削除中", async () => {
       const result = await invokeCommand("cleanup_orphan_temp_files", {
         projectPath: getProjectPath(),
+        expectedPlanId: state.tempCleanupPlan.planId,
         confirmed: true,
       });
       state.tempCleanupPlan = null;
@@ -2095,6 +2778,10 @@ function renderProgress(progress) {
   if (!state.busy || !state.activeCommand) return;
   if (!immediatelyCancellableCommands.has(state.activeCommand)
     && !progressCancellableStartCommands.has(state.activeCommand)) return;
+  if (!operationCanCancelAtProgress(progress) && state.currentOperationCancellable) {
+    state.currentOperationCancellable = false;
+    updateControls();
+  }
   state.pendingProgress = progress;
   if (state.progressFrame !== null) return;
   state.progressFrame = requestAnimationFrame(() => {
@@ -2105,49 +2792,51 @@ function renderProgress(progress) {
   });
 }
 
-function renderProgressImmediately(progress) {
+function renderProgressImmediately(progress, uiOperationComplete = false) {
   if (!state.busy) return;
-  if (progress?.phase === "complete") {
+  const visiblePhase = CheckPoFrontendState.visibleProgressPhase(
+    progress?.phase,
+    uiOperationComplete,
+  );
+  if (["backendComplete", "uiComplete"].includes(visiblePhase)) {
     if (state.progressFrame !== null) cancelAnimationFrame(state.progressFrame);
     state.progressFrame = null;
     state.pendingProgress = null;
   }
   const total = Number(progress?.total || 0);
   const completed = Number(progress?.completed || 0);
-  const percent = total > 0 ? Math.max(0, Math.min(100, Math.floor((completed * 100) / total))) : undefined;
+  const percent = CheckPoFrontendState.operationProgressPercent(
+    state.activeCommand,
+    progress,
+    uiOperationComplete,
+  );
   const progressBar = $("busyProgress");
-  $("busyCommand").textContent = progressPhaseLabel(progress?.phase);
+  $("busyCommand").textContent = progressPhaseLabel(visiblePhase);
   progressBar.max = 100;
   progressBar.removeAttribute("value");
   if (percent !== undefined) progressBar.value = percent;
   $("busyProgressText").textContent = total > 0
     ? `${completed}/${total}${progress?.currentItem ? ` ${compactProgressItem(progress.currentItem)}` : ""}`
     : compactProgressItem(progress?.currentItem || "");
-  state.currentOperationCancellable = operationCanCancelAtProgress(progress);
+  state.currentOperationCancellable = operationCanCancelAtProgress({ ...progress, phase: visiblePhase });
   updateControls();
 }
 
 function operationCanCancelAtProgress(progress) {
   if (state.cancelRequested) return false;
-  if ([
-    "backingUp",
-    "removingDirectories",
-    "creatingDirectories",
-    "applying",
-    "finalizing",
-    "committingIndex",
-    "complete",
-  ].includes(progress?.phase)) return false;
-  if (progressCancellableStartCommands.has(state.activeCommand)) {
-    return progress?.phase === "scan" || progress?.phase === "storeCheckpoint";
-  }
-  return immediatelyCancellableCommands.has(state.activeCommand);
+  const cancellableAtStartOnly = progressCancellableStartCommands.has(state.activeCommand);
+  if (!cancellableAtStartOnly && !immediatelyCancellableCommands.has(state.activeCommand)) return false;
+  return CheckPoFrontendState.progressPhaseCanCancel(progress?.phase, cancellableAtStartOnly);
 }
 
 function progressPhaseLabel(phase) {
   return ({
     scan: "ファイル確認中",
     storeCheckpoint: "保存中",
+    writeCheckpointMetadata: "チェックポイント情報を書き込み中",
+    syncCheckpoint: "保存内容をディスクへ確定中",
+    readbackCheckpoint: "保存内容を検証中",
+    commitCheckpoint: "チェックポイントを公開中",
     planning: "戻す内容を確認中",
     staging: "復元準備中",
     backingUp: "変更を適用中",
@@ -2161,8 +2850,15 @@ function progressPhaseLabel(phase) {
     readingSnapshots: "チェックポイント一覧を集計中",
     aggregatingReferences: "保存データの参照を集計中",
     checkingObjects: "保存データの存在を確認中",
+    gcReadingSnapshots: "GC: チェックポイント確認中",
+    gcCheckingReferences: "GC: 参照データ確認中",
+    gcEnumeratingObjects: "GC: 保存データ列挙中",
+    gcEnumeratingManifestChunks: "GC: manifest chunk列挙中",
+    gcDeletingObjects: "GC: 不要データ削除中",
+    gcDeletingManifestChunks: "GC: 不要manifest chunk削除中",
     committingIndex: "一覧の更新を確定中",
-    complete: "完了",
+    backendComplete: t("backendCommandComplete"),
+    uiComplete: t("uiOperationComplete"),
   })[phase] || phase || "";
 }
 
@@ -2190,6 +2886,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   setResult({});
   if (tauriListen) {
     tauriListen("operation-progress", (event) => renderProgress(event.payload));
+    tauriListen("operation-close-pending", (event) => renderPendingClose(event.payload));
   }
   await restoreLastProject();
   checkForUpdate({ silent: true });

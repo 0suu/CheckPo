@@ -241,12 +241,6 @@ p {
   min-width: 0;
   border-radius: 8px;
   padding: 6px 8px;
-  cursor: context-menu;
-}
-
-.active-checkpoint-card:focus-visible {
-  outline: 2px solid var(--primary);
-  outline-offset: 2px;
 }
 
 .active-checkpoint-card.is-disabled {
@@ -583,6 +577,7 @@ p {
 
 .update-banner,
 .error-banner,
+.warning-banner,
 .pending-banner,
 .quarantine-banner,
 .project-warning-banner {
@@ -602,6 +597,10 @@ p {
   background: var(--danger-soft);
 }
 
+.warning-banner {
+  background: var(--warning-soft);
+}
+
 .pending-banner {
   background: var(--warning-soft);
 }
@@ -616,6 +615,7 @@ p {
 
 .update-banner div,
 .error-banner div,
+.warning-banner div,
 .pending-banner div,
 .quarantine-banner div,
 .project-warning-banner div {
@@ -639,6 +639,11 @@ p {
   font-size: 13px;
 }
 
+.warning-banner strong {
+  color: var(--warning);
+  font-size: 13px;
+}
+
 .quarantine-banner strong {
   color: var(--danger);
   font-size: 13px;
@@ -651,6 +656,7 @@ p {
 
 .update-banner span,
 .error-banner span,
+.warning-banner span,
 .pending-banner span,
 .quarantine-banner span,
 .project-warning-banner span {
@@ -1658,6 +1664,14 @@ pre {
   display: none;
 }
 
+.busy-close-notice {
+  max-width: 36rem;
+  color: var(--text);
+  font-size: 0.86rem;
+  font-weight: 700;
+  text-align: center;
+}
+
 .confirm-overlay {
   position: fixed;
   inset: 0;
@@ -1667,6 +1681,10 @@ pre {
   background: rgba(15, 23, 42, 0.32);
   backdrop-filter: blur(4px);
   padding: 18px;
+}
+
+.error-overlay {
+  z-index: 25;
 }
 
 .settings-overlay {
@@ -2046,6 +2064,22 @@ input[type="text"] {
   text-transform: uppercase;
 }
 
+.checkpoint-virtual-spacer {
+  position: relative;
+  min-width: 100%;
+}
+
+.checkpoint-row.checkpoint-virtual-row,
+.history-sidebar .checkpoint-row.checkpoint-virtual-row {
+  position: absolute;
+  right: 0;
+  left: 0;
+  box-sizing: border-box;
+  height: 32px;
+  min-height: 32px;
+  overflow: hidden;
+}
+
 .checkpoint-row,
 .history-sidebar .checkpoint-row {
   display: grid;
@@ -2059,6 +2093,11 @@ input[type="text"] {
   background: transparent;
   box-shadow: none;
   padding: 7px 10px;
+}
+
+.checkpoint-row[hidden],
+.checkpoint-section[hidden] {
+  display: none;
 }
 
 .history-sidebar .checkpoint-row::before {
@@ -2522,6 +2561,7 @@ input[type="text"] {
 
 .update-banner,
 .error-banner,
+.warning-banner,
 .pending-banner,
 .quarantine-banner,
 .project-warning-banner {
@@ -2823,6 +2863,7 @@ input[type="text"] {
   .toolbar-actions,
   .update-banner,
   .error-banner,
+  .warning-banner,
   .quarantine-banner,
   .project-warning-banner {
     align-items: stretch;
@@ -3033,6 +3074,13 @@ input[type="text"],
 :root[data-theme="dark"] .button.primary:hover:not(:disabled) {
   border-color: #ffffff;
   background: #ffffff;
+}
+
+.button.primary:disabled {
+  border-color: var(--border);
+  background: var(--control-bg);
+  color: var(--muted);
+  box-shadow: none;
 }
 
 :root[data-theme="dark"] .button.danger {

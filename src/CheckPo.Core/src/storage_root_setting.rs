@@ -1,8 +1,8 @@
 use crate::{
-    acquire_registry_lock, ensure_repo_outside_tracked_roots, load_project_marker, load_registry,
-    load_repo_config, marker_path, normalize_existing_dir, repo_root, update_registry_locked,
-    validate_unity_project_root, CheckPoError, ProjectContext, ProjectRoot, ProjectView, Result,
-    StorageRoot,
+    acquire_project_location_lock, acquire_registry_lock, ensure_repo_outside_project,
+    load_project_marker, load_registry, load_repo_config, marker_path, normalize_existing_dir,
+    repo_root, update_registry_locked, validate_unity_project_root, CheckPoError, ProjectContext,
+    ProjectRoot, ProjectView, Result, StorageRoot,
 };
 use std::path::Path;
 
@@ -19,6 +19,8 @@ pub fn set_project_storage_root(
             marker_path.display()
         )));
     }
+    let marker = load_project_marker(&marker_path)?;
+    let _location_lock = acquire_project_location_lock(&marker.project_id, "storage-root-set")?;
     let marker = load_project_marker(&marker_path)?;
     let registry_lock = acquire_registry_lock()?;
     let registry = load_registry()?;
@@ -47,7 +49,7 @@ pub fn set_project_storage_root(
         .map(|storage_root| repo_root(storage_root, &project_id))
         .filter(|repo_root| repo_root.exists());
     let new_repo_root = repo_root(&storage_root, &project_id);
-    ensure_repo_outside_tracked_roots(&project_root, &new_repo_root)?;
+    ensure_repo_outside_project(&project_root, &new_repo_root)?;
     load_repo_config(&new_repo_root, &project_id).map_err(|error| {
         crate::user_error(format!(
             "checkpoint repository was not found at {}. Move the existing repository there before changing the storage folder: {error}",
@@ -64,6 +66,9 @@ pub fn set_project_storage_root(
         warnings: Vec::new(),
     };
     let _repo_locks = lock_storage_root_repositories(old_repo_root.as_deref(), &context.repo_root)?;
+    ensure_repo_outside_project(context.project_root.as_path(), &context.repo_root)?;
+    load_repo_config(&context.repo_root, &context.project_id)?;
+    crate::validate_repository_layout_no_follow(&context.repo_root)?;
     if let (Some(old_storage_root), Some(old_repo_root)) = (old_storage_root, old_repo_root) {
         let old_context = ProjectContext {
             project_id: context.project_id.clone(),
@@ -73,6 +78,9 @@ pub fn set_project_storage_root(
             location_status: context.location_status,
             warnings: Vec::new(),
         };
+        ensure_repo_outside_project(old_context.project_root.as_path(), &old_context.repo_root)?;
+        load_repo_config(&old_context.repo_root, &old_context.project_id)?;
+        crate::validate_repository_layout_no_follow(&old_context.repo_root)?;
         crate::ensure_no_pending_transactions(&old_context)?;
         crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
     }

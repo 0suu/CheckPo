@@ -55,7 +55,7 @@
 
         <section class="detail-pane">
           <header class="detail-toolbar">
-            <div class="active-checkpoint-card" id="activeCheckpointCard" role="button" tabindex="0">
+            <div class="active-checkpoint-card" id="activeCheckpointCard">
               <h2 id="activeCheckpointTitle" data-i18n="noSelection">No checkpoint selected</h2>
               <p id="diffSummary" data-i18n="diffEmpty">Create a checkpoint to see changes since the latest checkpoint.</p>
             </div>
@@ -100,6 +100,13 @@
               <span id="errorBannerText"></span>
             </div>
             <button class="ghost-button" id="dismissErrorButton" type="button">閉じる</button>
+          </section>
+
+          <section class="warning-banner" id="warningBanner" role="status" aria-live="polite" hidden>
+            <div>
+              <strong data-i18n="warningBannerTitle">一部を完全に確認できませんでした</strong>
+              <span id="warningBannerText"></span>
+            </div>
           </section>
 
           <section class="quarantine-banner" id="unresolvedQuarantineBanner" hidden>
@@ -349,7 +356,7 @@
           <button class="ghost-button" id="closeProjectSelectionButton" type="button" data-i18n="close">Close</button>
         </header>
 
-        <div class="project-selection-list" id="projectSelectionList" role="listbox"></div>
+        <div class="project-selection-list" id="projectSelectionList" role="listbox" aria-label="登録済みプロジェクト"></div>
 
         <div class="dialog-actions">
           <button class="button primary" id="addProjectFromSelectionButton" type="button" data-i18n="addProject">Add project</button>
@@ -410,13 +417,24 @@
       </section>
     </div>
 
+    <div class="confirm-overlay error-overlay" id="errorOverlay" hidden>
+      <section class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="errorDialogTitle" aria-describedby="errorDialogText">
+        <h2 id="errorDialogTitle">操作を完了できませんでした</h2>
+        <p id="errorDialogText"></p>
+        <div class="confirm-actions">
+          <button class="button primary" id="dismissErrorDialogButton" type="button">閉じる</button>
+        </div>
+      </section>
+    </div>
+
     <div class="busy-overlay" id="busyOverlay" hidden>
-      <div class="busy-box">
+      <div class="busy-box" role="dialog" aria-modal="true" aria-labelledby="busyTitle">
         <div class="spinner" aria-hidden="true"></div>
         <strong id="busyTitle" data-i18n="working">Working...</strong>
         <span id="busyCommand"></span>
         <progress id="busyProgress" class="busy-progress" max="100"></progress>
         <span id="busyProgressText" class="busy-progress-text"></span>
+        <span id="busyCloseNotice" class="busy-close-notice" role="status" aria-live="assertive" hidden></span>
         <button class="button" id="cancelOperationButton" type="button" data-i18n="cancelOperation">Cancel</button>
       </div>
     </div>

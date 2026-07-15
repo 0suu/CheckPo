@@ -1,6 +1,7 @@
 use super::*;
 
 const QUARANTINE_RECORD_SCHEMA_VERSION_V1: u32 = 1;
+const MAX_QUARANTINE_RECORD_BYTES: u64 = 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +36,8 @@ pub fn unresolved_transaction_quarantines(
     project_path: impl AsRef<Path>,
 ) -> Result<Vec<UnresolvedTransactionQuarantine>> {
     let project = crate::load_project(project_path)?;
+    let _lock =
+        crate::acquire_project_repository_shared_lock(&project, "transaction-quarantine-status")?;
     unresolved_transaction_quarantines_for_project(&project)
 }
 
@@ -145,7 +148,7 @@ pub fn ensure_no_unresolved_transaction_quarantines(project: &ProjectContext) ->
 pub fn recover_transactions(project_path: impl AsRef<Path>) -> Result<TransactionRecoveryResult> {
     let project = crate::load_project(project_path)?;
     crate::ensure_project_location_allows_mutation(&project)?;
-    let _lock = acquire_repository_lock(&project.repo_root, "transaction-recover")?;
+    let _lock = crate::acquire_project_repository_lock(&project, "transaction-recover")?;
     let mut result = TransactionRecoveryResult {
         recovered_transaction_count: 0,
         failed_transaction_count: 0,
@@ -191,11 +194,23 @@ pub fn quarantine_transaction(
 
     let project = crate::load_project(project_path)?;
     crate::ensure_project_location_allows_mutation(&project)?;
-    let _lock = acquire_repository_lock(&project.repo_root, "transaction-quarantine")?;
+    let _lock = crate::acquire_project_repository_lock(&project, "transaction-quarantine")?;
     let tx_root = journals_dir(&project.repo_root).join(transaction_id);
     ensure_regular_transaction_directory(&tx_root)?;
 
     let journal_path = tx_root.join("journal.json");
+    if let Ok(journal) = read_transaction_journal(&journal_path) {
+        if validate_transaction_journal_identity(&tx_root, &journal).is_ok()
+            && matches!(
+                journal.state,
+                JournalState::Committed | JournalState::Recovered
+            )
+        {
+            return Err(crate::user_error(
+                "completed or recovered transactions cannot be quarantined; run transaction cleanup instead.",
+            ));
+        }
+    }
     let (project_was_verified_in_before_state, mut warnings) =
         inspect_project_before_state(&project, &tx_root, &journal_path);
     if !project_was_verified_in_before_state {
@@ -221,7 +236,8 @@ pub fn quarantine_transaction(
     let quarantine_name = format!("{transaction_id}-{}", Uuid::new_v4().simple());
     let quarantine_path = quarantine_root.join(&quarantine_name);
     let record_path = quarantine_root.join(format!("{quarantine_name}.json"));
-    write_json_atomic(
+    write_quarantine_json(
+        &project.repo_root,
         &record_path,
         &QuarantineRecord {
             schema_version: QUARANTINE_RECORD_SCHEMA_VERSION_V1,
@@ -233,12 +249,11 @@ pub fn quarantine_transaction(
             resolved_checkpoint_id: None,
         },
     )?;
-    if let Err(error) = fs::rename(&tx_root, &quarantine_path) {
-        let _ = fs::remove_file(&record_path);
-        return Err(crate::io_error(&tx_root, error));
+    if let Err(error) = move_repo_directory_anchored(&project.repo_root, &tx_root, &quarantine_path)
+    {
+        let _ = remove_repo_file_if_exists_anchored(&project.repo_root, &record_path);
+        return Err(error);
     }
-    crate::sync_parent_dir(&tx_root)?;
-    crate::sync_parent_dir(&quarantine_path)?;
 
     crate::diagnostics::log_warning(
         "transaction-quarantine",
@@ -255,11 +270,10 @@ pub fn quarantine_transaction(
     })
 }
 
-pub(crate) fn resolve_unverified_transaction_quarantines(
+pub(super) fn resolve_unverified_transaction_quarantines_unlocked(
     project: &ProjectContext,
     checkpoint_id: &SnapshotId,
 ) -> Result<usize> {
-    let _lock = acquire_repository_lock(&project.repo_root, "transaction-quarantine-resolve")?;
     let Some((quarantine_root, record_paths)) = quarantine_record_paths(project)? else {
         return Ok(0);
     };
@@ -274,7 +288,12 @@ pub(crate) fn resolve_unverified_transaction_quarantines(
         if quarantine_record_has_valid_resolution(&record_path)? {
             continue;
         }
-        write_quarantine_resolution(&record_path, checkpoint_id, &resolved_at_utc)?;
+        write_quarantine_resolution(
+            &project.repo_root,
+            &record_path,
+            checkpoint_id,
+            &resolved_at_utc,
+        )?;
         resolved_count += 1;
     }
     for entry in
@@ -291,7 +310,8 @@ pub(crate) fn resolve_unverified_transaction_quarantines(
         if fs::symlink_metadata(&record_path).is_ok() {
             continue;
         }
-        write_json_atomic(
+        write_quarantine_json(
+            &project.repo_root,
             &record_path,
             &QuarantineRecord {
                 schema_version: QUARANTINE_RECORD_SCHEMA_VERSION_V1,
@@ -303,19 +323,27 @@ pub(crate) fn resolve_unverified_transaction_quarantines(
                 resolved_checkpoint_id: None,
             },
         )?;
-        write_quarantine_resolution(&record_path, checkpoint_id, &resolved_at_utc)?;
+        write_quarantine_resolution(
+            &project.repo_root,
+            &record_path,
+            checkpoint_id,
+            &resolved_at_utc,
+        )?;
         resolved_count += 1;
     }
     Ok(resolved_count)
 }
 
 fn write_quarantine_resolution(
+    repo_root: &Path,
     record_path: &Path,
     checkpoint_id: &SnapshotId,
     resolved_at_utc: &str,
 ) -> Result<()> {
-    let bytes = fs::read(record_path).map_err(|error| crate::io_error(record_path, error))?;
-    write_json_atomic(
+    let anchored_repo = crate::storage::AnchoredRoot::open(repo_root)?;
+    let bytes = anchored_repo.read_bytes_bounded_path(record_path, MAX_QUARANTINE_RECORD_BYTES)?;
+    write_quarantine_json(
+        repo_root,
         &quarantine_resolution_path(record_path),
         &QuarantineResolutionRecord {
             schema_version: QUARANTINE_RECORD_SCHEMA_VERSION_V1,
@@ -324,6 +352,14 @@ fn write_quarantine_resolution(
             quarantine_record_digest: blake3::hash(&bytes).to_hex().to_string(),
         },
     )
+}
+
+fn write_quarantine_json<T: serde::Serialize>(
+    repo_root: &Path,
+    path: &Path,
+    value: &T,
+) -> Result<()> {
+    crate::storage::AnchoredRoot::open(repo_root)?.write_json_atomic_path(path, value)
 }
 
 fn quarantine_resolution_path(record_path: &Path) -> PathBuf {
@@ -340,14 +376,17 @@ fn quarantine_record_has_valid_resolution(record_path: &Path) -> Result<bool> {
     if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
         return Ok(false);
     }
-    let resolution = match crate::read_json::<QuarantineResolutionRecord>(&resolution_path) {
-        Ok(resolution) if resolution.schema_version == QUARANTINE_RECORD_SCHEMA_VERSION_V1 => {
-            resolution
-        }
-        Ok(_) | Err(_) => return Ok(false),
-    };
+    let repo_root = quarantine_repo_root_for_record_path(record_path)?;
+    let anchored_repo = crate::storage::AnchoredRoot::open(repo_root)?;
+    let resolution =
+        match anchored_repo.read_json_path::<QuarantineResolutionRecord>(&resolution_path) {
+            Ok(resolution) if resolution.schema_version == QUARANTINE_RECORD_SCHEMA_VERSION_V1 => {
+                resolution
+            }
+            Ok(_) | Err(_) => return Ok(false),
+        };
     let record_bytes =
-        fs::read(record_path).map_err(|error| crate::io_error(record_path, error))?;
+        anchored_repo.read_bytes_bounded_path(record_path, MAX_QUARANTINE_RECORD_BYTES)?;
     Ok(resolution.quarantine_record_digest == blake3::hash(&record_bytes).to_hex().as_str())
 }
 
@@ -379,7 +418,9 @@ fn quarantine_record_paths(project: &ProjectContext) -> Result<Option<(PathBuf, 
 }
 
 fn read_quarantine_record(path: &Path) -> Result<QuarantineRecord> {
-    let bytes = fs::read(path).map_err(|error| crate::io_error(path, error))?;
+    let repo_root = quarantine_repo_root_for_record_path(path)?;
+    let bytes = crate::storage::AnchoredRoot::open(repo_root)?
+        .read_bytes_bounded_path(path, MAX_QUARANTINE_RECORD_BYTES)?;
     let envelope: QuarantineRecordEnvelope =
         serde_json::from_slice(&bytes).map_err(|error| crate::json_error(path, error))?;
     if envelope.schema_version > QUARANTINE_RECORD_SCHEMA_VERSION_V1 {
@@ -396,6 +437,27 @@ fn read_quarantine_record(path: &Path) -> Result<QuarantineRecord> {
         )));
     }
     serde_json::from_slice(&bytes).map_err(|error| crate::json_error(path, error))
+}
+
+fn quarantine_repo_root_for_record_path(path: &Path) -> Result<&Path> {
+    let quarantine_root = path.parent().ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "quarantine record has no parent: {}",
+            path.display()
+        ))
+    })?;
+    if quarantine_root.file_name() != Some(std::ffi::OsStr::new("quarantined-journals")) {
+        return Err(CheckPoError::Corruption(format!(
+            "quarantine record is outside the canonical repository namespace: {}",
+            path.display()
+        )));
+    }
+    quarantine_root.parent().ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "quarantine record has no repository root: {}",
+            path.display()
+        ))
+    })
 }
 
 fn inspect_project_before_state(
@@ -423,6 +485,8 @@ fn inspect_project_before_state(
             let current = current_file_state(project, &operation.path)?;
             if current.as_ref().map(|state| &state.hash) != operation.before_hash.as_ref()
                 || current.as_ref().map(|state| state.size_bytes) != operation.before_size_bytes
+                || current.as_ref().map(|state| state.modified_at_utc.as_str())
+                    != operation.before_modified_at_utc.as_deref()
             {
                 return Ok(false);
             }
@@ -533,18 +597,107 @@ fn recover_one(project: &ProjectContext, pending: &PendingTransaction) -> Result
             .collect(),
     )?;
 
+    cleanup_transaction_materialization_temps(project, &journal)?;
+
     if transaction_needs_rollback(project, &journal, &backup_paths, &staged_paths)? {
         invalidate_operation_fingerprints(project, &journal.operations)?;
         recover_topology_transaction(project, &backup_root, &journal)?;
     }
-    if staged_root.exists() {
-        fs::remove_dir_all(&staged_root).map_err(|error| crate::io_error(&staged_root, error))?;
-        crate::sync_parent_dir(&staged_root)?;
-    }
+    remove_repository_tree_if_exists(&project.repo_root, &staged_root)?;
     journal.state = JournalState::Recovered;
     journal.updated_at_utc = crate::now_utc_string();
     write_journal(&pending.journal_path, &journal)?;
     Ok(())
+}
+
+fn remove_repository_tree_if_exists(repo_root: &Path, directory: &Path) -> Result<()> {
+    let relative = directory.strip_prefix(repo_root).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "transaction cleanup is outside repository: {}",
+            directory.display()
+        ))
+    })?;
+    let root = crate::storage::AnchoredRoot::open(repo_root)?;
+    let (parent, leaf) = match root.open_parent_for_mutation(relative, false) {
+        Ok(value) => value,
+        Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    let tree = match parent.open_directory_for_mutation(&leaf) {
+        Ok(tree) => tree,
+        Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    tree.remove_tree_contents()?;
+    drop(tree);
+    parent.unlink_dir(&leaf)?;
+    parent.sync_all()?;
+    root.verify_root_binding()
+}
+
+fn cleanup_transaction_materialization_temps(
+    project: &ProjectContext,
+    journal: &TransactionJournal,
+) -> Result<()> {
+    let anchored_project = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    for operation in journal.operations.iter().filter(|operation| {
+        matches!(
+            operation.operation_type,
+            FileOperationType::Restore | FileOperationType::Replace
+        )
+    }) {
+        let destination = operation
+            .path
+            .to_project_path(project.project_root.as_path());
+        let temporary = transaction_materialization_temp_path(
+            &destination,
+            &operation.path,
+            &journal.transaction_id,
+        )?;
+        let relative = temporary
+            .strip_prefix(project.project_root.as_path())
+            .map_err(|_| {
+                CheckPoError::Corruption(format!(
+                    "transaction materialization temp is outside project: {}",
+                    temporary.display()
+                ))
+            })?;
+        let (parent, leaf) = match anchored_project.open_parent_for_mutation(relative, false) {
+            Ok(value) => value,
+            Err(CheckPoError::Io { source, .. })
+                if matches!(
+                    source.kind(),
+                    ErrorKind::NotFound | ErrorKind::NotADirectory
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        match parent.open_file(&leaf) {
+            Ok(file) => {
+                parent.unlink_file_if_bound(&leaf, file)?;
+                parent.sync_all()?;
+            }
+            Err(CheckPoError::Corruption(_)) => {
+                return Err(CheckPoError::Corruption(format!(
+                    "transaction materialization temp is not a regular file: {}",
+                    temporary.display()
+                )))
+            }
+            Err(CheckPoError::Io { source, .. })
+                if matches!(
+                    source.kind(),
+                    ErrorKind::NotFound | ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    anchored_project.verify_root_binding()
 }
 
 fn ensure_regular_transaction_directory(tx_root: &Path) -> Result<()> {
@@ -651,8 +804,15 @@ fn ensure_before_state_restored(
     operations: &[FileOperation],
 ) -> Result<()> {
     for operation in operations {
-        if current_hash_for_recovery(project, &operation.path, &journal_before_paths(operations))?
-            != operation.before_hash
+        let current = current_file_state_for_recovery(
+            project,
+            &operation.path,
+            &journal_before_paths(operations),
+        )?;
+        if current.as_ref().map(|state| &state.hash) != operation.before_hash.as_ref()
+            || current.as_ref().map(|state| state.size_bytes) != operation.before_size_bytes
+            || current.as_ref().map(|state| state.modified_at_utc.as_str())
+                != operation.before_modified_at_utc.as_deref()
         {
             return Err(CheckPoError::Corruption(format!(
                 "transaction recovery did not restore before state for {}",
@@ -681,11 +841,12 @@ fn recover_topology_transaction(
         CheckPoError::Corruption(format!("invalid backup root: {}", backup_root.display()))
     })?;
     let recovery_after_root = transaction_root.join("recovery-after");
-    for operation in journal
-        .operations
-        .iter()
-        .filter(|operation| operation.after_hash.is_some())
-    {
+    for operation in journal.operations.iter().filter(|operation| {
+        matches!(
+            operation.operation_type,
+            FileOperationType::Restore | FileOperationType::Replace
+        )
+    }) {
         let Some(after_hash) = operation.after_hash.as_ref() else {
             continue;
         };
@@ -730,18 +891,12 @@ fn recover_topology_transaction(
         let path = directory.to_project_path(project.project_root.as_path());
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {
-                fs::remove_dir(&path).map_err(|error| {
-                    if error.kind() == ErrorKind::DirectoryNotEmpty {
-                        CheckPoError::WorkingTreeChanged(directory.to_string())
-                    } else {
-                        crate::io_error(&path, error)
-                    }
-                })?;
-                crate::sync_parent_dir(&path)?;
+                remove_project_directory(project, directory)?;
             }
             Ok(metadata)
                 if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
             Ok(_) => return Err(CheckPoError::WorkingTreeChanged(directory.to_string())),
             Err(error) => return Err(crate::io_error(&path, error)),
         }
@@ -756,11 +911,29 @@ fn recover_topology_transaction(
     let mut backed_up = journal
         .operations
         .iter()
-        .filter(|operation| operation.before_hash.is_some())
+        .filter(|operation| {
+            matches!(
+                operation.operation_type,
+                FileOperationType::Delete | FileOperationType::Replace
+            )
+        })
         .collect::<Vec<_>>();
     backed_up.sort_by(|left, right| left.path.cmp(&right.path));
     for operation in backed_up {
-        recover_before_file(project, backup_root, operation, &before_paths)?;
+        recover_before_file(
+            project,
+            backup_root,
+            operation,
+            &before_paths,
+            &journal.transaction_id,
+        )?;
+    }
+    for operation in journal
+        .operations
+        .iter()
+        .filter(|operation| operation.operation_type == FileOperationType::SetMetadata)
+    {
+        recover_project_file_mtime(project, operation)?;
     }
     ensure_before_state_restored(project, &journal.operations)
 }
@@ -779,24 +952,56 @@ fn recovery_after_path(
 }
 
 fn existing_held_after_file(
+    project: &ProjectContext,
     destination: &Path,
     path: &TrackedUnityFilePath,
     transaction_id: &str,
     expected_hash: &ObjectId,
 ) -> Result<Option<PathBuf>> {
     let held = recovery_after_path(destination, path, transaction_id)?;
-    match fs::symlink_metadata(&held) {
-        Ok(metadata) if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {
-            verify_path_hash(&held, expected_hash)?;
-            Ok(Some(held))
+    let relative = held
+        .strip_prefix(project.project_root.as_path())
+        .map_err(|_| {
+            CheckPoError::Corruption(format!("invalid recovery quarantine: {}", held.display()))
+        })?;
+    let root = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    let (parent, leaf) = match root.open_parent(relative, false) {
+        Ok(value) => value,
+        Err(CheckPoError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                ErrorKind::NotFound | ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
         }
-        Ok(_) => Err(CheckPoError::Corruption(format!(
-            "recovery quarantine is not a regular file: {}",
-            held.display()
-        ))),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(crate::io_error(&held, error)),
+        Err(error) => return Err(error),
+    };
+    let mut file = match parent.open_file(&leaf) {
+        Ok(file) => file,
+        Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            return Ok(None)
+        }
+        Err(CheckPoError::Corruption(_)) => {
+            return Err(CheckPoError::Corruption(format!(
+                "recovery quarantine is not a regular file: {}",
+                held.display()
+            )))
+        }
+        Err(error) => return Err(error),
+    };
+    let actual = file.hash()?.object_id;
+    if &actual != expected_hash {
+        return Err(CheckPoError::ObjectHashMismatch(format!(
+            "{} expected {}, got {}",
+            held.display(),
+            expected_hash,
+            actual
+        )));
     }
+    parent.verify_file_binding(&leaf, &file)?;
+    root.verify_root_binding()?;
+    Ok(Some(held))
 }
 
 fn preserve_after_file_for_recovery(
@@ -805,25 +1010,111 @@ fn preserve_after_file_for_recovery(
     expected_hash: &ObjectId,
     recovery_after_root: &Path,
 ) -> Result<()> {
-    crate::create_dir_all_no_follow(&project.repo_root, recovery_after_root)?;
     let preserved = recovery_after_root.join(expected_hash.as_str());
-    match fs::symlink_metadata(&preserved) {
-        Ok(metadata) if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {
-            verify_path_hash(&preserved, expected_hash)?;
-            return Ok(());
+    let preserved_relative = preserved.strip_prefix(&project.repo_root).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "recovery copy is outside repository: {}",
+            preserved.display()
+        ))
+    })?;
+    let repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
+    let (preserved_parent, preserved_leaf) =
+        repo.open_parent_for_mutation(preserved_relative, true)?;
+    match preserved_parent.open_file(&preserved_leaf) {
+        Ok(mut file) => {
+            let actual = file.hash()?.object_id;
+            if &actual != expected_hash {
+                return Err(CheckPoError::ObjectHashMismatch(format!(
+                    "{} expected {}, got {}",
+                    preserved.display(),
+                    expected_hash,
+                    actual
+                )));
+            }
+            preserved_parent.verify_file_binding(&preserved_leaf, &file)?;
+            return repo.verify_root_binding();
         }
-        Ok(_) => {
+        Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {}
+        Err(CheckPoError::Corruption(_)) => {
             return Err(CheckPoError::Corruption(format!(
                 "recovery copy is not a regular file: {}",
                 preserved.display()
             )))
         }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(crate::io_error(&preserved, error)),
+        Err(error) => return Err(error),
     }
-    crate::storage::reflink_or_copy_file_no_replace(source, &preserved)?;
-    verify_path_hash(&preserved, expected_hash)?;
-    crate::sync_parent_dir(&preserved)
+
+    let temporary_leaf = std::ffi::OsString::from(format!(
+        ".checkpo-preserve-{}.tmp",
+        &expected_hash.as_str()[..16]
+    ));
+    if let Ok(file) = preserved_parent.open_file(&temporary_leaf) {
+        preserved_parent.unlink_file_if_bound(&temporary_leaf, file)?;
+        preserved_parent.sync_all()?;
+    }
+    let source_relative = source
+        .strip_prefix(project.project_root.as_path())
+        .map_err(|_| {
+            CheckPoError::Corruption(format!(
+                "recovery source is outside project: {}",
+                source.display()
+            ))
+        })?;
+    let project_root = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    let (source_parent, source_leaf) = project_root.open_parent(source_relative, false)?;
+    let mut source_file = source_parent.open_file(&source_leaf)?;
+    let source_hash = source_file.hash()?;
+    if &source_hash.object_id != expected_hash {
+        return Err(CheckPoError::ObjectHashMismatch(format!(
+            "{} expected {}, got {}",
+            source.display(),
+            expected_hash,
+            source_hash.object_id
+        )));
+    }
+    let mut output = preserved_parent.create_new_file(&temporary_leaf)?;
+    let result = (|| -> Result<()> {
+        let copied = source_file.copy_and_hash_to(&mut output, &preserved)?;
+        if &copied.object_id != expected_hash {
+            return Err(CheckPoError::ObjectHashMismatch(format!(
+                "recovery preservation copy mismatch: {}",
+                source.display()
+            )));
+        }
+        output.sync_all()?;
+        let readback = output.hash()?;
+        if &readback.object_id != expected_hash {
+            return Err(CheckPoError::ObjectHashMismatch(format!(
+                "recovery preservation readback mismatch: {}",
+                preserved.display()
+            )));
+        }
+        source_parent.verify_file_binding(&source_leaf, &source_file)?;
+        preserved_parent.rename_no_replace_to(
+            &temporary_leaf,
+            &output,
+            &preserved_parent,
+            &preserved_leaf,
+        )?;
+        preserved_parent.sync_all()?;
+        project_root.verify_root_binding()?;
+        repo.verify_root_binding()
+    })();
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let cleanup_leaf = if preserved_parent
+                .verify_file_binding(&preserved_leaf, &output)
+                .is_ok()
+            {
+                preserved_leaf.as_os_str()
+            } else {
+                temporary_leaf.as_os_str()
+            };
+            let _ = preserved_parent.unlink_file_if_bound(cleanup_leaf, output);
+            Err(error)
+        }
+    }
 }
 
 fn remove_existing_held_after_file(
@@ -834,14 +1125,48 @@ fn remove_existing_held_after_file(
     expected_hash: &ObjectId,
     recovery_after_root: &Path,
 ) -> Result<()> {
-    let Some(held) =
-        existing_held_after_file(destination, &operation.path, transaction_id, expected_hash)?
+    let Some(held) = existing_held_after_file(
+        project,
+        destination,
+        &operation.path,
+        transaction_id,
+        expected_hash,
+    )?
     else {
         return Ok(());
     };
     preserve_after_file_for_recovery(project, &held, expected_hash, recovery_after_root)?;
-    fs::remove_file(&held).map_err(|error| crate::io_error(&held, error))?;
-    crate::sync_parent_dir(&held)
+    remove_anchored_project_file(project, &held, expected_hash)
+}
+
+fn remove_anchored_project_file(
+    project: &ProjectContext,
+    path: &Path,
+    expected_hash: &ObjectId,
+) -> Result<()> {
+    let relative = path
+        .strip_prefix(project.project_root.as_path())
+        .map_err(|_| {
+            CheckPoError::Corruption(format!(
+                "recovery removal is outside project: {}",
+                path.display()
+            ))
+        })?;
+    let root = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    let (parent, leaf) = root.open_parent_for_mutation(relative, false)?;
+    let mut file = parent.open_file(&leaf)?;
+    let actual = file.hash()?.object_id;
+    if &actual != expected_hash {
+        return Err(CheckPoError::ObjectHashMismatch(format!(
+            "{} expected {}, got {}",
+            path.display(),
+            expected_hash,
+            actual
+        )));
+    }
+    parent.unlink_file_if_bound(&leaf, file)?;
+    parent.sync_all()?;
+    root.verify_root_binding()
 }
 
 fn remove_after_file_for_recovery(
@@ -852,25 +1177,41 @@ fn remove_after_file_for_recovery(
     expected_hash: &ObjectId,
     recovery_after_root: &Path,
 ) -> Result<()> {
-    if existing_held_after_file(destination, &operation.path, transaction_id, expected_hash)?
-        .is_some()
+    if existing_held_after_file(
+        project,
+        destination,
+        &operation.path,
+        transaction_id,
+        expected_hash,
+    )?
+    .is_some()
     {
         return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
     }
     preserve_after_file_for_recovery(project, destination, expected_hash, recovery_after_root)?;
-    ensure_project_parent_is_safe(project, &operation.path)?;
     let held = recovery_after_path(destination, &operation.path, transaction_id)?;
-    fs::rename(destination, &held).map_err(|error| crate::io_error(destination, error))?;
-    crate::sync_parent_dir(destination)?;
-    if let Err(error) = verify_path_hash(&held, expected_hash) {
-        if fs::symlink_metadata(destination).is_err() {
-            let _ = fs::rename(&held, destination);
-            let _ = crate::sync_parent_dir(destination);
-        }
+    let root = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    let relative = Path::new(operation.path.as_str());
+    let (parent, destination_leaf) = root.open_parent_for_mutation(relative, false)?;
+    let held_leaf = held
+        .file_name()
+        .ok_or_else(|| CheckPoError::InvalidTrackedPath(held.display().to_string()))?;
+    let mut file = parent.open_file(&destination_leaf)?;
+    let actual = file.hash()?.object_id;
+    if &actual != expected_hash {
+        return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
+    }
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    root.verify_parent_binding(parent_relative, &parent)?;
+    parent.rename_no_replace_to(&destination_leaf, &file, &parent, held_leaf)?;
+    if let Err(error) = root.verify_parent_binding(parent_relative, &parent) {
+        let _ = parent.rename_no_replace_to(held_leaf, &file, &parent, &destination_leaf);
         return Err(error);
     }
-    fs::remove_file(&held).map_err(|error| crate::io_error(&held, error))?;
-    crate::sync_parent_dir(&held)
+    parent.sync_all()?;
+    parent.unlink_file_if_bound(held_leaf, file)?;
+    parent.sync_all()?;
+    root.verify_root_binding()
 }
 
 fn recover_before_file(
@@ -878,6 +1219,7 @@ fn recover_before_file(
     backup_root: &Path,
     operation: &FileOperation,
     before_paths: &BTreeSet<TrackedUnityFilePath>,
+    transaction_id: &str,
 ) -> Result<()> {
     let destination = operation
         .path
@@ -886,20 +1228,17 @@ fn recover_before_file(
     let expected = required_before_hash(operation)?;
     match current_hash_for_recovery(project, &operation.path, before_paths)? {
         Some(current) if &current == expected => {
-            if backup_regular_file_exists(&backup_path)? {
-                let modified = fs::metadata(&backup_path)
-                    .and_then(|metadata| metadata.modified())
-                    .map_err(|error| crate::io_error(&backup_path, error))?;
-                filetime::set_file_mtime(&destination, FileTime::from_system_time(modified))
-                    .map_err(|error| crate::io_error(&destination, error))?;
-                sync_project_file(&destination)?;
-                crate::sync_parent_dir(&destination)?;
-            }
-            Ok(())
+            restore_before_mtime_for_recovery(project, operation)
         }
         None if backup_regular_file_exists(&backup_path)? => {
-            verify_path_hash(&backup_path, expected)?;
-            copy_backup_file_to_project(project, operation, &backup_path, &destination)
+            verify_path_hash(&project.repo_root, &backup_path, expected)?;
+            copy_backup_file_to_project(
+                project,
+                operation,
+                &backup_path,
+                &destination,
+                transaction_id,
+            )
         }
         Some(_) => Err(CheckPoError::WorkingTreeChanged(operation.path.to_string())),
         None => Err(CheckPoError::Corruption(format!(
@@ -915,11 +1254,45 @@ fn current_hash_for_recovery(
     before_paths: &BTreeSet<TrackedUnityFilePath>,
 ) -> Result<Option<ObjectId>> {
     let full_path = path.to_project_path(project.project_root.as_path());
+    let anchored_project = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
     match fs::symlink_metadata(&full_path) {
         Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) => {
             Err(CheckPoError::WorkingTreeChanged(path.to_string()))
         }
-        Ok(metadata) if metadata.is_file() => hash_file(&full_path).map(Some),
+        Ok(metadata) if metadata.is_file() => {
+            current_file_state_from_anchor(&anchored_project, path).map(|state| Some(state.hash))
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(None),
+        Ok(_) => Err(CheckPoError::WorkingTreeChanged(path.to_string())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if error.kind() == ErrorKind::NotADirectory
+                && before_paths.iter().any(|candidate| {
+                    path.as_str()
+                        .strip_prefix(candidate.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                }) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(crate::io_error(&full_path, error)),
+    }
+}
+
+fn current_file_state_for_recovery(
+    project: &ProjectContext,
+    path: &TrackedUnityFilePath,
+    before_paths: &BTreeSet<TrackedUnityFilePath>,
+) -> Result<Option<CurrentFileState>> {
+    let full_path = path.to_project_path(project.project_root.as_path());
+    let anchored_project = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    match fs::symlink_metadata(&full_path) {
+        Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) => {
+            Err(CheckPoError::WorkingTreeChanged(path.to_string()))
+        }
+        Ok(metadata) if metadata.is_file() => {
+            current_file_state_from_anchor(&anchored_project, path).map(Some)
+        }
         Ok(metadata) if metadata.is_dir() => Ok(None),
         Ok(_) => Err(CheckPoError::WorkingTreeChanged(path.to_string())),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -949,7 +1322,8 @@ fn quarantine_unknown_transaction_locked(
     let quarantine_name = format!("unknown-{}", Uuid::new_v4().simple());
     let quarantine_path = quarantine_root.join(&quarantine_name);
     let record_path = quarantine_root.join(format!("{quarantine_name}.json"));
-    write_json_atomic(
+    write_quarantine_json(
+        &project.repo_root,
         &record_path,
         &QuarantineRecord {
             schema_version: QUARANTINE_RECORD_SCHEMA_VERSION_V1,
@@ -961,12 +1335,11 @@ fn quarantine_unknown_transaction_locked(
             resolved_checkpoint_id: None,
         },
     )?;
-    if let Err(error) = fs::rename(tx_root, &quarantine_path) {
-        let _ = fs::remove_file(&record_path);
-        return Err(crate::io_error(tx_root, error));
+    if let Err(error) = move_repo_directory_anchored(&project.repo_root, tx_root, &quarantine_path)
+    {
+        let _ = remove_repo_file_if_exists_anchored(&project.repo_root, &record_path);
+        return Err(error);
     }
-    crate::sync_parent_dir(tx_root)?;
-    crate::sync_parent_dir(&quarantine_path)?;
     crate::diagnostics::log_warning(
         "transaction-recovery",
         &format!(
@@ -975,6 +1348,63 @@ fn quarantine_unknown_transaction_locked(
         ),
     );
     Ok(quarantine_path)
+}
+
+fn move_repo_directory_anchored(repo_root: &Path, source: &Path, destination: &Path) -> Result<()> {
+    let source_relative = source.strip_prefix(repo_root).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "transaction directory is outside repository: {}",
+            source.display()
+        ))
+    })?;
+    let destination_relative = destination.strip_prefix(repo_root).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "quarantine directory is outside repository: {}",
+            destination.display()
+        ))
+    })?;
+    let root = crate::storage::AnchoredRoot::open(repo_root)?;
+    let (source_parent, source_leaf) = root.open_parent_for_mutation(source_relative, false)?;
+    let source_directory = source_parent.open_directory(&source_leaf)?;
+    let (destination_parent, destination_leaf) =
+        root.open_parent_for_mutation(destination_relative, true)?;
+    let source_parent_relative = source_relative.parent().unwrap_or_else(|| Path::new(""));
+    let destination_parent_relative = destination_relative
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    root.verify_parent_binding(source_parent_relative, &source_parent)?;
+    root.verify_parent_binding(destination_parent_relative, &destination_parent)?;
+    source_parent.rename_directory_no_replace_to_owned(
+        &source_leaf,
+        source_directory,
+        &destination_parent,
+        &destination_leaf,
+    )?;
+    destination_parent.sync_all()?;
+    source_parent.sync_all()?;
+    root.verify_parent_binding(destination_parent_relative, &destination_parent)?;
+    root.verify_root_binding()
+}
+
+fn remove_repo_file_if_exists_anchored(repo_root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(repo_root).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "quarantine record is outside repository: {}",
+            path.display()
+        ))
+    })?;
+    let root = crate::storage::AnchoredRoot::open(repo_root)?;
+    let (parent, leaf) = root.open_parent_for_mutation(relative, false)?;
+    let file = match parent.open_file(&leaf) {
+        Ok(file) => file,
+        Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    parent.unlink_file_if_bound(&leaf, file)?;
+    parent.sync_all()?;
+    root.verify_root_binding()
 }
 
 pub(super) fn invalidate_operation_fingerprints(

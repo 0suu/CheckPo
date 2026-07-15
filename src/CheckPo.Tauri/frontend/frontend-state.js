@@ -14,6 +14,8 @@
     objectHashMismatch: "チェックポイントの保存データが一致しません。破損チェックを実行してください。",
     workingTreeChanged: "処理中にUnity側のファイルが変わりました。保存が落ち着いてから、もう一度実行してください。",
     repositoryLocked: "別のCheckPo処理が実行中です。完了してから、もう一度実行してください。",
+    storageRootConflict: "指定した保存先と登録済みの保存先が一致しません。保存先の再接続を明示的に実行してください。",
+    storageRootUnavailable: "登録済みのチェックポイント保存先を読み込めません。移動先の保存フォルダーを選んで再接続してください。",
     operationBusy: "別の処理が実行中です。完了してから、もう一度実行してください。",
     pendingTransaction: "中断された作業があります。先に復旧してください。",
     unresolvedTransactionQuarantine: "プロジェクトの状態を安全と確認できません。既知のチェックポイントへ全体復元してください。",
@@ -21,6 +23,7 @@
     indexUnavailable: "一覧用データを読み込めませんでした。インデックスの再構築を実行してください。",
     unsupportedFormat: "この保存データは、より新しいCheckPoで作られています。データを変更せず、CheckPoを更新してください。",
     copiedProjectSuspected: "同じプロジェクトのコピーが見つかりました。使用する場所を確認してください。",
+    unsafeFolderMetaOperation: "フォルダーの .meta だけを戻すことはできません。Unity上でフォルダーの状態を確認してください。",
     cancelled: "処理を中止しました。",
     io: "ファイルを読み書きできませんでした。空き容量、権限、他のアプリの使用状況を確認してください。",
     json: "CheckPoの保存データを読み込めませんでした。破損チェックを実行してください。",
@@ -47,6 +50,7 @@
       renamingCheckpointId: null,
       gcPlan: null,
       tempCleanupPlan: null,
+      transactionCleanupPlan: null,
       rollbackPlan: null,
       rollbackPlanContext: null,
       rollbackRequestSerial: 0,
@@ -54,6 +58,14 @@
       unresolvedQuarantines: [],
       failedTransactions: [],
       currentDiff: null,
+      diffRefreshFailure: null,
+      latestDiffCheckpointId: null,
+      latestDiffChangeCount: null,
+      latestDiffExact: false,
+      latestDiffRefreshFailure: null,
+      latestDiffWarnings: [],
+      snapshotWarnings: [],
+      operationWarnings: [],
       diffRequestSerial: 0,
       queuedDiffRefreshOptions: null,
       currentDiffFilter: "all",
@@ -62,6 +74,215 @@
       currentDiffSelectedPaths: new Set(),
       lastSelectedChangePath: null,
     };
+  }
+
+  function diffResultIsComplete(currentDiff, diffRefreshFailure) {
+    return Boolean(currentDiff)
+      && !diffRefreshFailure
+      && !(Array.isArray(currentDiff.warnings) && currentDiff.warnings.length > 0);
+  }
+
+  function diffResultIsProvisionalZero(diff) {
+    return Boolean(diff)
+      && diffChangeCount(diff) === 0
+      && (!diff.exact || (Array.isArray(diff.warnings) && diff.warnings.length > 0));
+  }
+
+  function warningBannerText(warningGroups, limit = 5) {
+    const warnings = [];
+    const seen = new Set();
+    for (const group of Array.isArray(warningGroups) ? warningGroups : []) {
+      for (const value of Array.isArray(group) ? group : []) {
+        const warning = String(value || "").trim();
+        if (!warning || seen.has(warning)) continue;
+        seen.add(warning);
+        warnings.push(warning);
+      }
+    }
+    const safeLimit = Math.max(1, Number(limit) || 1);
+    const shown = warnings.slice(0, safeLimit);
+    const omitted = warnings.length - shown.length;
+    return {
+      count: warnings.length,
+      text: `${shown.join(" / ")}${omitted > 0 ? ` / 他 ${omitted} 件` : ""}`,
+    };
+  }
+
+  function gcPlanPresentation(plan) {
+    const value = plan && typeof plan === "object" ? plan : {};
+    const number = (input) => {
+      const parsed = Number(input);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    };
+    const objectCount = number(value.unreferencedBlobCount);
+    const objectBytes = number(value.unreferencedLogicalBytes);
+    const manifestChunkCount = number(value.unreferencedManifestChunkCount);
+    const manifestChunkBytes = number(value.unreferencedManifestChunkBytes);
+    return {
+      objectCount,
+      objectBytes,
+      manifestChunkCount,
+      manifestChunkBytes,
+      totalCount: objectCount + manifestChunkCount,
+      totalBytes: objectBytes + manifestChunkBytes,
+    };
+  }
+
+  function diffChangeCount(diff) {
+    return (diff?.added?.length ?? 0)
+      + (diff?.modified?.length ?? 0)
+      + (diff?.deleted?.length ?? 0);
+  }
+
+  function latestDiffState(diff, exact) {
+    const warnings = Array.isArray(diff?.warnings) ? diff.warnings.map(String) : [];
+    const changeCount = diffChangeCount(diff);
+    return {
+      warnings,
+      exact: Boolean(exact) && warnings.length === 0,
+      changeCount: warnings.length || (!exact && changeCount === 0)
+        ? null
+        : changeCount,
+    };
+  }
+
+  function latestDiffCountText(changeCount, exact) {
+    if (!Number.isFinite(changeCount) || (!exact && changeCount === 0)) return "…";
+    return exact ? String(changeCount) : `${changeCount}+`;
+  }
+
+  function detectedDiffCountText(changeCount, marker = "") {
+    return `${changeCount}${marker}`;
+  }
+
+  function isCancellationKind(kind) {
+    return String(kind || "") === "cancelled";
+  }
+
+  function normalizedPathInput(value) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return "";
+    return trimmed.replace(/[\\/]+$/, "") || trimmed;
+  }
+
+  function samePathInput(left, right) {
+    const normalizedLeft = normalizedPathInput(left);
+    return Boolean(normalizedLeft) && normalizedLeft === normalizedPathInput(right);
+  }
+
+  function checkpointSearchText(checkpoint) {
+    const value = checkpoint && typeof checkpoint === "object" ? checkpoint : {};
+    return `${value.name || ""} ${value.checkpointId || ""} ${value.createdAtUtc || ""}`.toLowerCase();
+  }
+
+  function filterCheckpoints(checkpoints, query) {
+    const values = Array.isArray(checkpoints) ? checkpoints : [];
+    const normalizedQuery = String(query || "").trim().toLowerCase();
+    if (!normalizedQuery) return values;
+    return values.filter((checkpoint) => checkpointSearchText(checkpoint).includes(normalizedQuery));
+  }
+
+  function checkpointNavigationIndex(length, currentIndex, key, pageSize = 10) {
+    const count = Math.max(0, Number(length) || 0);
+    if (count === 0) return -1;
+    const current = Number.isInteger(currentIndex) ? currentIndex : -1;
+    const page = Math.max(1, Number(pageSize) || 1);
+    if (key === "Home") return 0;
+    if (key === "End") return count - 1;
+    if (key === "ArrowDown") return current < 0 ? 0 : Math.min(count - 1, current + 1);
+    if (key === "ArrowUp") return current < 0 ? count - 1 : Math.max(0, current - 1);
+    if (key === "PageDown") return current < 0 ? 0 : Math.min(count - 1, current + page);
+    if (key === "PageUp") return current < 0 ? count - 1 : Math.max(0, current - page);
+    return current;
+  }
+
+  function transactionCleanupPlanHasCandidates(plan) {
+    return Number(plan?.directoryCount || 0) > 0
+      && Array.isArray(plan?.candidates)
+      && plan.candidates.length > 0;
+  }
+
+  function restorePlanHasChanges(plan) {
+    const operationCount = Number(plan?.restoreCount || 0)
+      + Number(plan?.replaceCount || 0)
+      + Number(plan?.deleteCount || 0)
+      + Number(plan?.metadataCount || 0)
+      + (plan?.directoriesToRemove?.length ?? 0)
+      + (plan?.directoriesToCreate?.length ?? 0);
+    return Boolean(plan?.hasChanges) && operationCount > 0;
+  }
+
+  function restorePlanCanApply(plan, unresolvedQuarantineCount = 0) {
+    return restorePlanHasChanges(plan) || Number(unresolvedQuarantineCount || 0) > 0;
+  }
+
+  function pathConfirmationPreview(paths, limit = 30) {
+    const normalized = (Array.isArray(paths) ? paths : []).map((path) => String(path));
+    const safeLimit = Math.max(1, Number(limit) || 1);
+    const shown = normalized.slice(0, safeLimit);
+    const omitted = normalized.length - shown.length;
+    return {
+      total: normalized.length,
+      omitted,
+      text: `${shown.join("\n")}${omitted > 0 ? `\n... 他 ${omitted} 件` : ""}`,
+    };
+  }
+
+  function visibleProgressPhase(phase, uiOperationComplete = false) {
+    if (uiOperationComplete) return "uiComplete";
+    return phase === "complete" ? "backendComplete" : phase;
+  }
+
+  function operationProgressPercent(command, progress, uiOperationComplete = false) {
+    const phase = visibleProgressPhase(progress?.phase, uiOperationComplete);
+    if (phase === "uiComplete") return 100;
+    if (phase === "backendComplete") return 99;
+    const total = Number(progress?.total || 0);
+    const completed = Number(progress?.completed || 0);
+    if ([
+      "create_checkpoint",
+      "init_project",
+      "start_as_separate_project",
+    ].includes(command)) {
+      const checkpointRanges = {
+        scan: [0, 25],
+        storeCheckpoint: [25, 70],
+        writeCheckpointMetadata: [70, 75],
+        syncCheckpoint: [75, 85],
+        readbackCheckpoint: [85, 95],
+        commitCheckpoint: [95, 99],
+      };
+      const range = checkpointRanges[phase];
+      if (range) {
+        const ratio = total > 0 ? Math.max(0, Math.min(1, completed / total)) : 1;
+        return Math.min(99, Math.floor(range[0] + ((range[1] - range[0]) * ratio)));
+      }
+    }
+    if (!(total > 0)) return undefined;
+    const ratio = Math.max(0, Math.min(1, completed / total));
+    return Math.min(99, Math.floor(ratio * 100));
+  }
+
+  function progressPhaseCanCancel(phase, cancellableAtStartOnly = false) {
+    if ([
+      "backingUp",
+      "removingDirectories",
+      "creatingDirectories",
+      "applying",
+      "finalizing",
+      "committingIndex",
+      "commitCheckpoint",
+      "backendComplete",
+      "uiComplete",
+    ].includes(phase)) return false;
+    if (!cancellableAtStartOnly) return true;
+    return [
+      "scan",
+      "storeCheckpoint",
+      "writeCheckpointMetadata",
+      "syncCheckpoint",
+      "readbackCheckpoint",
+    ].includes(phase);
   }
 
   function checkpointIndexPresentation(status) {
@@ -82,6 +303,12 @@
       message: messages[state] || (state === "current" ? "" : messages.corrupt),
       detail: normalized.detail || null,
     };
+  }
+
+  function storageSummaryWithRetainedSize(storage, previousStoredSize) {
+    if (!storage) return null;
+    if (storage.storedSizeBytes != null || previousStoredSize == null) return storage;
+    return { ...storage, storedSizeBytes: previousStoredSize };
   }
 
   function localizedErrorDisplay(kind, raw, providedDetail) {
@@ -324,19 +551,41 @@
     buildChangeTreeModel,
     cancelAndWaitForIdle,
     checkpointIndexPresentation,
+    checkpointNavigationIndex,
+    checkpointSearchText,
     collectChangeTreeFilePaths,
     collectChangeTreeFolderPaths,
+    diffResultIsComplete,
+    diffResultIsProvisionalZero,
+    diffChangeCount,
+    latestDiffState,
+    latestDiffCountText,
+    detectedDiffCountText,
     flattenChangeTreeRows,
+    filterCheckpoints,
+    gcPlanPresentation,
+    isCancellationKind,
     projectChanged,
     projectIdentity,
     projectScopedStateReset,
     mergeDiffRefreshOptions,
+    normalizedPathInput,
+    operationProgressPercent,
+    pathConfirmationPreview,
+    progressPhaseCanCancel,
     removeProjectFromHistory,
     restorableLastProjectPath,
     localizedErrorDisplay,
     retainPendingTransactionFailures,
     retainVisibleChangeSelection,
     selectChangePaths,
+    samePathInput,
+    storageSummaryWithRetainedSize,
+    transactionCleanupPlanHasCandidates,
+    restorePlanHasChanges,
+    restorePlanCanApply,
     virtualTreeWindowRange,
+    visibleProgressPhase,
+    warningBannerText,
   };
 });

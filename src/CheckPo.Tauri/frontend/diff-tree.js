@@ -14,15 +14,26 @@ const diffVirtualView = {
   resizeObserver: null,
 };
 
-function renderDiff(diff, checkpointId = state.selectedCheckpointId) {
+function renderDiff(diff, checkpointId = state.selectedCheckpointId, options = {}) {
   const previousCheckpointId = state.currentDiff?.checkpointId || null;
   const checkpoint = state.checkpoints.find((item) => item.checkpointId === checkpointId) || null;
-  state.currentDiff = { ...diff, checkpointId, checkpoint };
+  state.currentDiff = { ...diff, checkpointId, checkpoint, exact: Boolean(options.exact) };
+  if (checkpointId === latestCheckpointId()) {
+    const latest = CheckPoFrontendState.latestDiffState(diff, state.currentDiff.exact);
+    state.latestDiffCheckpointId = checkpointId;
+    state.latestDiffWarnings = latest.warnings;
+    state.latestDiffExact = latest.exact;
+    state.latestDiffRefreshFailure = null;
+    state.latestDiffChangeCount = latest.changeCount;
+  }
+  state.diffRefreshFailure = null;
   if (!state.diffTreeTouched) state.diffTreeOpenPaths = new Set();
   renderCurrentDiff(state.currentDiff, {
     resetScroll: previousCheckpointId !== checkpointId,
   });
-  renderCheckpoints();
+  renderPendingFileCount();
+  updateWorkingCheckpointRow();
+  renderWarningBanner();
 }
 
 function renderCurrentDiff(diff, options = {}) {
@@ -31,16 +42,27 @@ function renderCurrentDiff(diff, options = {}) {
   const deletedCount = diff.deleted?.length ?? 0;
   const unchangedCount = diff.unchangedCount ?? 0;
   const checkpoint = diff.checkpoint || null;
-  $("diffSummary").textContent = tf("fileChangesSummary", {
-    total: addedCount + editedCount + deletedCount,
-    added: addedCount,
-    modified: editedCount,
-    deleted: deletedCount,
-    unchanged: unchangedCount,
-  });
+  const unconfirmedZero = CheckPoFrontendState.diffResultIsProvisionalZero(diff);
+  const hasWarnings = Array.isArray(diff.warnings) && diff.warnings.length > 0;
+  const detectedOnly = !diff.exact || hasWarnings;
+  $("diffSummary").textContent = unconfirmedZero
+    ? t(hasWarnings ? "warningFileChangesSummary" : "provisionalFileChangesSummary")
+    : detectedOnly
+      ? tf(hasWarnings ? "warningDetectedFileChangesSummary" : "detectedFileChangesSummary", {
+        total: addedCount + editedCount + deletedCount,
+        added: addedCount,
+        modified: editedCount,
+        deleted: deletedCount,
+      })
+    : tf("fileChangesSummary", {
+      total: addedCount + editedCount + deletedCount,
+      added: addedCount,
+      modified: editedCount,
+      deleted: deletedCount,
+      unchanged: unchangedCount,
+    });
   $("activeCheckpointTitle").textContent =
     `${checkpoint?.name || checkpoint?.checkpointId || t("latestCheckpoint")} → ${t("workingFolder")}`;
-  $("pendingFileCount").textContent = `${addedCount + editedCount + deletedCount}${t("fileUnit")}`;
   updateFilterChips(addedCount, editedCount, deletedCount);
   renderChangeGroups([
     [t("added"), diff.added || [], "added"],
@@ -79,7 +101,12 @@ function renderChangeGroups(groups, options = {}) {
     const empty = document.createElement("div");
     empty.className = "diff-empty-state";
     const message = document.createElement("p");
-    message.textContent = t("noFileChanges");
+    const unconfirmedZero = CheckPoFrontendState.diffResultIsProvisionalZero(state.currentDiff);
+    const hasWarnings = Array.isArray(state.currentDiff?.warnings)
+      && state.currentDiff.warnings.length > 0;
+    message.textContent = unconfirmedZero
+      ? t(hasWarnings ? "warningNoFileChanges" : "provisionalNoFileChanges")
+      : t("noFileChanges");
     const button = document.createElement("button");
     button.className = "button primary";
     button.type = "button";
@@ -469,7 +496,8 @@ function diffDestructiveActionBlocked() {
     || !state.projectPath
     || state.pendingTransactions.length > 0
     || state.unresolvedQuarantines.length > 0
-    || state.projectLocationStatus === "copiedSuspected";
+    || state.projectLocationStatus === "copiedSuspected"
+    || !CheckPoFrontendState.diffResultIsComplete(state.currentDiff, state.diffRefreshFailure);
 }
 
 function changeFileDescription(type) {
@@ -479,8 +507,19 @@ function changeFileDescription(type) {
 }
 
 function currentChangeCount() {
-  const diff = state.currentDiff;
-  return (diff?.added?.length ?? 0) + (diff?.modified?.length ?? 0) + (diff?.deleted?.length ?? 0);
+  return CheckPoFrontendState.diffChangeCount(state.currentDiff);
+}
+
+function latestChangeCount() {
+  return Number.isFinite(state.latestDiffChangeCount)
+    ? state.latestDiffChangeCount
+    : 0;
+}
+
+function renderPendingFileCount() {
+  const count = state.latestDiffChangeCount;
+  $("pendingFileCount").textContent =
+    `${CheckPoFrontendState.latestDiffCountText(count, state.latestDiffExact)}${t("fileUnit")}`;
 }
 
 function currentFilteredChanges() {
@@ -496,6 +535,9 @@ function currentFilteredChanges() {
 }
 
 function updateFilterChips(addedCount, modifiedCount, deletedCount) {
+  const hasWarnings = Array.isArray(state.currentDiff?.warnings)
+    && state.currentDiff.warnings.length > 0;
+  const detectedOnly = Boolean(state.currentDiff) && (!state.currentDiff.exact || hasWarnings);
   const counts = {
     all: addedCount + modifiedCount + deletedCount,
     added: addedCount,
@@ -505,7 +547,12 @@ function updateFilterChips(addedCount, modifiedCount, deletedCount) {
   document.querySelectorAll("[data-diff-filter]").forEach((button) => {
     const filter = button.dataset.diffFilter;
     const prefix = filter === "added" ? "＋" : filter === "modified" ? "✎" : filter === "deleted" ? "−" : t("all");
-    button.textContent = `${prefix} ${counts[filter] ?? 0}`;
+    const marker = hasWarnings
+      ? "?"
+      : detectedOnly && (filter === "all" || filter === "modified")
+        ? "+"
+        : "";
+    button.textContent = `${prefix} ${CheckPoFrontendState.detectedDiffCountText(counts[filter] ?? 0, marker)}`;
     button.classList.toggle("is-active", state.currentDiffFilter === filter);
   });
 }
@@ -530,7 +577,8 @@ function updateSelectedDiffButton() {
     || state.confirming
     || state.pendingTransactions.length > 0
     || state.unresolvedQuarantines.length > 0
-    || state.projectLocationStatus === "copiedSuspected";
+    || state.projectLocationStatus === "copiedSuspected"
+    || !CheckPoFrontendState.diffResultIsComplete(state.currentDiff, state.diffRefreshFailure);
 }
 
 function renderAggregateBadges(container, counts) {

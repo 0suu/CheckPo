@@ -62,6 +62,27 @@ pub fn log_operation_error(operation: &str, error: &str) {
     tracing::error!(operation, error, "operation failed");
 }
 
+pub fn log_checkpoint_create_metrics(
+    project_path: &std::path::Path,
+    result: &crate::ProfiledCheckpointResult,
+) {
+    match serde_json::to_string(&result.create_metrics) {
+        Ok(metrics) => tracing::info!(
+            operation = "checkpoint-create",
+            project = %project_path.display(),
+            checkpoint_id = %result.summary.checkpoint_id,
+            metrics,
+            "checkpoint create metrics"
+        ),
+        Err(error) => tracing::warn!(
+            operation = "checkpoint-create",
+            project = %project_path.display(),
+            error = %error,
+            "checkpoint create metrics could not be serialized"
+        ),
+    }
+}
+
 pub(crate) fn log_warning(operation: &str, warning: &str) {
     tracing::warn!(operation, warning, "operation warning");
 }

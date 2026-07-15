@@ -2,6 +2,8 @@ use crate::{CheckpointSummary, ProjectContext, Result, SnapshotId};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+const MAX_CHECKPOINT_NAMES_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub(crate) fn apply_checkpoint_name_overrides(
     project: &ProjectContext,
     checkpoints: &mut [CheckpointSummary],
@@ -22,11 +24,16 @@ pub(crate) fn read_checkpoint_name_overrides(
     project: &ProjectContext,
 ) -> (BTreeMap<String, String>, Vec<String>) {
     let path = crate::checkpoint_names_path(&project.repo_root);
-    if !path.exists() {
-        return (BTreeMap::new(), Vec::new());
-    }
-    let value = match crate::read_json::<Value>(&path) {
+    let value = match crate::storage::AnchoredRoot::open(&project.repo_root).and_then(|root| {
+        let bytes = root.read_bytes_bounded_path(&path, MAX_CHECKPOINT_NAMES_FILE_BYTES)?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|error| crate::json_error(&path, error))
+    }) {
         Ok(value) => value,
+        Err(crate::CheckPoError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return (BTreeMap::new(), Vec::new());
+        }
         Err(error) => {
             return (
                 BTreeMap::new(),
@@ -64,6 +71,13 @@ pub(crate) fn read_checkpoint_name_overrides(
             ));
             continue;
         };
+        if name.len() > crate::storage::merkle_codec::MAX_CHECKPOINT_NAME_BYTES {
+            warnings.push(format!(
+                "checkpoint display name for {checkpoint_id} exceeds {} bytes and was ignored",
+                crate::storage::merkle_codec::MAX_CHECKPOINT_NAME_BYTES
+            ));
+            continue;
+        }
         names.insert(checkpoint_id.clone(), name.to_string());
     }
     (names, warnings)
@@ -73,7 +87,8 @@ pub(crate) fn write_checkpoint_name_overrides(
     project: &ProjectContext,
     names: &BTreeMap<String, String>,
 ) -> Result<()> {
-    crate::write_json_atomic(&crate::checkpoint_names_path(&project.repo_root), names)
+    crate::storage::AnchoredRoot::open(&project.repo_root)?
+        .write_json_atomic(std::path::Path::new("refs/checkpoint_names.json"), names)
 }
 
 fn read_checkpoint_name_overrides_for_mutation(

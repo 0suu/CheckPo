@@ -53,6 +53,7 @@ pub fn build_plan_with_progress_and_cancellation(
                         CurrentFileState {
                             hash: file.hash,
                             size_bytes: file.size_bytes,
+                            modified_at_utc: file.modified_at_utc,
                         },
                     )
                 })
@@ -66,6 +67,7 @@ pub fn build_plan_with_progress_and_cancellation(
                         path: file.path.clone(),
                         before_hash: None,
                         before_size_bytes: None,
+                        before_modified_at_utc: None,
                         after_hash: Some(file.content_hash().clone()),
                         after_size_bytes: Some(file.content_size_bytes()),
                         after_modified_at_utc: Some(file.modified_at_utc.clone()),
@@ -76,11 +78,23 @@ pub fn build_plan_with_progress_and_cancellation(
                             path: file.path.clone(),
                             before_hash: Some(current.hash.clone()),
                             before_size_bytes: Some(current.size_bytes),
+                            before_modified_at_utc: Some(current.modified_at_utc.clone()),
                             after_hash: Some(file.content_hash().clone()),
                             after_size_bytes: Some(file.content_size_bytes()),
                             after_modified_at_utc: Some(file.modified_at_utc.clone()),
                         })
                     }
+                    Some(current) if current.modified_at_utc != file.modified_at_utc => operations
+                        .push(FileOperation {
+                            operation_type: FileOperationType::SetMetadata,
+                            path: file.path.clone(),
+                            before_hash: Some(current.hash.clone()),
+                            before_size_bytes: Some(current.size_bytes),
+                            before_modified_at_utc: Some(current.modified_at_utc.clone()),
+                            after_hash: Some(file.content_hash().clone()),
+                            after_size_bytes: Some(file.content_size_bytes()),
+                            after_modified_at_utc: Some(file.modified_at_utc.clone()),
+                        }),
                     Some(_) => {}
                 }
                 report_operation_progress(
@@ -99,6 +113,7 @@ pub fn build_plan_with_progress_and_cancellation(
                         operation_type: FileOperationType::Delete,
                         before_hash: Some(current.hash),
                         before_size_bytes: Some(current.size_bytes),
+                        before_modified_at_utc: Some(current.modified_at_utc),
                         path,
                         after_hash: None,
                         after_size_bytes: None,
@@ -134,6 +149,7 @@ pub fn build_plan_with_progress_and_cancellation(
                             path: path.clone(),
                             before_hash: None,
                             before_size_bytes: None,
+                            before_modified_at_utc: None,
                             after_hash: Some(file.content_hash().clone()),
                             after_size_bytes: Some(file.content_size_bytes()),
                             after_modified_at_utc: Some(file.modified_at_utc.clone()),
@@ -142,8 +158,21 @@ pub fn build_plan_with_progress_and_cancellation(
                             operations.push(FileOperation {
                                 operation_type: FileOperationType::Replace,
                                 path: path.clone(),
+                                before_hash: Some(current.hash.clone()),
+                                before_size_bytes: Some(current.size_bytes),
+                                before_modified_at_utc: Some(current.modified_at_utc.clone()),
+                                after_hash: Some(file.content_hash().clone()),
+                                after_size_bytes: Some(file.content_size_bytes()),
+                                after_modified_at_utc: Some(file.modified_at_utc.clone()),
+                            })
+                        }
+                        Some(current) if current.modified_at_utc != file.modified_at_utc => {
+                            operations.push(FileOperation {
+                                operation_type: FileOperationType::SetMetadata,
+                                path: path.clone(),
                                 before_hash: Some(current.hash),
                                 before_size_bytes: Some(current.size_bytes),
+                                before_modified_at_utc: Some(current.modified_at_utc),
                                 after_hash: Some(file.content_hash().clone()),
                                 after_size_bytes: Some(file.content_size_bytes()),
                                 after_modified_at_utc: Some(file.modified_at_utc.clone()),
@@ -158,6 +187,7 @@ pub fn build_plan_with_progress_and_cancellation(
                                 path: path.clone(),
                                 before_hash: Some(current.hash),
                                 before_size_bytes: Some(current.size_bytes),
+                                before_modified_at_utc: Some(current.modified_at_utc),
                                 after_hash: None,
                                 after_size_bytes: None,
                                 after_modified_at_utc: None,
@@ -350,6 +380,7 @@ fn normalize_discard_selection_with_snapshot<'a>(
     snapshot_paths: impl Iterator<Item = &'a TrackedUnityFilePath>,
     selected: &[TrackedUnityFilePath],
 ) -> Result<Vec<TrackedUnityFilePath>> {
+    reject_selected_directory_meta(project, selected)?;
     let snapshot_paths = snapshot_paths.cloned().collect::<BTreeSet<_>>();
     let mut effective = selected.iter().cloned().collect::<BTreeSet<_>>();
     loop {
@@ -374,6 +405,29 @@ fn normalize_discard_selection_with_snapshot<'a>(
         }
     }
     Ok(effective.into_iter().collect())
+}
+
+fn reject_selected_directory_meta(
+    project: &ProjectContext,
+    selected: &[TrackedUnityFilePath],
+) -> Result<()> {
+    for path in selected {
+        let value = path.as_str();
+        if !value.starts_with("Assets/") {
+            continue;
+        }
+        let Some(asset) = value.strip_suffix(".meta") else {
+            continue;
+        };
+        let asset = TrackedUnityFilePath::parse(asset)?;
+        if matches!(
+            current_path_kind(project, &asset)?,
+            CurrentPathKind::Directory
+        ) {
+            return Err(CheckPoError::UnsafeFolderMetaOperation(path.to_string()));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -543,6 +597,13 @@ pub(super) fn validate_expected_plan(project: &ProjectContext, plan: &OperationP
 }
 
 fn validate_plan_shape(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {
+    if plan.schema_version != crate::OPERATION_PLAN_SCHEMA_VERSION {
+        return Err(CheckPoError::Corruption(format!(
+            "unsupported operation plan schema version: found {}, supported {}",
+            plan.schema_version,
+            crate::OPERATION_PLAN_SCHEMA_VERSION
+        )));
+    }
     if !plan.warnings.is_empty() {
         return Err(CheckPoError::Corruption(
             "operation plan contains scan warnings and cannot be applied".to_string(),
@@ -566,7 +627,16 @@ fn validate_plan_shape(project: &ProjectContext, plan: &OperationPlan) -> Result
                 .iter()
                 .filter(|operation| operation.operation_type == FileOperationType::Delete)
                 .count()
-        || plan.has_changes == plan.operations.is_empty()
+        || plan.metadata_count
+            != plan
+                .operations
+                .iter()
+                .filter(|operation| operation.operation_type == FileOperationType::SetMetadata)
+                .count()
+        || plan.has_changes
+            != (!plan.operations.is_empty()
+                || !plan.directories_to_remove.is_empty()
+                || !plan.directories_to_create.is_empty())
     {
         return Err(CheckPoError::Corruption(
             "operation plan counts are inconsistent".to_string(),
@@ -684,6 +754,7 @@ pub(super) fn validate_journal_operations(
                 })?;
                 if operation.before_hash.is_some()
                     || operation.before_size_bytes.is_some()
+                    || operation.before_modified_at_utc.is_some()
                     || operation.after_hash.as_ref() != Some(file.content_hash())
                     || operation.after_size_bytes != Some(file.content_size_bytes())
                     || operation.after_modified_at_utc.as_deref()
@@ -704,6 +775,7 @@ pub(super) fn validate_journal_operations(
                 })?;
                 if operation.before_hash.is_none()
                     || operation.before_size_bytes.is_none()
+                    || operation.before_modified_at_utc.is_none()
                     || operation.after_hash.as_ref() != Some(file.content_hash())
                     || operation.after_size_bytes != Some(file.content_size_bytes())
                     || operation.after_modified_at_utc.as_deref()
@@ -718,6 +790,7 @@ pub(super) fn validate_journal_operations(
             FileOperationType::Delete => {
                 if operation.before_hash.is_none()
                     || operation.before_size_bytes.is_none()
+                    || operation.before_modified_at_utc.is_none()
                     || operation.after_hash.is_some()
                     || operation.after_size_bytes.is_some()
                     || operation.after_modified_at_utc.is_some()
@@ -725,6 +798,30 @@ pub(super) fn validate_journal_operations(
                 {
                     return Err(CheckPoError::Corruption(format!(
                         "invalid delete operation for {}",
+                        operation.path
+                    )));
+                }
+            }
+            FileOperationType::SetMetadata => {
+                let file = snapshot_files.get(&operation.path).ok_or_else(|| {
+                    CheckPoError::Corruption(format!(
+                        "metadata operation missing snapshot entry for {}",
+                        operation.path
+                    ))
+                })?;
+                if operation.before_hash.is_none()
+                    || operation.before_size_bytes.is_none()
+                    || operation.before_modified_at_utc.is_none()
+                    || operation.before_hash.as_ref() != Some(file.content_hash())
+                    || operation.before_size_bytes != Some(file.content_size_bytes())
+                    || operation.after_hash.as_ref() != Some(file.content_hash())
+                    || operation.after_size_bytes != Some(file.content_size_bytes())
+                    || operation.after_modified_at_utc.as_deref()
+                        != Some(file.modified_at_utc.as_str())
+                    || operation.before_modified_at_utc == operation.after_modified_at_utc
+                {
+                    return Err(CheckPoError::Corruption(format!(
+                        "invalid metadata operation for {}",
                         operation.path
                     )));
                 }

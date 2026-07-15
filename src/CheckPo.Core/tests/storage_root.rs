@@ -9,7 +9,10 @@ fn setup() -> (
     std::path::PathBuf,
 ) {
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let guard = TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let guard = TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
     std::env::set_var("CHECKPO_DATA_DIR", &data);
@@ -77,6 +80,53 @@ fn set_project_storage_root_uses_manually_moved_repository() {
 }
 
 #[test]
+fn portable_repository_set_roundtrips_without_local_indexes_or_journals() {
+    let (_guard, _temp, project, data) = setup();
+    let tracked = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&tracked, "one").unwrap();
+    let view = core::init_project(&project).unwrap();
+    let first = core::create_checkpoint(&project, "first", Default::default()).unwrap();
+    fs::write(&tracked, "two").unwrap();
+    let second = core::create_checkpoint(&project, "second", Default::default()).unwrap();
+    let old_repo = view.storage_root_path.join("repos").join(&view.project_id);
+    let new_storage = data.join("portable-restore");
+    let new_repo = new_storage.join("repos").join(&view.project_id);
+    fs::create_dir_all(&new_repo).unwrap();
+    fs::copy(old_repo.join("repo.json"), new_repo.join("repo.json")).unwrap();
+    for relative in ["refs", "inventory", "snapshots", "manifests", "objects"] {
+        copy_dir(&old_repo.join(relative), &new_repo.join(relative));
+    }
+    for relative in ["indexes", "journals/transactions", "tmp", "locks"] {
+        fs::create_dir_all(new_repo.join(relative)).unwrap();
+    }
+    fs::remove_dir_all(&old_repo).unwrap();
+
+    core::set_project_storage_root(&project, &new_storage).unwrap();
+    core::rebuild_index(&project).unwrap();
+
+    let checkpoints = core::list_checkpoints(&project).unwrap();
+    assert_eq!(checkpoints.len(), 2);
+    assert_eq!(checkpoints[0].checkpoint_id, second.checkpoint_id);
+    assert!(core::verify_project(&project, false).unwrap().is_valid);
+    assert!(core::verify_project(&project, true).unwrap().is_valid);
+    let clean = core::diff_checkpoint(&project, second.checkpoint_id.as_str()).unwrap();
+    assert!(clean.added.is_empty() && clean.modified.is_empty() && clean.deleted.is_empty());
+
+    fs::write(&tracked, "changed after import").unwrap();
+    let restore = core::preview_restore(&project, first.checkpoint_id.as_str()).unwrap();
+    core::apply_restore_plan(
+        &project,
+        first.checkpoint_id.as_str(),
+        restore,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert_eq!(fs::read_to_string(&tracked).unwrap(), "one");
+    let gc = core::analyze_gc(&project).unwrap();
+    assert!(!gc.has_integrity_problems);
+}
+
+#[test]
 fn set_project_storage_root_locks_old_repository_when_copy_exists() {
     let (_guard, _temp, project, data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
@@ -115,7 +165,7 @@ fn set_project_storage_root_rejects_old_repository_pending_transaction_when_copy
     let new_storage = data.join("new-store");
     let new_repo = new_storage.join("repos").join(&view.project_id);
     copy_dir(&old_repo, &new_repo);
-    let pending = old_repo.join("journals/pendingtx");
+    let pending = old_repo.join("journals/transactions/pendingtx");
     fs::create_dir_all(&pending).unwrap();
     fs::write(
         pending.join("journal.json"),
@@ -158,6 +208,25 @@ fn init_project_uses_custom_storage_root_for_new_project() {
         custom_storage.canonicalize().unwrap()
     );
     assert!(custom_storage.join("repos").join(&view.project_id).is_dir());
+}
+
+#[test]
+fn init_rejects_explicit_storage_root_that_conflicts_with_registry() {
+    let (_guard, temp, project, _data) = setup();
+    let original_storage = temp.path().join("storage-a");
+    let conflicting_storage = temp.path().join("storage-b");
+    fs::create_dir_all(&original_storage).unwrap();
+    fs::create_dir_all(&conflicting_storage).unwrap();
+    let original = core::init_project_with_storage_root(&project, &original_storage).unwrap();
+
+    let error = core::init_project_with_storage_root(&project, &conflicting_storage).unwrap_err();
+
+    assert!(matches!(
+        error,
+        core::CheckPoError::StorageRootConflict { .. }
+    ));
+    let loaded = core::load_project_view(&project).unwrap();
+    assert_eq!(loaded.storage_root_path, original.storage_root_path);
 }
 
 #[test]
@@ -249,7 +318,24 @@ fn set_project_storage_root_rejects_repository_inside_tracked_folder() {
 
     let error = core::set_project_storage_root(&project, &dangerous_storage).unwrap_err();
 
-    assert!(error.to_string().contains("tracked Unity folder"));
+    assert!(error.to_string().contains("inside the Unity project"));
+}
+
+#[test]
+fn init_rejects_repository_anywhere_inside_unity_project() {
+    let (_guard, _temp, project, _data) = setup();
+    for relative in ["Library/CheckPo", "Temp/CheckPo", ".checkpo/storage"] {
+        let storage = project.join(relative);
+        fs::create_dir_all(&storage).unwrap();
+        let error = core::init_project_with_storage_root(&project, &storage).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must not be inside the Unity project"),
+            "{relative}: {error}"
+        );
+        assert!(!project.join(".checkpo/project.json").exists());
+    }
 }
 
 fn copy_dir(source: &std::path::Path, destination: &std::path::Path) {

@@ -6,21 +6,64 @@ pub struct FileLock {
     _parent: File,
 }
 
-pub type RepositoryLock = FileLock;
+pub struct RepositoryLock {
+    _file_lock: FileLock,
+    _repo_root: AnchoredRoot,
+    _locks_directory: AnchoredParent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
 
 pub fn acquire_repository_lock(repo_root: &Path, operation: &str) -> Result<RepositoryLock> {
-    let lock_dir = repo_root.join("locks");
-    fs::create_dir_all(&lock_dir).map_err(|error| io_error(&lock_dir, error))?;
-    FileLock::acquire(&lock_dir.join("repository.lock"), operation)
+    acquire_repository_lock_mode(repo_root, operation, LockMode::Exclusive)
+}
+
+pub fn acquire_repository_shared_lock(repo_root: &Path, operation: &str) -> Result<RepositoryLock> {
+    acquire_repository_lock_mode(repo_root, operation, LockMode::Shared)
+}
+
+fn acquire_repository_lock_mode(
+    repo_root: &Path,
+    operation: &str,
+    mode: LockMode,
+) -> Result<RepositoryLock> {
+    let anchored_repo = AnchoredRoot::open(repo_root)?;
+    let locks_relative = Path::new("locks");
+    let locks_directory = anchored_repo.open_directory(locks_relative, true)?;
+    anchored_repo.verify_parent_binding(locks_relative, &locks_directory)?;
+    let lock_path = repo_root.join("locks/repository.lock");
+    let file_lock = match mode {
+        LockMode::Exclusive => FileLock::acquire(&lock_path, operation)?,
+        LockMode::Shared => FileLock::acquire_shared(&lock_path, operation)?,
+    };
+    anchored_repo.verify_parent_binding(locks_relative, &locks_directory)?;
+    anchored_repo.verify_root_binding()?;
+    Ok(RepositoryLock {
+        _file_lock: file_lock,
+        _repo_root: anchored_repo,
+        _locks_directory: locks_directory,
+    })
 }
 
 impl FileLock {
     pub(crate) fn acquire(path: &Path, operation: &str) -> Result<Self> {
+        Self::acquire_mode(path, operation, LockMode::Exclusive)
+    }
+
+    pub(crate) fn acquire_shared(path: &Path, operation: &str) -> Result<Self> {
+        Self::acquire_mode(path, operation, LockMode::Shared)
+    }
+
+    fn acquire_mode(path: &Path, operation: &str, mode: LockMode) -> Result<Self> {
         let parent = path
             .parent()
             .ok_or_else(|| CheckPoError::Corruption("lock path has no parent directory".into()))?;
         fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
-        let (file, parent) = match open_exclusive_lock_file(path)? {
+        let (file, parent) = match open_lock_file(path, mode)? {
             Some(opened) => opened,
             None => {
                 crate::diagnostics::log_warning(
@@ -45,7 +88,7 @@ fn unsafe_lock_path(path: &Path, reason: &str) -> CheckPoError {
 }
 
 #[cfg(unix)]
-fn open_exclusive_lock_file(path: &Path) -> Result<Option<(File, File)>> {
+fn open_lock_file(path: &Path, mode: LockMode) -> Result<Option<(File, File)>> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -92,7 +135,11 @@ fn open_exclusive_lock_file(path: &Path) -> Result<Option<(File, File)>> {
         return Err(unsafe_lock_path(path, "lock file is not a regular file"));
     }
 
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let operation = match mode {
+        LockMode::Shared => libc::LOCK_SH,
+        LockMode::Exclusive => libc::LOCK_EX,
+    };
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) };
     if result == 0 {
         return Ok(Some((file, parent)));
     }
@@ -105,7 +152,7 @@ fn open_exclusive_lock_file(path: &Path) -> Result<Option<(File, File)>> {
 }
 
 #[cfg(windows)]
-fn open_exclusive_lock_file(path: &Path) -> Result<Option<(File, File)>> {
+fn open_lock_file(path: &Path, mode: LockMode) -> Result<Option<(File, File)>> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -133,12 +180,16 @@ fn open_exclusive_lock_file(path: &Path) -> Result<Option<(File, File)>> {
         ));
     }
 
+    let share_mode = match mode {
+        LockMode::Shared => FILE_SHARE_READ | FILE_SHARE_WRITE,
+        LockMode::Exclusive => 0,
+    };
     match OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .share_mode(0)
+        .share_mode(share_mode)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
     {
@@ -159,7 +210,7 @@ fn open_exclusive_lock_file(path: &Path) -> Result<Option<(File, File)>> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_exclusive_lock_file(path: &Path) -> Result<Option<(File, File)>> {
+fn open_lock_file(path: &Path, _mode: LockMode) -> Result<Option<(File, File)>> {
     Err(io_error(
         path,
         std::io::Error::new(
@@ -184,6 +235,34 @@ mod tests {
 
         drop(first);
         FileLock::acquire(&path, "third").unwrap();
+    }
+
+    #[test]
+    fn shared_locks_coexist_and_block_exclusive_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("repository.lock");
+        let first = FileLock::acquire_shared(&path, "first-reader").unwrap();
+        let second = FileLock::acquire_shared(&path, "second-reader").unwrap();
+
+        let error = FileLock::acquire(&path, "writer").unwrap_err();
+        assert!(matches!(error, CheckPoError::RepositoryLocked(_)));
+
+        drop(first);
+        drop(second);
+        FileLock::acquire(&path, "writer").unwrap();
+    }
+
+    #[test]
+    fn exclusive_lock_blocks_shared_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("repository.lock");
+        let writer = FileLock::acquire(&path, "writer").unwrap();
+
+        let error = FileLock::acquire_shared(&path, "reader").unwrap_err();
+        assert!(matches!(error, CheckPoError::RepositoryLocked(_)));
+
+        drop(writer);
+        FileLock::acquire_shared(&path, "reader").unwrap();
     }
 
     #[test]
