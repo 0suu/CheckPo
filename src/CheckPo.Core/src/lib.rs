@@ -59,8 +59,8 @@ pub use models::{
     TempFileCleanupPlan, TempFileCleanupResult, TransactionCleanupCandidate,
     TransactionCleanupPlan, TransactionCleanupResult, TransactionQuarantineResult,
     TransactionRecoveryFailure, TransactionRecoveryResult, UnreferencedBlob,
-    UnreferencedManifestChunk, UnresolvedTransactionQuarantine, VerificationResult,
-    OPERATION_PLAN_SCHEMA_VERSION, STORAGE_GC_PLAN_SCHEMA_VERSION,
+    UnreferencedInventoryNode, UnreferencedManifestChunk, UnresolvedTransactionQuarantine,
+    VerificationResult, OPERATION_PLAN_SCHEMA_VERSION, STORAGE_GC_PLAN_SCHEMA_VERSION,
     TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION, TRANSACTION_CLEANUP_PLAN_SCHEMA_VERSION,
 };
 pub use path::{

@@ -118,6 +118,7 @@ fn apply_plan_inner_with_quarantine_resolution(
             applied: false,
             transaction_id: None,
             journal_path: None,
+            warnings: Vec::new(),
         });
     }
     ensure_capacity_for_plan(project, &plan)?;
@@ -509,11 +510,18 @@ fn apply_plan_inner_with_quarantine_resolution(
     journal.state = JournalState::Committed;
     journal.updated_at_utc = crate::now_utc_string();
     write_journal(&journal_path, &journal)?;
+    let mut warnings = Vec::new();
     if let Some(checkpoint_id) = resolve_quarantines_for {
-        super::recovery::resolve_unverified_transaction_quarantines_unlocked(
+        if let Err(error) = super::recovery::resolve_unverified_transaction_quarantines_unlocked(
             project,
             checkpoint_id,
-        )?;
+        ) {
+            let warning = format!(
+                "restore was committed, but transaction quarantine resolution failed and remains pending: {error}"
+            );
+            crate::diagnostics::log_warning("restore-quarantine-resolution", &warning);
+            warnings.push(warning);
+        }
     }
     report_operation_progress(progress, "complete", 1, 1, None);
     Ok(ApplyResult {
@@ -522,6 +530,7 @@ fn apply_plan_inner_with_quarantine_resolution(
         applied: true,
         transaction_id: Some(transaction_id),
         journal_path: Some(journal_path),
+        warnings,
     })
 }
 

@@ -43,11 +43,11 @@ pub(crate) use atomic_io::{
 };
 pub use atomic_io::{read_json, sync_parent_dir};
 pub(crate) use chunk_store::RepositoryManifestSource;
-#[cfg(test)]
-pub(crate) use db_file::open_db;
 pub(crate) use db_file::open_file_fingerprint_db;
 pub(crate) use db_file::remove_file_fingerprint_db_if_exists;
 pub use db_file::{db_path, file_fingerprint_db_path};
+#[cfg(test)]
+pub(crate) use db_file::{open_db_path, remove_db_path_if_exists};
 #[allow(unused_imports)]
 pub(crate) use fs_safety::{
     create_absolute_dir_all_no_follow, create_dir_all_no_follow, create_dir_all_no_follow_batched,
@@ -81,8 +81,8 @@ pub(crate) use object_store::{
 };
 pub(crate) use platform::available_space_bytes;
 pub(crate) use snapshot_inventory::{
-    add_snapshot_to_inventory_if_head, inventory_head_id, inventory_snapshot_count,
-    project_snapshot_removal, remove_snapshot_from_inventory_if_head,
+    add_snapshot_to_inventory_if_head, inventory_gc_candidates, inventory_head_id,
+    inventory_snapshot_count, project_snapshot_removal, remove_snapshot_from_inventory_if_head,
     validate_physical_snapshot_inventory,
 };
 #[cfg(debug_assertions)]

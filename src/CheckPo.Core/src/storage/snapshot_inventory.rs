@@ -121,6 +121,162 @@ pub(crate) fn inventory_snapshot_count(repo_root: &Path, project_id: &ProjectId)
     Ok(inventory_head(repo_root, project_id)?.state.count)
 }
 
+pub(crate) fn inventory_gc_candidates(
+    repo_root: &Path,
+    project_id: &ProjectId,
+) -> Result<Vec<(PathBuf, u64)>> {
+    let head = inventory_head(repo_root, project_id)?;
+    let root = load_set_root(repo_root, &head.state.set_root, project_id)?;
+    if root.count != head.state.count {
+        return Err(CheckPoError::Corruption(
+            "snapshot inventory state count does not match its set root".to_string(),
+        ));
+    }
+    let mut reachable = BTreeSet::new();
+    reachable.insert(repo_relative_inventory_path(
+        repo_root,
+        &inventory_state_path(repo_root, &head.id),
+    )?);
+    reachable.insert(repo_relative_inventory_path(
+        repo_root,
+        &inventory_set_root_path(repo_root, &head.state.set_root),
+    )?);
+    for (prefix, reference) in root.leaves.iter().enumerate() {
+        let Some(reference) = reference else {
+            continue;
+        };
+        let leaf = load_set_leaf(repo_root, &reference.id, project_id, prefix as u8)?;
+        if leaf.ids.len() != reference.count as usize {
+            return Err(CheckPoError::Corruption(format!(
+                "snapshot inventory leaf {prefix:02x} count mismatch"
+            )));
+        }
+        reachable.insert(repo_relative_inventory_path(
+            repo_root,
+            &inventory_set_leaf_path(repo_root, &reference.id),
+        )?);
+    }
+
+    let stores = [
+        (Path::new("inventory/snapshots/states"), ".state"),
+        (Path::new("inventory/snapshots/sets/roots"), ".root"),
+        (Path::new("inventory/snapshots/sets/leaves"), ".leaf"),
+    ];
+    let mut candidates = Vec::new();
+    for (store, suffix) in stores {
+        let full_store = repo_root.join(store);
+        for entry in walkdir::WalkDir::new(&full_store)
+            .follow_links(false)
+            .min_depth(1)
+        {
+            let entry = entry.map_err(|error| CheckPoError::Corruption(error.to_string()))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| crate::io_error(entry.path(), error))?;
+            if crate::metadata_is_link_or_reparse(&metadata) {
+                return Err(CheckPoError::Corruption(format!(
+                    "snapshot inventory contains a symbolic link or reparse point: {}",
+                    entry.path().display()
+                )));
+            }
+            let below_store = entry.path().strip_prefix(&full_store).map_err(|_| {
+                CheckPoError::Corruption("snapshot inventory path escaped its store".to_string())
+            })?;
+            if metadata.is_dir() {
+                if below_store.components().count() != 1 || !is_lower_hex_shard(entry.file_name()) {
+                    return Err(CheckPoError::Corruption(format!(
+                        "snapshot inventory contains an unexpected directory: {}",
+                        entry.path().display()
+                    )));
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(CheckPoError::Corruption(format!(
+                    "snapshot inventory contains a non-regular entry: {}",
+                    entry.path().display()
+                )));
+            }
+            validate_inventory_content_path(below_store, suffix)?;
+            let relative = repo_relative_inventory_path(repo_root, entry.path())?;
+            if !reachable.contains(&relative) {
+                candidates.push((relative, metadata.len()));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(candidates)
+}
+
+fn repo_relative_inventory_path(repo_root: &Path, path: &Path) -> Result<PathBuf> {
+    path.strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            CheckPoError::Corruption(format!(
+                "snapshot inventory path is outside repository: {}",
+                path.display()
+            ))
+        })
+}
+
+fn is_lower_hex_shard(value: &std::ffi::OsStr) -> bool {
+    value.to_str().is_some_and(|value| {
+        value.len() == 2
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn validate_inventory_content_path(path: &Path, suffix: &str) -> Result<()> {
+    let components = path.components().collect::<Vec<_>>();
+    let (std::path::Component::Normal(shard), std::path::Component::Normal(file_name)) = (
+        components
+            .first()
+            .copied()
+            .unwrap_or(std::path::Component::CurDir),
+        components
+            .get(1)
+            .copied()
+            .unwrap_or(std::path::Component::CurDir),
+    ) else {
+        return Err(CheckPoError::Corruption(format!(
+            "snapshot inventory content path is invalid: {}",
+            path.display()
+        )));
+    };
+    if components.len() != 2 || !is_lower_hex_shard(shard) {
+        return Err(CheckPoError::Corruption(format!(
+            "snapshot inventory content path is invalid: {}",
+            path.display()
+        )));
+    }
+    let file_name = file_name.to_str().ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "snapshot inventory filename is not UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    let id = file_name.strip_suffix(suffix).ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "snapshot inventory filename has the wrong suffix: {}",
+            path.display()
+        ))
+    })?;
+    let id = ObjectId::parse(id).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "snapshot inventory filename has an invalid id: {}",
+            path.display()
+        ))
+    })?;
+    if shard.to_str() != Some(&id.as_str()[..2]) {
+        return Err(CheckPoError::Corruption(format!(
+            "snapshot inventory shard does not match its id: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Projects the canonical inventory state after removing one snapshot.
 ///
 /// The common latest-delete path is O(1): a surviving snapshot parent is the

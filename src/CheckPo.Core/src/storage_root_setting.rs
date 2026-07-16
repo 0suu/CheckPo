@@ -81,11 +81,29 @@ pub fn set_project_storage_root(
         ensure_repo_outside_project(old_context.project_root.as_path(), &old_context.repo_root)?;
         load_repo_config(&old_context.repo_root, &old_context.project_id)?;
         crate::validate_repository_layout_no_follow(&old_context.repo_root)?;
+        recover_checkpoint_journals(&old_context)?;
         crate::ensure_no_pending_transactions(&old_context)?;
         crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
     }
+    let recovered_new_repository = recover_checkpoint_journals(&context)?;
     crate::ensure_no_pending_transactions(&context)?;
     crate::ensure_no_unresolved_transaction_quarantines(&context)?;
+    if recovered_new_repository {
+        let index_is_current = matches!(
+            crate::checkpoint_index_status(&context),
+            Ok(status) if status.state == crate::CheckpointIndexState::Current
+        );
+        if !index_is_current {
+            if let Err(error) = crate::rebuild_index_for_project_unlocked(&context, None, None) {
+                crate::diagnostics::log_warning(
+                    "storage-root-recovery-index",
+                    &format!(
+                        "checkpoint recovery completed while changing storage root, but the SQLite index rebuild failed: {error}"
+                    ),
+                );
+            }
+        }
+    }
     update_registry_locked(
         &registry_lock,
         registry,
@@ -94,6 +112,12 @@ pub fn set_project_storage_root(
         context.storage_root.as_path(),
     )?;
     crate::project_view(&context)
+}
+
+fn recover_checkpoint_journals(project: &ProjectContext) -> Result<bool> {
+    let recovered_creation = crate::recover_checkpoint_creations_unlocked(project)?;
+    let recovered_deletion = crate::recover_checkpoint_deletions_unlocked(project)?;
+    Ok(recovered_creation || recovered_deletion)
 }
 
 fn lock_storage_root_repositories(

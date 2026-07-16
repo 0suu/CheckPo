@@ -878,23 +878,25 @@ fn recover_topology_transaction(
         }
     }
 
-    for directory in journal.directories_to_create.iter().rev() {
-        if !before_paths.iter().any(|before| {
-            directory == before
-                || directory
-                    .as_str()
-                    .strip_prefix(before.as_str())
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        }) {
-            continue;
-        }
+    let mut created_directories = journal.directories_to_create.clone();
+    created_directories.sort_by(|left, right| {
+        right
+            .as_str()
+            .matches('/')
+            .count()
+            .cmp(&left.as_str().matches('/').count())
+            .then_with(|| left.cmp(right))
+    });
+    for directory in &created_directories {
         let path = directory.to_project_path(project.project_root.as_path());
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {
                 remove_project_directory(project, directory)?;
             }
             Ok(metadata)
-                if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {}
+                if metadata.is_file()
+                    && !crate::metadata_is_link_or_reparse(&metadata)
+                    && before_paths.contains(directory) => {}
             Err(error)
                 if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
             Ok(_) => return Err(CheckPoError::WorkingTreeChanged(directory.to_string())),

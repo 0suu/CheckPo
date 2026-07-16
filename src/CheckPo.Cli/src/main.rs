@@ -466,6 +466,9 @@ fn run() -> Result<u8, String> {
                 print_or_json(cli.json, &result, || {
                     println!("Restore applied: {}", result.applied);
                     print_plan(&result.plan);
+                    for warning in &result.warnings {
+                        println!("Warning: {warning}");
+                    }
                 })?;
             }
         },
@@ -495,6 +498,9 @@ fn run() -> Result<u8, String> {
                 print_or_json(cli.json, &result, || {
                     println!("Discard applied: {}", result.applied);
                     print_plan(&result.plan);
+                    for warning in &result.warnings {
+                        println!("Warning: {warning}");
+                    }
                 })?;
             }
         },
@@ -566,6 +572,10 @@ fn run() -> Result<u8, String> {
                             plan.unreferenced_manifest_chunk_count
                         );
                         println!(
+                            "Unreferenced inventory nodes: {}",
+                            plan.unreferenced_inventory_node_count
+                        );
+                        println!(
                             "Reclaimable object bytes: {}",
                             plan.unreferenced_logical_bytes
                         );
@@ -574,10 +584,30 @@ fn run() -> Result<u8, String> {
                             plan.unreferenced_manifest_chunk_bytes
                         );
                         println!(
+                            "Reclaimable inventory bytes: {}",
+                            plan.unreferenced_inventory_node_bytes
+                        );
+                        println!(
                             "Reclaimable bytes: {}",
                             plan.unreferenced_logical_bytes
                                 .saturating_add(plan.unreferenced_manifest_chunk_bytes)
+                                .saturating_add(plan.unreferenced_inventory_node_bytes)
                         );
+                        if plan.details_truncated {
+                            let displayed = plan
+                                .unreferenced_blobs
+                                .len()
+                                .saturating_add(plan.unreferenced_manifest_chunks.len())
+                                .saturating_add(plan.unreferenced_inventory_nodes.len());
+                            let total = plan
+                                .unreferenced_blob_count
+                                .saturating_add(plan.unreferenced_manifest_chunk_count)
+                                .saturating_add(plan.unreferenced_inventory_node_count);
+                            println!(
+                                "Candidate details are truncated: {displayed} shown, {} omitted. Applying this plan ID deletes all {total} candidates.",
+                                total.saturating_sub(displayed)
+                            );
+                        }
                     })?;
                     return Ok(if plan.has_integrity_problems { 1 } else { 0 });
                 }
@@ -599,8 +629,25 @@ fn run() -> Result<u8, String> {
                             "Deleted manifest chunks: {}",
                             result.deleted_manifest_chunk_count
                         );
+                        println!(
+                            "Deleted inventory nodes: {}",
+                            result.deleted_inventory_node_count
+                        );
                         println!("Deleted bytes: {}", result.deleted_bytes);
+                        if !result.completed {
+                            println!(
+                                "GC stopped after a partial apply. Remaining candidates: {}",
+                                result.remaining_candidate_count
+                            );
+                            if let Some(candidate) = &result.failed_candidate {
+                                println!("Failed candidate: {}", candidate.display());
+                            }
+                            if let Some(error) = &result.failure {
+                                println!("Error: {error}");
+                            }
+                        }
                     })?;
+                    return Ok(if result.completed { 0 } else { 1 });
                 }
             },
         },
@@ -743,7 +790,9 @@ fn print_diff(result: &core::DiffResult) {
     println!("Added: {}", result.added.len());
     println!("Modified: {}", result.modified.len());
     println!("Deleted: {}", result.deleted.len());
+    println!("Unknown: {}", result.unknown.len());
     println!("Unchanged: {}", result.unchanged_count);
+    println!("Complete: {}", result.complete);
     for warning in &result.warnings {
         println!("Warning: {warning}");
     }

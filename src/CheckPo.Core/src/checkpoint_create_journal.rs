@@ -96,12 +96,15 @@ impl CreateJournalHandle {
         self.transition(CreateJournalState::LatestUpdated)
     }
 
-    pub(crate) fn commit(mut self) -> Result<Option<String>> {
-        self.transition(CreateJournalState::Committed)?;
-        Ok(cleanup_committed_create_journal(
-            &self.repo_root,
-            &self.journal.transaction_id,
-        ))
+    pub(crate) fn commit(mut self) -> Option<String> {
+        if let Err(error) = self.transition(CreateJournalState::Committed) {
+            let warning = format!(
+                "checkpoint was committed, but its journal could not be finalized and will be recovered later: {error}"
+            );
+            crate::diagnostics::log_warning("checkpoint-create-commit", &warning);
+            return Some(warning);
+        }
+        cleanup_committed_create_journal(&self.repo_root, &self.journal.transaction_id)
     }
 
     fn transition(&mut self, state: CreateJournalState) -> Result<()> {

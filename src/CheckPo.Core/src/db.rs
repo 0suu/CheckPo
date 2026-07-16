@@ -91,7 +91,7 @@ pub(crate) struct IndexConnection {
 
 struct BoundSnapshotIndexConnection {
     connection: rusqlite::Connection,
-    _repo: crate::storage::AnchoredRoot,
+    _database_directory: crate::storage::AnchoredRoot,
     _indexes: crate::storage::AnchoredParent,
 }
 
@@ -108,13 +108,13 @@ pub(crate) fn open_index_connection(project: &ProjectContext) -> Result<IndexCon
     if status.state != CheckpointIndexState::Current {
         return Err(index_unavailable(&status));
     }
-    let db_path = crate::db_path(&project.repo_root);
+    let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_write(&db_path)?;
     Ok(IndexConnection { conn, db_path })
 }
 
 pub fn checkpoint_index_status(project: &ProjectContext) -> Result<CheckpointIndexStatus> {
-    let db_path = crate::db_path(&project.repo_root);
+    let db_path = crate::db_path(&project.repo_root)?;
     let metadata = match fs::symlink_metadata(&db_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -243,7 +243,7 @@ pub fn list_checkpoint_summaries_from_index(
     project: &ProjectContext,
 ) -> Result<Vec<CheckpointSummary>> {
     require_current_index(project)?;
-    let db_path = crate::db_path(&project.repo_root);
+    let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_only(&db_path).map_err(index_read_error)?;
     query_checkpoint_summaries(&conn, &db_path, project).map_err(index_read_error)
 }
@@ -251,7 +251,7 @@ pub fn list_checkpoint_summaries_from_index(
 pub fn storage_summary_from_index(project: &ProjectContext) -> Result<StorageSummary> {
     let _lock = crate::acquire_project_repository_shared_lock(project, "storage-summary")?;
     require_current_index(project)?;
-    let db_path = crate::db_path(&project.repo_root);
+    let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_only(&db_path).map_err(index_read_error)?;
     query_storage_summary(&conn, &db_path, project).map_err(index_read_error)
 }
@@ -261,7 +261,7 @@ pub fn storage_index_summary_from_index(
 ) -> Result<crate::StorageIndexSummary> {
     let _lock = crate::acquire_project_repository_shared_lock(project, "storage-index-summary")?;
     require_current_index(project)?;
-    let db_path = crate::db_path(&project.repo_root);
+    let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_only(&db_path).map_err(index_read_error)?;
     query_storage_index_summary(&conn, &db_path, project).map_err(index_read_error)
 }
@@ -272,7 +272,7 @@ pub fn checkpoint_summaries_and_storage_summary_from_index(
     let _lock =
         crate::acquire_project_repository_shared_lock(project, "checkpoint-storage-summary")?;
     require_current_index(project)?;
-    let db_path = crate::db_path(&project.repo_root);
+    let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_only(&db_path).map_err(index_read_error)?;
     let mut checkpoints =
         query_checkpoint_summaries(&conn, &db_path, project).map_err(index_read_error)?;
@@ -382,7 +382,7 @@ fn repository_content_stored_bytes(repo_root: &Path) -> Result<u64> {
 pub fn load_file_fingerprints(
     project: &ProjectContext,
 ) -> Result<BTreeMap<TrackedUnityFilePath, CachedFileFingerprint>> {
-    let db_path = crate::file_fingerprint_db_path(&project.repo_root);
+    let db_path = crate::file_fingerprint_db_path(&project.repo_root)?;
     if !db_path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -394,7 +394,7 @@ pub fn load_file_fingerprints(
 pub(crate) fn load_object_integrity_fingerprints(
     repo_root: &Path,
 ) -> Result<BTreeMap<ObjectId, CachedObjectIntegrityFingerprint>> {
-    let db_path = crate::file_fingerprint_db_path(repo_root);
+    let db_path = crate::file_fingerprint_db_path(repo_root)?;
     if !db_path.exists() {
         return Ok(BTreeMap::new());
     }
@@ -438,7 +438,7 @@ pub(crate) fn refresh_object_integrity_fingerprints(
     if updates.is_empty() {
         return Ok(());
     }
-    let db_path = crate::file_fingerprint_db_path(repo_root);
+    let db_path = crate::file_fingerprint_db_path(repo_root)?;
     let conn = open_file_fingerprint_db(repo_root)?;
     create_fingerprint_schema(&conn, &db_path)?;
     let tx = conn
@@ -514,7 +514,7 @@ pub(crate) fn refresh_file_fingerprints(
     updates: &[FileFingerprintUpdate],
     seen_paths: &BTreeSet<TrackedUnityFilePath>,
 ) -> Result<()> {
-    let db_path = crate::file_fingerprint_db_path(&project.repo_root);
+    let db_path = crate::file_fingerprint_db_path(&project.repo_root)?;
     let conn = open_file_fingerprint_db(&project.repo_root)?;
     create_fingerprint_schema(&conn, &db_path)?;
     let existing = load_file_fingerprints_with_connection(&conn, &db_path, project)?;
@@ -594,15 +594,15 @@ pub(crate) fn rebuild_index_for_project_unlocked(
         &project.repo_root,
         &project.project_id,
     )?;
-    let live_path = crate::db_path(&project.repo_root);
+    let live_path = crate::db_path(&project.repo_root)?;
     let indexes_dir = live_path
         .parent()
         .ok_or_else(|| crate::CheckPoError::Unexpected("index path has no parent".to_string()))?;
     crate::create_absolute_dir_all_no_follow(indexes_dir)?;
-    let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
-    let indexes = anchored_repo.open_directory_for_mutation(Path::new("indexes"), false)?;
-    anchored_repo.verify_parent_binding(Path::new("indexes"), &indexes)?;
-    cleanup_owned_index_temporary_files(&anchored_repo, &indexes)?;
+    let anchored_indexes = crate::storage::AnchoredRoot::open(indexes_dir)?;
+    let indexes = anchored_indexes.open_directory_for_mutation(Path::new(""), false)?;
+    anchored_indexes.verify_root_binding()?;
+    cleanup_owned_index_temporary_files(&anchored_indexes, &indexes)?;
     let temp_leaf =
         std::ffi::OsString::from(format!("snapshot-index-{}.tmp", Uuid::new_v4().simple()));
     let temp_file = indexes.create_new_file(&temp_leaf)?;
@@ -636,7 +636,7 @@ pub(crate) fn rebuild_index_for_project_unlocked(
     report_operation_progress(progress, "committingIndex", 0, 0, None);
     if let Err(error) = temp_file.sync_all().and_then(|()| {
         indexes.verify_file_binding(&temp_leaf, &temp_file)?;
-        anchored_repo.verify_parent_binding(Path::new("indexes"), &indexes)
+        anchored_indexes.verify_root_binding()
     }) {
         let _ = remove_bound_index_temporary(&indexes, &temp_leaf, temp_file);
         return Err(error);
@@ -648,8 +648,7 @@ pub(crate) fn rebuild_index_for_project_unlocked(
         let _ = remove_bound_index_temporary(&indexes, &temp_leaf, temp_file);
         return Err(error);
     }
-    anchored_repo.verify_parent_binding(Path::new("indexes"), &indexes)?;
-    anchored_repo.verify_root_binding()?;
+    anchored_indexes.verify_root_binding()?;
     Ok(result)
 }
 
@@ -799,11 +798,18 @@ fn build_snapshot_index(
         )));
     }
     drop(conn);
+    let errors = if missing_object_count == 0 {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{missing_object_count} referenced object(s) are unavailable; the index was rebuilt, but the repository requires a full verify"
+        )]
+    };
     Ok(RebuildIndexResult {
         snapshot_count,
         referenced_object_count: object_count,
         unavailable_referenced_object_count: missing_object_count,
-        errors: Vec::new(),
+        errors,
     })
 }
 
@@ -1573,7 +1579,7 @@ pub(crate) fn delete_snapshot_from_index(
     snapshot_id: &SnapshotId,
     snapshot: &SnapshotFile,
 ) -> Result<()> {
-    let db_path = crate::db_path(&project.repo_root);
+    let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_write(&db_path)?;
     let tx = conn
         .unchecked_transaction()
@@ -1699,7 +1705,7 @@ fn delete_file_fingerprints(
     project: &ProjectContext,
     paths: &[TrackedUnityFilePath],
 ) -> Result<()> {
-    let db_path = crate::file_fingerprint_db_path(&project.repo_root);
+    let db_path = crate::file_fingerprint_db_path(&project.repo_root)?;
     if !db_path.exists() {
         return Ok(());
     }
@@ -1716,7 +1722,7 @@ fn delete_file_fingerprints(
 }
 
 fn cleanup_owned_index_temporary_files(
-    anchored_repo: &crate::storage::AnchoredRoot,
+    anchored_indexes: &crate::storage::AnchoredRoot,
     indexes: &crate::storage::AnchoredParent,
 ) -> Result<()> {
     let indexes_dir = indexes.display_path();
@@ -1728,7 +1734,7 @@ fn cleanup_owned_index_temporary_files(
                 .map_err(|error| crate::io_error(indexes_dir, error))
         })
         .collect::<Result<Vec<_>>>()?;
-    anchored_repo.verify_parent_binding(Path::new("indexes"), indexes)?;
+    anchored_indexes.verify_parent_binding(Path::new(""), indexes)?;
     let mut removed_any = false;
     for name in names {
         let Some(name) = name.to_str() else {
@@ -1770,7 +1776,7 @@ fn cleanup_owned_index_temporary_files(
     if removed_any {
         indexes.sync_all()?;
     }
-    anchored_repo.verify_parent_binding(Path::new("indexes"), indexes)?;
+    anchored_indexes.verify_parent_binding(Path::new(""), indexes)?;
     Ok(())
 }
 
@@ -2031,31 +2037,29 @@ fn open_bound_snapshot_index(
             path.display()
         ))
     })?;
-    let repo_root = indexes_path.parent().ok_or_else(|| {
+    let anchored_indexes = crate::storage::AnchoredRoot::open(indexes_path)?;
+    let indexes = anchored_indexes.open_directory(Path::new(""), false)?;
+    anchored_indexes.verify_root_binding()?;
+    let leaf = path.file_name().ok_or_else(|| {
         crate::CheckPoError::Corruption(format!(
-            "snapshot index path is outside a repository: {}",
+            "snapshot index path has no file name: {}",
             path.display()
         ))
     })?;
-    let anchored_repo = crate::storage::AnchoredRoot::open(repo_root)?;
-    let indexes = anchored_repo.open_directory(Path::new("indexes"), false)?;
-    anchored_repo.verify_parent_binding(Path::new("indexes"), &indexes)?;
+    let opened = indexes.open_file(leaf)?;
+    indexes.verify_file_binding(leaf, &opened)?;
     let sqlite_path = indexes_path
         .canonicalize()
         .map_err(|error| crate::io_error(indexes_path, error))?
-        .join(path.file_name().ok_or_else(|| {
-            crate::CheckPoError::Corruption(format!(
-                "snapshot index path has no file name: {}",
-                path.display()
-            ))
-        })?);
+        .join(leaf);
     let connection = rusqlite::Connection::open_with_flags(&sqlite_path, flags)
         .map_err(|error| db_error(path, error))?;
-    anchored_repo.verify_parent_binding(Path::new("indexes"), &indexes)?;
-    anchored_repo.verify_root_binding()?;
+    let reopened = indexes.open_file(leaf)?;
+    indexes.verify_file_binding(leaf, &reopened)?;
+    anchored_indexes.verify_root_binding()?;
     Ok(BoundSnapshotIndexConnection {
         connection,
-        _repo: anchored_repo,
+        _database_directory: anchored_indexes,
         _indexes: indexes,
     })
 }
@@ -2132,11 +2136,11 @@ mod tests {
         fs::write(&journal, b"journal").unwrap();
         fs::write(&near_match, b"keep").unwrap();
 
-        let anchored_repo = crate::storage::AnchoredRoot::open(&repo).unwrap();
-        let anchored_indexes = anchored_repo
-            .open_directory_for_mutation(Path::new("indexes"), false)
+        let anchored_indexes_root = crate::storage::AnchoredRoot::open(&indexes).unwrap();
+        let anchored_indexes = anchored_indexes_root
+            .open_directory_for_mutation(Path::new(""), false)
             .unwrap();
-        cleanup_owned_index_temporary_files(&anchored_repo, &anchored_indexes).unwrap();
+        cleanup_owned_index_temporary_files(&anchored_indexes_root, &anchored_indexes).unwrap();
 
         assert!(!owned.exists());
         assert!(!journal.exists());

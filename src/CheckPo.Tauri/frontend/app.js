@@ -230,6 +230,7 @@ async function run(title, task, options = {}) {
   state.busy = true;
   state.userOperationSerial += 1;
   clearVisibleError();
+  clearVisibleStatus();
   $("busyOverlay").hidden = false;
   $("busyTitle").textContent = title;
   resetBusyProgress();
@@ -262,6 +263,46 @@ async function run(title, task, options = {}) {
 
 function setStatus(text) {
   appendLog(text);
+  if ($("statusBannerText")) $("statusBannerText").textContent = text;
+  if ($("statusBanner")) $("statusBanner").hidden = false;
+  const dialogTarget = [
+    ["rollbackOverlay", "rollbackStatus"],
+    ["projectRegistrationOverlay", "projectRegistrationStatus"],
+    ["projectSelectionOverlay", "projectSelectionStatus"],
+    ["advancedOverlay", "advancedStatus"],
+    ["settingsOverlay", "settingsStatus"],
+  ].find(([overlayId]) => !$(overlayId)?.hidden);
+  if (dialogTarget) {
+    const target = $(dialogTarget[1]);
+    if (target) {
+      target.textContent = text;
+      target.hidden = false;
+    }
+  }
+}
+
+function clearVisibleStatus() {
+  if ($("statusBanner")) $("statusBanner").hidden = true;
+  if ($("statusBannerText")) $("statusBannerText").textContent = "";
+  for (const id of [
+    "settingsStatus",
+    "advancedStatus",
+    "projectRegistrationStatus",
+    "projectSelectionStatus",
+    "rollbackStatus",
+  ]) {
+    const target = $(id);
+    if (!target) continue;
+    target.hidden = true;
+    target.textContent = "";
+  }
+}
+
+function clearDialogStatus(id) {
+  const target = $(id);
+  if (!target) return;
+  target.hidden = true;
+  target.textContent = "";
 }
 
 function setResult(value) {
@@ -859,6 +900,7 @@ function renderProjectLabels() {
     ? `${active.name || active.checkpointId} → ${t("workingFolder")}`
     : t("noSelection");
   $("projectStatusPath").textContent = state.projectPath || "-";
+  $("projectStatusPath").title = state.projectPath || "";
   updateProjectEmptyState();
 }
 
@@ -1045,7 +1087,7 @@ async function quarantineFailedTransaction(event) {
   try {
     confirmed = await confirmAction(
       `自動復旧に失敗した作業 ${transactionId} を、CheckPoの自動復旧対象から外して安全な場所へ退避します。`
-        + "\n\njournal・backup・stagedは削除せず保存し、Unityプロジェクト内のファイルもこの操作では変更しません。"
+        + "\n\n復旧用データは削除せず保存し、Unityプロジェクト内のファイルもこの操作では変更しません。"
         + "ただし、現在のUnityプロジェクトが処理前の状態へ完全に戻っていない可能性があります。"
         + "退避後は正常なチェックポイントへ戻して状態を確認してください。続行しますか？",
       "安全な場所へ退避",
@@ -1275,7 +1317,7 @@ function checkpointRow(checkpoint) {
       String(checkpoint.checkpointId || "").slice(0, 4) || "----";
     existing.querySelector(".checkpoint-title").textContent = checkpoint.name || checkpoint.checkpointId;
     existing.querySelector(".checkpoint-meta").textContent =
-      `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0} files`;
+      `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0}${t("fileUnit")}`;
   }
   return existing;
 }
@@ -1298,7 +1340,7 @@ function createCheckpointRow(checkpoint) {
   `;
   row.querySelector(".checkpoint-id").textContent = String(checkpoint.checkpointId || "").slice(0, 4) || "----";
   row.querySelector(".checkpoint-meta").textContent =
-    `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0} files`;
+    `${formatCompactDate(checkpoint.createdAtUtc)} · ${checkpoint.fileCount ?? 0}${t("fileUnit")}`;
   if (isRenaming) {
     const title = row.querySelector(".checkpoint-title");
     const input = document.createElement("input");
@@ -1574,7 +1616,10 @@ function showCheckpointContextMenu(x, y, checkpoint) {
       label: "この状態に戻す",
       disabled: locationBlocked
         || pendingBlocked
-        || checkpointHasKnownExactNoChanges(checkpoint.checkpointId),
+        || CheckPoFrontendState.restorePreviewIsRedundant(
+          checkpointHasKnownExactNoChanges(checkpoint.checkpointId),
+          state.unresolvedQuarantines.length,
+        ),
       action: () => previewRestoreCheckpoint(checkpoint.checkpointId),
     },
     { separator: true },
@@ -1599,9 +1644,25 @@ function showProjectContextMenu(x, y) {
   ]);
 }
 
+let contextMenuReturnFocus = null;
+
+function visibleModalOverlay() {
+  return [
+    "errorOverlay",
+    "confirmOverlay",
+    "rollbackOverlay",
+    "projectRegistrationOverlay",
+    "projectSelectionOverlay",
+    "advancedOverlay",
+    "settingsOverlay",
+  ].map((id) => $(id)).find((overlay) => overlay && !overlay.hidden) || null;
+}
+
 function showContextMenu(x, y, items) {
   const menu = $("contextMenu");
   if (!menu) return;
+  contextMenuReturnFocus = document.activeElement;
+  (visibleModalOverlay() || document.body).append(menu);
   menu.replaceChildren();
   for (const item of items) {
     if (item.separator) {
@@ -1618,7 +1679,7 @@ function showContextMenu(x, y, items) {
     button.disabled = state.busy || state.confirming || Boolean(item.disabled);
     button.setAttribute("role", "menuitem");
     button.addEventListener("click", () => {
-      hideContextMenu();
+      hideContextMenu({ restoreFocus: true });
       if (!button.disabled) item.action();
     });
     menu.append(button);
@@ -1636,9 +1697,40 @@ function showContextMenu(x, y, items) {
   });
 }
 
-function hideContextMenu() {
+function hideContextMenu(options = {}) {
   const menu = $("contextMenu");
-  if (menu) menu.hidden = true;
+  if (menu) {
+    menu.hidden = true;
+    if (menu.parentElement !== document.body) document.body.append(menu);
+  }
+  const returnFocus = contextMenuReturnFocus;
+  contextMenuReturnFocus = null;
+  if (options.restoreFocus && returnFocus?.isConnected && !returnFocus.closest("[hidden]")) {
+    returnFocus.focus({ preventScroll: true });
+  }
+}
+
+function handleContextMenuKeyDown(event) {
+  const menu = $("contextMenu");
+  if (!menu || menu.hidden) return;
+  const items = Array.from(menu.querySelectorAll("button:not(:disabled)"));
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    hideContextMenu({ restoreFocus: true });
+    return;
+  }
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || items.length === 0) return;
+  event.preventDefault();
+  const currentIndex = Math.max(0, items.indexOf(document.activeElement));
+  const nextIndex = event.key === "Home"
+    ? 0
+    : event.key === "End"
+      ? items.length - 1
+      : event.key === "ArrowDown"
+        ? (currentIndex + 1) % items.length
+        : (currentIndex - 1 + items.length) % items.length;
+  items[nextIndex].focus();
 }
 
 async function copyCheckpointId(checkpointId) {
@@ -1769,6 +1861,7 @@ function openProjectRegistration() {
   $("projectPath").value = "";
   $("registrationStorageRootPath").value = state.defaultStorageRootPath || "";
   resetInitialCheckpointChoice("registrationInitialCheckpoint");
+  clearDialogStatus("projectRegistrationStatus");
   $("projectRegistrationOverlay").hidden = false;
   updateControls();
 }
@@ -1906,6 +1999,7 @@ function renderRollbackPlan(plan, context) {
     list.append(omitted);
   }
   $("rollbackConfirm").checked = false;
+  clearDialogStatus("rollbackStatus");
   $("rollbackOverlay").hidden = false;
   updateControls();
 }
@@ -1997,8 +2091,10 @@ function updateControls() {
     if (["previewRollbackButton", "diffButton", "verifyButton"].includes(button.id)) {
       const pendingBlocked = button.id === "previewRollbackButton" && pendingMutationBlocked;
       const exactNoChanges = button.id === "previewRollbackButton"
-        && checkpointHasKnownExactNoChanges(state.selectedCheckpointId)
-        && state.unresolvedQuarantines.length === 0;
+        && CheckPoFrontendState.restorePreviewIsRedundant(
+          checkpointHasKnownExactNoChanges(state.selectedCheckpointId),
+          state.unresolvedQuarantines.length,
+        );
       button.disabled = controlsBlocked
         || indexUnavailable
         || pendingBlocked
@@ -2126,6 +2222,37 @@ async function handleCopiedProjectRegistrationChoice(projectPath, storageRootPat
   }
 }
 
+async function reconnectProjectStorageAfterLoadFailure(projectPath, storageRootPath) {
+  state.confirming = true;
+  updateControls();
+  let reconnect = false;
+  try {
+    reconnect = await confirmAction(
+      `登録済みの保存先を読み込めません。${storageRootPath} に手動移動済みの保存データがある場合、このプロジェクトを再接続します。`,
+      "保存データへ再接続",
+    );
+  } finally {
+    state.confirming = false;
+    updateControls();
+  }
+  if (!reconnect) {
+    setStatus("保存データへの再接続を中止しました。");
+    return;
+  }
+  await run("保存データへ再接続中", async () => {
+    const snapshot = await invokeCommand("set_storage_root", {
+      projectPath,
+      storageRootPath,
+      confirmed: true,
+    });
+    invalidateStoredSize();
+    renderSnapshot(snapshot);
+    await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
+    $("projectRegistrationOverlay").hidden = true;
+    setStatus("手動移動済みの保存データへ再接続しました。");
+  });
+}
+
 function copiedLocationConfirmMessage() {
   const warning = (state.projectWarnings || []).find((item) =>
     item?.kind === "copiedProjectSuspected" || item?.locationStatus === "copiedSuspected"
@@ -2222,7 +2349,7 @@ async function discardPaths(paths) {
   }
 
   await run("戻し中", async () => {
-    await invokeCommand("apply_discard_files", {
+    const result = await invokeCommand("apply_discard_files", {
       projectPath,
       paths,
       checkpointId,
@@ -2235,6 +2362,10 @@ async function discardPaths(paths) {
     state.currentDiffSelectedPaths.clear();
     state.lastSelectedChangePath = null;
     await refreshLatestDiff({ allowBusy: true });
+    if (result.warnings?.length) {
+      setOperationWarnings(result.warnings);
+      setStatus("変更は取り消しましたが、後処理に警告があります。");
+    }
   });
 }
 
@@ -2243,6 +2374,7 @@ function bindEvents() {
   $("dismissErrorDialogButton").addEventListener("click", clearVisibleError);
   $("projectMenuButton").addEventListener("click", () => {
     renderProjectHistory();
+    clearDialogStatus("projectSelectionStatus");
     $("projectSelectionOverlay").hidden = false;
   });
   $("projectMenuButton").addEventListener("contextmenu", (event) => {
@@ -2257,9 +2389,7 @@ function bindEvents() {
   document.addEventListener("click", (event) => {
     if (!$("contextMenu")?.contains(event.target)) hideContextMenu();
   });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") hideContextMenu();
-  });
+  document.addEventListener("keydown", handleContextMenuKeyDown);
   window.addEventListener("resize", hideContextMenu);
   window.addEventListener("scroll", hideContextMenu, true);
   $("addProjectFromEmptyButton").addEventListener("click", () => {
@@ -2272,13 +2402,21 @@ function bindEvents() {
   $("closeProjectSelectionButton").addEventListener("click", () => $("projectSelectionOverlay").hidden = true);
   $("closeProjectRegistrationButton").addEventListener("click", () => $("projectRegistrationOverlay").hidden = true);
   $("settingsButton").addEventListener("click", () => {
+    clearDialogStatus("settingsStatus");
     $("settingsOverlay").hidden = false;
     updateControls();
   });
   $("closeSettingsButton").addEventListener("click", () => $("settingsOverlay").hidden = true);
-  $("advancedButton").addEventListener("click", () => $("advancedOverlay").hidden = false);
+  $("advancedButton").addEventListener("click", () => {
+    clearDialogStatus("advancedStatus");
+    $("advancedOverlay").hidden = false;
+  });
   $("closeAdvancedButton").addEventListener("click", () => $("advancedOverlay").hidden = true);
   $("closeRollbackDialogButton").addEventListener("click", () => $("rollbackOverlay").hidden = true);
+  $("dismissStatusButton").addEventListener("click", () => {
+    $("statusBanner").hidden = true;
+    $("statusBannerText").textContent = "";
+  });
   $("clearLogButton").addEventListener("click", () => $("logList").replaceChildren());
   $("openDiagnosticLogsButton").addEventListener("click", async () => {
     await run("診断ログを開いています", async () => {
@@ -2350,21 +2488,21 @@ function bindEvents() {
   $("setStorageRootButton").addEventListener("click", async () => {
     const storageRootPath = $("settingsNewStorageRootPath").value.trim();
     if (!storageRootPath) {
-      setStatus("新しいチェックポイント保存先を選んでください。");
+      setStatus("手動移動済みの保存データがある場所を選んでください。");
       return;
     }
     const current = $("settingsStorageRootPath").value;
     if (CheckPoFrontendState.samePathInput(storageRootPath, current)) {
-      setStatus("現在とは異なるチェックポイント保存先を選んでください。");
+      setStatus("現在参照している場所とは異なる場所を選んでください。");
       updateControls();
       return;
     }
     const confirmed = await confirmAction(
-      `保存先情報だけを変更します。ファイル移動は行いません。先に ${current} の repos フォルダ内にあるこのプロジェクトの保存データを、新しい保存先へ手動で移動してください。移動済みなら続行します。`,
-      "保存先を変更",
+      `CheckPoはファイルを移動しません。${current} から選択した場所へ、このプロジェクトの保存データを手動で移動済みの場合だけ再接続できます。続行しますか？`,
+      "保存データへ再接続",
     );
     if (!confirmed) return;
-    await run("保存先を変更中", async () => {
+    await run("保存データへ再接続中", async () => {
       const snapshot = await invokeCommand("set_storage_root", {
         projectPath: getProjectPath(),
         storageRootPath,
@@ -2373,36 +2511,37 @@ function bindEvents() {
       invalidateStoredSize();
       renderSnapshot(snapshot);
       await refreshLatestDiff({ allowBusy: true });
-      setStatus("チェックポイント保存先を変更しました。");
+      setStatus("手動移動済みの保存データへ再接続しました。");
     });
   });
   $("analyzeGcButton").addEventListener("click", async () => {
-    await run("不要データを確認中", async () => {
+    await run("不要なバックアップデータを確認中", async () => {
       const plan = await invokeCommand("analyze_gc", { projectPath: getProjectPath() });
       state.gcPlan = plan;
       const gc = CheckPoFrontendState.gcPlanPresentation(plan);
       $("gcSummary").textContent =
-        `不要 object ${gc.objectCount} 件 / ${formatBytes(gc.objectBytes)}、` +
-        `manifest chunk ${gc.manifestChunkCount} 件 / ${formatBytes(gc.manifestChunkBytes)}、` +
-        `合計 ${formatBytes(gc.totalBytes)}`;
+        `不要なバックアップデータ ${gc.totalCount} 件 / ${formatBytes(gc.totalBytes)}` +
+        (gc.detailsTruncated
+          ? `。一覧では ${gc.displayedCount} 件のみ表示していますが、残り ${gc.omittedCount} 件も確認済みの削除対象です。`
+          : "");
       $("gcResult").textContent = plan.hasIntegrityProblems
-        ? "破損または読み取れない checkpoint があるため削除できません。"
+        ? "破損または読み取れないチェックポイントがあるため削除できません。"
         : "削除前の確認が完了しました。";
       updateControls();
     });
   });
   $("applyGcButton").addEventListener("click", async () => {
     if (!state.gcPlan) {
-      setStatus("先に不要データを調べてください。");
+      setStatus("先に不要なバックアップデータを確認してください。");
       return;
     }
     if (state.gcPlan.hasIntegrityProblems) {
-      setStatus("破損または読み取れない checkpoint があるため削除できません。");
+      setStatus("破損または読み取れないチェックポイントがあるため削除できません。");
       return;
     }
     const gc = CheckPoFrontendState.gcPlanPresentation(state.gcPlan);
     if (gc.totalCount === 0) {
-      setStatus("削除できる不要データはありません。");
+      setStatus("削除できる不要なバックアップデータはありません。");
       updateControls();
       return;
     }
@@ -2411,8 +2550,11 @@ function bindEvents() {
     let confirmed = false;
     try {
       confirmed = await confirmAction(
-        `不要 object ${gc.objectCount} 件とmanifest chunk ${gc.manifestChunkCount} 件` +
-        `（合計 ${formatBytes(gc.totalBytes)}）を削除します。続行しますか？`,
+        `不要なバックアップデータ ${gc.totalCount} 件（${formatBytes(gc.totalBytes)}）を削除します。` +
+        (gc.detailsTruncated
+          ? `一覧に表示していない ${gc.omittedCount} 件も削除対象です。`
+          : "") +
+        "続行しますか？",
         "削除",
       );
     } finally {
@@ -2420,7 +2562,7 @@ function bindEvents() {
       updateControls();
     }
     if (!confirmed) return;
-    await run("不要データを削除中", async () => {
+    await run("不要なバックアップデータを削除中", async () => {
       const result = await invokeCommand("apply_gc", {
         projectPath: getProjectPath(),
         expectedPlanId: state.gcPlan.planId,
@@ -2428,11 +2570,13 @@ function bindEvents() {
       });
       invalidateStoredSize();
       state.gcPlan = null;
-      $("gcSummary").textContent =
-        `削除 object ${result.deletedBlobCount ?? 0} 件、` +
-        `manifest chunk ${result.deletedManifestChunkCount ?? 0} 件 / ` +
-        `${formatBytes(result.deletedBytes ?? 0)}`;
-      $("gcResult").textContent = "不要データを削除しました。";
+      const deletedCount = (result.deletedBlobCount ?? 0)
+        + (result.deletedManifestChunkCount ?? 0)
+        + (result.deletedInventoryNodeCount ?? 0);
+      $("gcSummary").textContent = `削除 ${deletedCount} 件 / ${formatBytes(result.deletedBytes ?? 0)}`;
+      $("gcResult").textContent = result.completed === false
+        ? `一部を削除した後で停止しました。未処理 ${result.remainingCandidateCount ?? 0} 件です。詳しい内容は作業記録を確認してください。`
+        : "不要なバックアップデータを削除しました。";
       await refreshProject();
     });
   });
@@ -2452,24 +2596,7 @@ function bindEvents() {
           renderSnapshot(await invokeCommand("load_project", { projectPath }));
           setStatus("プロジェクトを開きました。");
         } catch (error) {
-          if (error?.kind === "storageRootUnavailable" && storageRootPath) {
-            const reconnect = await confirmAction(
-              `登録済みの保存先を読み込めません。選択した保存先 ${storageRootPath} に既存のチェックポイントデータがある場合、このプロジェクトを再接続します。`,
-              "保存先へ再接続",
-            );
-            if (!reconnect) throw error;
-            const snapshot = await invokeCommand("set_storage_root", {
-              projectPath,
-              storageRootPath,
-              confirmed: true,
-            });
-            invalidateStoredSize();
-            renderSnapshot(snapshot);
-            setStatus("チェックポイント保存先へ再接続しました。");
-            await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
-            $("projectRegistrationOverlay").hidden = true;
-            return;
-          }
+          if (error?.kind === "storageRootUnavailable" && storageRootPath) throw error;
           if (!shouldStartProjectAfterLoadError(error)) throw error;
           const snapshot = await invokeCommand("init_project", {
             projectPath,
@@ -2482,7 +2609,9 @@ function bindEvents() {
         $("projectRegistrationOverlay").hidden = true;
       }, { rethrow: true, suppressError: true });
     } catch (error) {
-      if (isCopiedProjectError(error) || await isCopiedProjectAtPath(projectPath)) {
+      if (error?.kind === "storageRootUnavailable" && storageRootPath) {
+        await reconnectProjectStorageAfterLoadFailure(projectPath, storageRootPath);
+      } else if (isCopiedProjectError(error) || await isCopiedProjectAtPath(projectPath)) {
         await handleCopiedProjectRegistrationChoice(projectPath, storageRootPath);
       } else {
         showError(error);
@@ -2496,7 +2625,7 @@ function bindEvents() {
   $("rebuildIndexButton").addEventListener("click", async () => {
     const projectPath = getProjectPath();
     await run("一覧の索引を再構築中", async () => {
-      await invokeCommand("rebuild_index", { projectPath });
+      const result = await invokeCommand("rebuild_index", { projectPath });
       const snapshot = await invokeCommand("refresh_project", { projectPath });
       if (state.projectPath !== projectPath) return;
       renderSnapshot(snapshot);
@@ -2505,8 +2634,14 @@ function bindEvents() {
         setStatus("一覧の索引を再構築できませんでした。詳細を確認してください。");
         return;
       }
-      setStatus("一覧の索引を再構築しました。");
       await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
+      if ((result.unavailableReferencedObjectCount ?? 0) > 0 || result.errors?.length) {
+        setStatus(
+          `一覧の索引は再構築しましたが、参照データ ${result.unavailableReferencedObjectCount ?? 0} 件を利用できません。フル検証を実行してください。`,
+        );
+      } else {
+        setStatus("一覧の索引を再構築しました。");
+      }
     });
   });
   $("confirmProjectLocationButton").addEventListener("click", async () => {
@@ -2609,7 +2744,7 @@ function bindEvents() {
       return;
     }
     await run("戻し中", async () => {
-      await invokeCommand("apply_restore", {
+      const result = await invokeCommand("apply_restore", {
         projectPath: context.projectPath,
         checkpointId: context.checkpointId,
         expectedPlan: state.rollbackPlan,
@@ -2621,7 +2756,13 @@ function bindEvents() {
       $("rollbackOverlay").hidden = true;
       await refreshProject();
       await refreshLatestDiff({ allowBusy: true });
-      setStatus("復元しました。");
+      if (result.warnings?.length) {
+        setOperationWarnings(result.warnings);
+        setStatus("復元しましたが、後処理に警告があります。");
+      } else {
+        setOperationWarnings([]);
+        setStatus("復元しました。");
+      }
     });
   });
   $("verifyButton").addEventListener("click", async () => {
@@ -2659,18 +2800,18 @@ function bindEvents() {
       });
       state.transactionCleanupPlan = plan;
       $("cleanupSummary").textContent =
-        `削除対象 ${plan.directoryCount ?? 0} 件 / `
+        `復旧用データ ${plan.directoryCount ?? 0} 件 / `
         + `${plan.fileCount ?? 0} ファイル / ${formatBytes(plan.totalBytes ?? 0)}`;
       $("cleanupResult").textContent = plan.directoryCount
-        ? "完了・復旧済み transaction の削除対象を確認しました。"
-        : "削除できる完了・復旧済み transaction はありません。";
+        ? "削除できる復旧用データを確認しました。"
+        : "削除できる復旧用データはありません。";
       updateControls();
     });
   });
   $("applyCleanupButton").addEventListener("click", async () => {
     const plan = state.transactionCleanupPlan;
     if (!CheckPoFrontendState.transactionCleanupPlanHasCandidates(plan)) {
-      setStatus("先にtransaction cleanupの削除対象を確認してください。");
+      setStatus("先に復旧用データの片付け内容を確認してください。");
       updateControls();
       return;
     }
@@ -2679,9 +2820,8 @@ function bindEvents() {
     let confirmed = false;
     try {
       confirmed = await confirmAction(
-        `確認済みの完了・復旧済み transaction ${plan.directoryCount} 件`
-        + `（${formatBytes(plan.totalBytes ?? 0)}）のjournalとbackupを削除します。`
-        + "削除後は参照できません。続行しますか？",
+        `確認済みの復旧用データ ${plan.directoryCount} 件（${formatBytes(plan.totalBytes ?? 0)}）を削除します。`
+        + "削除後は元に戻せません。続行しますか？",
         "削除",
       );
     } finally {
@@ -2689,7 +2829,7 @@ function bindEvents() {
       updateControls();
     }
     if (!confirmed) return;
-    await run("片付け中", async () => {
+    await run("復旧用データを片付け中", async () => {
       const result = await invokeCommand("cleanup_journals", {
         projectPath: getProjectPath(),
         expectedPlan: plan,
@@ -2850,12 +2990,13 @@ function progressPhaseLabel(phase) {
     readingSnapshots: "チェックポイント一覧を集計中",
     aggregatingReferences: "保存データの参照を集計中",
     checkingObjects: "保存データの存在を確認中",
-    gcReadingSnapshots: "GC: チェックポイント確認中",
-    gcCheckingReferences: "GC: 参照データ確認中",
-    gcEnumeratingObjects: "GC: 保存データ列挙中",
-    gcEnumeratingManifestChunks: "GC: manifest chunk列挙中",
-    gcDeletingObjects: "GC: 不要データ削除中",
-    gcDeletingManifestChunks: "GC: 不要manifest chunk削除中",
+    gcReadingSnapshots: "チェックポイントを確認中",
+    gcCheckingReferences: "使用中のバックアップデータを確認中",
+    gcEnumeratingObjects: "不要なバックアップデータを確認中",
+    gcEnumeratingManifestChunks: "不要なバックアップデータを確認中",
+    gcDeletingObjects: "不要なバックアップデータを削除中",
+    gcDeletingManifestChunks: "不要なバックアップデータを削除中",
+    gcDeletingInventoryNodes: "不要なバックアップデータを削除中",
     committingIndex: "一覧の更新を確定中",
     backendComplete: t("backendCommandComplete"),
     uiComplete: t("uiOperationComplete"),

@@ -534,7 +534,7 @@ fn init_project_internal(
         location_status: ProjectLocationStatus::Current,
         warnings: Vec::new(),
     };
-    if !crate::db_path(&context.repo_root).exists()
+    if !crate::db_path(&context.repo_root)?.exists()
         && crate::storage::inventory_snapshot_count(&context.repo_root, &context.project_id)? == 0
     {
         crate::rebuild_index_for_project_unlocked(&context, None, None)?;

@@ -287,13 +287,15 @@ pub struct DiffResult {
     pub added: Vec<String>,
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
+    pub unknown: Vec<String>,
     pub unchanged_count: usize,
+    pub complete: bool,
     pub warnings: Vec<String>,
 }
 
 pub const OPERATION_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const TRANSACTION_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
-pub const STORAGE_GC_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const STORAGE_GC_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -461,6 +463,7 @@ pub struct ApplyResult {
     pub applied: bool,
     pub transaction_id: Option<String>,
     pub journal_path: Option<PathBuf>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -511,8 +514,11 @@ pub struct StorageGcPlan {
     pub referenced_manifest_chunk_count: usize,
     pub unreferenced_manifest_chunk_count: usize,
     pub unreferenced_manifest_chunk_bytes: u64,
+    pub unreferenced_inventory_node_count: usize,
+    pub unreferenced_inventory_node_bytes: u64,
     pub unreferenced_blobs: Vec<UnreferencedBlob>,
     pub unreferenced_manifest_chunks: Vec<UnreferencedManifestChunk>,
+    pub unreferenced_inventory_nodes: Vec<UnreferencedInventoryNode>,
     pub missing_references: Vec<MissingBlobReference>,
     pub invalid_object_locations: Vec<InvalidObjectLocation>,
     pub invalid_manifest_chunk_locations: Vec<InvalidManifestChunkLocation>,
@@ -526,10 +532,17 @@ pub struct StorageGcPlan {
 pub struct StorageGcResult {
     pub plan: StorageGcPlan,
     pub applied: bool,
+    pub completed: bool,
+    pub committed_partially: bool,
     pub deleted_blob_count: usize,
     pub deleted_manifest_chunk_count: usize,
     pub deleted_manifest_chunk_bytes: u64,
+    pub deleted_inventory_node_count: usize,
+    pub deleted_inventory_node_bytes: u64,
     pub deleted_bytes: u64,
+    pub failed_candidate: Option<PathBuf>,
+    pub failure: Option<String>,
+    pub remaining_candidate_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +557,13 @@ pub struct UnreferencedBlob {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UnreferencedManifestChunk {
     pub chunk_path: PathBuf,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnreferencedInventoryNode {
+    pub node_path: PathBuf,
     pub size_bytes: u64,
 }
 

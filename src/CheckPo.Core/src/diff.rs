@@ -19,7 +19,7 @@ pub fn diff_checkpoint_with_options(
     let snapshot_id = SnapshotId::parse(checkpoint_id)?;
     let snapshot = load_project_snapshot(&project, &snapshot_id)?;
     let progress = options.progress.as_deref().map(|f| f as &dyn Fn(_));
-    let (working, warnings, _) = scan_project_for_checkpoint_with_baseline(
+    let (working, warnings, incomplete) = scan_project_for_checkpoint_with_baseline(
         &project,
         Some(&snapshot),
         progress,
@@ -39,7 +39,7 @@ pub fn diff_checkpoint_with_options(
         .into_iter()
         .map(|file| (file.path, (file.hash, file.modified_at_utc)))
         .collect::<BTreeMap<_, _>>();
-    let mut diff = compare_maps(&snapshot_map, &working_map);
+    let mut diff = compare_maps(&snapshot_map, &working_map, incomplete);
     diff.warnings = warnings
         .iter()
         .map(crate::scanner::format_scan_warning)
@@ -78,7 +78,7 @@ pub fn diff_checkpoint_metadata_with_cancellation(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let (working, warnings) =
+    let (working, warnings, incomplete) =
         crate::scanner::scan_project_metadata(project.project_root.as_path(), cancellation)?;
     let working_map = working
         .into_iter()
@@ -92,7 +92,7 @@ pub fn diff_checkpoint_metadata_with_cancellation(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut diff = compare_maps(&snapshot_map, &working_map);
+    let mut diff = compare_maps(&snapshot_map, &working_map, incomplete);
     diff.warnings = warnings
         .iter()
         .map(crate::scanner::format_scan_warning)
@@ -103,10 +103,12 @@ pub fn diff_checkpoint_metadata_with_cancellation(
 fn compare_maps<T: PartialEq>(
     snapshot_map: &BTreeMap<TrackedUnityFilePath, T>,
     working_map: &BTreeMap<TrackedUnityFilePath, T>,
+    incomplete: bool,
 ) -> DiffResult {
     let mut added = Vec::new();
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
+    let mut unknown = Vec::new();
     let mut unchanged_count = 0_usize;
     let keys = snapshot_map
         .keys()
@@ -116,6 +118,7 @@ fn compare_maps<T: PartialEq>(
     for path in keys {
         match (snapshot_map.get(&path), working_map.get(&path)) {
             (None, Some(_)) => added.push(path.to_string()),
+            (Some(_), None) if incomplete => unknown.push(path.to_string()),
             (Some(_), None) => deleted.push(path.to_string()),
             (Some(expected), Some(actual)) if expected != actual => modified.push(path.to_string()),
             (Some(_), Some(_)) => unchanged_count += 1,
@@ -126,7 +129,9 @@ fn compare_maps<T: PartialEq>(
         added,
         modified,
         deleted,
+        unknown,
         unchanged_count,
+        complete: !incomplete,
         warnings: Vec::new(),
     }
 }

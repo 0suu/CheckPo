@@ -100,7 +100,7 @@ fn cleanup_journals_for_test(
 }
 
 fn fingerprint_count(repo: &std::path::Path, path: &str) -> i64 {
-    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(repo)).unwrap();
+    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(repo).unwrap()).unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM file_fingerprints WHERE path = ?1",
         [path],
@@ -110,7 +110,28 @@ fn fingerprint_count(repo: &std::path::Path, path: &str) -> i64 {
 }
 
 fn open_test_index(repo: &std::path::Path) -> rusqlite::Connection {
-    rusqlite::Connection::open(core::db_path(repo)).unwrap()
+    rusqlite::Connection::open(core::db_path(repo).unwrap()).unwrap()
+}
+
+#[test]
+fn derived_sqlite_databases_live_outside_the_repository() {
+    let (_guard, _temp, project, data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let repo = repo_path(&view);
+
+    let index = core::db_path(&repo).unwrap();
+    let fingerprints = core::file_fingerprint_db_path(&repo).unwrap();
+
+    assert!(index.starts_with(data.join("derived-indexes")));
+    assert!(fingerprints.starts_with(data.join("derived-indexes")));
+    assert!(!index.starts_with(&repo));
+    assert!(!fingerprints.starts_with(&repo));
+    assert!(index.is_file());
+    assert!(fingerprints.is_file());
+    assert!(!repo.join("indexes/local.db").exists());
+    assert!(!repo.join("indexes/working-tree-cache.db").exists());
 }
 
 fn assert_copied_project_error(error: &core::CheckPoError) {
@@ -627,7 +648,7 @@ fn checkpoint_does_not_trust_cached_object_id_without_latest_snapshot_anchor() {
         .unwrap()
         .content_hash()
         .clone();
-    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(&repo)).unwrap();
+    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(&repo).unwrap()).unwrap();
     conn.execute(
         "UPDATE file_fingerprints SET object_id = ?1 WHERE path = ?2",
         rusqlite::params![bar_hash.as_str(), "Assets/Avatar/Foo.prefab"],
@@ -934,7 +955,7 @@ fn unchanged_checkpoint_does_not_rewrite_object_integrity_cache() {
     let repo = repo_path(&view);
     core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
 
-    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(&repo)).unwrap();
+    let conn = rusqlite::Connection::open(core::file_fingerprint_db_path(&repo).unwrap()).unwrap();
     let cached_object_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM object_integrity_fingerprints",
@@ -1222,7 +1243,7 @@ fn incompatible_sqlite_index_requires_explicit_rebuild_without_dropping_live_db_
     let view = init_project_for_test(&project).unwrap();
     let repo = repo_path(&view);
     core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
-    let index_path = core::db_path(&repo);
+    let index_path = core::db_path(&repo).unwrap();
     fs::remove_file(&index_path).unwrap();
     let conn = open_test_index(&repo);
     conn.execute_batch(
@@ -1307,7 +1328,7 @@ fn list_and_storage_summary_do_not_rebuild_missing_sqlite_index() {
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "two").unwrap();
     core::create_checkpoint(&project, "two", Default::default()).unwrap();
     let repo = repo_path(&view);
-    fs::remove_file(core::db_path(&repo)).unwrap();
+    fs::remove_file(core::db_path(&repo).unwrap()).unwrap();
 
     let context = core::load_project(&project).unwrap();
     assert_eq!(
@@ -1322,7 +1343,7 @@ fn list_and_storage_summary_do_not_rebuild_missing_sqlite_index() {
         core::storage_summary(&project),
         Err(core::CheckPoError::IndexUnavailable(_))
     ));
-    assert!(!core::db_path(&repo).exists());
+    assert!(!core::db_path(&repo).unwrap().exists());
 
     core::rebuild_index(&project).unwrap();
     let checkpoints = core::list_checkpoints(&project).unwrap();
@@ -1330,7 +1351,7 @@ fn list_and_storage_summary_do_not_rebuild_missing_sqlite_index() {
     assert_eq!(checkpoints.len(), 2);
     assert_eq!(summary.checkpoint_count, 2);
     assert_eq!(summary.unique_blob_count, 3);
-    assert!(core::db_path(&repo).is_file());
+    assert!(core::db_path(&repo).unwrap().is_file());
 }
 
 #[test]
@@ -1533,7 +1554,7 @@ fn unreadable_sqlite_index_is_reported_without_snapshot_fallback() {
     let view = init_project_for_test(&project).unwrap();
     core::create_checkpoint(&project, "one", Default::default()).unwrap();
     let repo = repo_path(&view);
-    let db_path = core::db_path(&repo);
+    let db_path = core::db_path(&repo).unwrap();
     fs::remove_file(&db_path).unwrap();
     fs::create_dir_all(&db_path).unwrap();
 
@@ -1559,7 +1580,7 @@ fn snapshot_index_symlink_is_corrupt_and_rebuild_never_follows_it() {
     let view = init_project_for_test(&project).unwrap();
     core::create_checkpoint(&project, "one", Default::default()).unwrap();
     let repo = repo_path(&view);
-    let db_path = core::db_path(&repo);
+    let db_path = core::db_path(&repo).unwrap();
     let outside = temp.path().join("outside.db");
     fs::write(&outside, b"outside-must-not-change").unwrap();
     let before = fs::read(&outside).unwrap();
@@ -1606,7 +1627,7 @@ fn cancelled_rebuild_index_does_not_remove_existing_index_db() {
     let view = init_project_for_test(&project).unwrap();
     core::create_checkpoint(&project, "one", Default::default()).unwrap();
     let repo = repo_path(&view);
-    let index_db = core::db_path(&repo);
+    let index_db = core::db_path(&repo).unwrap();
     core::rebuild_index(&project).unwrap();
     assert!(index_db.is_file());
     assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
@@ -1693,7 +1714,7 @@ fn rebuilding_snapshot_index_does_not_replace_fingerprint_cache() {
     let view = init_project_for_test(&project).unwrap();
     core::create_checkpoint(&project, "one", Default::default()).unwrap();
     let repo = repo_path(&view);
-    let cache_path = core::file_fingerprint_db_path(&repo);
+    let cache_path = core::file_fingerprint_db_path(&repo).unwrap();
     assert!(cache_path.is_file());
     assert_eq!(fingerprint_count(&repo, "Assets/Avatar/Foo.prefab"), 1);
     let before = fs::read(&cache_path).unwrap();
@@ -1713,7 +1734,7 @@ fn corrupt_snapshot_rebuild_preserves_existing_live_index() {
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "two").unwrap();
     core::create_checkpoint(&project, "two", Default::default()).unwrap();
     let repo = repo_path(&view);
-    let index_path = core::db_path(&repo);
+    let index_path = core::db_path(&repo).unwrap();
     let before = fs::read(&index_path).unwrap();
     fs::write(
         core::snapshot_path(&repo, &first.checkpoint_id),
@@ -1783,6 +1804,8 @@ fn object_size_mismatch_does_not_block_checkpoint_index_rebuild() {
     let rebuilt = core::rebuild_index(&project).unwrap();
     assert!(rebuilt.referenced_object_count >= 1);
     assert_eq!(rebuilt.unavailable_referenced_object_count, 1);
+    assert_eq!(rebuilt.errors.len(), 1);
+    assert!(rebuilt.errors[0].contains("full verify"));
     let context = core::load_project(&project).unwrap();
     assert_eq!(
         core::checkpoint_index_status(&context).unwrap().state,
@@ -2256,6 +2279,8 @@ fn metadata_diff_detects_added_deleted_and_metadata_changed_files() {
         .modified
         .contains(&"Assets/Avatar/Foo.prefab".to_string()));
     assert!(diff.deleted.contains(&"Packages/locked.json".to_string()));
+    assert!(diff.unknown.is_empty());
+    assert!(diff.complete);
     assert!(diff.warnings.is_empty());
 }
 
@@ -2282,8 +2307,10 @@ fn metadata_diff_honors_pre_cancelled_token() {
 fn metadata_diff_warns_when_tracked_root_is_not_directory() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    fs::write(project.join("Packages/locked.json"), "{}").unwrap();
     init_project_for_test(&project).unwrap();
     let checkpoint = core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    fs::remove_file(project.join("Packages/locked.json")).unwrap();
     fs::remove_dir(project.join("Packages")).unwrap();
     fs::write(project.join("Packages"), "not a directory").unwrap();
 
@@ -2293,6 +2320,9 @@ fn metadata_diff_warns_when_tracked_root_is_not_directory() {
         .warnings
         .iter()
         .any(|warning| warning.contains("Packages: tracked root is not a directory")));
+    assert!(!diff.complete);
+    assert!(!diff.deleted.contains(&"Packages/locked.json".to_string()));
+    assert!(diff.unknown.contains(&"Packages/locked.json".to_string()));
 }
 
 #[test]
@@ -4289,11 +4319,60 @@ fn storage_gc_deletes_only_unreferenced_loose_objects() {
     assert!(!plan.has_integrity_problems);
 
     let result = core::apply_gc_with_expected_plan(&project, &plan.plan_id).unwrap();
+    assert!(result.completed);
+    assert!(!result.committed_partially);
+    assert_eq!(result.remaining_candidate_count, 0);
     assert_eq!(result.deleted_blob_count, 1);
     let after = core::analyze_gc(&project).unwrap();
     assert_eq!(after.unreferenced_blob_count, 0);
     let diff = core::diff_checkpoint(&project, second.checkpoint_id.as_str()).unwrap();
     assert_eq!(diff.unchanged_count, 2);
+}
+
+#[test]
+fn storage_gc_reports_partial_progress_after_a_later_candidate_changes() {
+    let (_guard, _temp, project, _data) = setup();
+    let view = init_project_for_test(&project).unwrap();
+    let repo = repo_path(&view);
+    for bytes in [b"orphan-a".as_slice(), b"orphan-b".as_slice()] {
+        let path = core::object_path(&repo, &core::hash_bytes(bytes));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let plan = core::analyze_gc(&project).unwrap();
+    assert_eq!(plan.unreferenced_blobs.len(), 2);
+    let first = repo.join(&plan.unreferenced_blobs[0].object_path);
+    let second_relative = plan.unreferenced_blobs[1].object_path.clone();
+    let second = repo.join(&second_relative);
+    let changed = AtomicBool::new(false);
+    let progress = |progress: core::OperationProgress| {
+        if progress.phase == "gcDeletingObjects"
+            && progress.completed == 1
+            && !changed.swap(true, Ordering::SeqCst)
+        {
+            fs::write(&second, b"changed!").unwrap();
+        }
+    };
+
+    let result = core::apply_gc_with_expected_plan_and_progress_and_cancellation(
+        &project,
+        &plan.plan_id,
+        Some(&progress),
+        None,
+    )
+    .unwrap();
+
+    assert!(!result.completed);
+    assert!(result.committed_partially);
+    assert_eq!(result.deleted_blob_count, 1);
+    assert_eq!(
+        result.failed_candidate.as_deref(),
+        Some(second_relative.as_path())
+    );
+    assert_eq!(result.remaining_candidate_count, 1);
+    assert!(result.failure.is_some());
+    assert!(!first.exists());
+    assert_eq!(fs::read(second).unwrap(), b"changed!");
 }
 
 #[test]
@@ -4545,11 +4624,43 @@ fn storage_gc_truncates_display_details_but_apply_deletes_every_candidate() {
 
     let result = core::apply_gc_with_expected_plan(&project, &plan.plan_id).unwrap();
     assert_eq!(result.deleted_blob_count, 1_005);
+    assert!(result.completed);
+    assert!(!result.committed_partially);
+    assert_eq!(result.remaining_candidate_count, 0);
     assert!(result.plan.details_truncated);
     assert_eq!(
         core::analyze_gc(&project).unwrap().unreferenced_blob_count,
         0
     );
+}
+
+#[test]
+fn storage_gc_sweeps_unreachable_inventory_nodes() {
+    let (_guard, _temp, project, _data) = setup();
+    let tracked = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&tracked, "one").unwrap();
+    init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    fs::write(&tracked, "two").unwrap();
+    core::create_checkpoint(&project, "two", Default::default()).unwrap();
+
+    let plan = core::analyze_gc(&project).unwrap();
+    assert!(plan.unreferenced_inventory_node_count > 0);
+    assert_eq!(
+        plan.unreferenced_inventory_node_count,
+        plan.unreferenced_inventory_nodes.len()
+    );
+
+    let result = core::apply_gc_with_expected_plan(&project, &plan.plan_id).unwrap();
+    assert!(result.completed);
+    assert_eq!(
+        result.deleted_inventory_node_count,
+        plan.unreferenced_inventory_node_count
+    );
+    assert!(result.deleted_inventory_node_bytes > 0);
+    let after = core::analyze_gc(&project).unwrap();
+    assert_eq!(after.unreferenced_inventory_node_count, 0);
+    assert!(core::verify_project(&project, true).unwrap().is_valid);
 }
 
 #[test]
@@ -4962,7 +5073,7 @@ fn copied_project_blocks_mutating_operations_until_decided() {
     assert_copied_project_error(&error);
 
     let repo = repo_path(&original);
-    let index_db = core::db_path(&repo);
+    let index_db = core::db_path(&repo).unwrap();
     if index_db.exists() {
         fs::remove_file(&index_db).unwrap();
     }

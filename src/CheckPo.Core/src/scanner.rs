@@ -105,8 +105,8 @@ pub(crate) fn scan_project_for_checkpoint_with_baseline_profiled(
 pub(crate) fn scan_project_metadata(
     project_root: &Path,
     cancellation: Option<&CancellationToken>,
-) -> Result<(Vec<ScannedMetadataFile>, Vec<ScanWarning>)> {
-    let (files, warnings, _) = collect_project_files(project_root, cancellation)?;
+) -> Result<(Vec<ScannedMetadataFile>, Vec<ScanWarning>, bool)> {
+    let (files, warnings, incomplete) = collect_project_files(project_root, cancellation)?;
     Ok((
         files
             .into_iter()
@@ -117,6 +117,7 @@ pub(crate) fn scan_project_metadata(
             })
             .collect(),
         warnings,
+        incomplete,
     ))
 }
 

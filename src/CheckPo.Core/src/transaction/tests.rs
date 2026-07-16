@@ -989,6 +989,53 @@ fn recovery_restores_blocking_file_after_directory_creation_fault() {
 }
 
 #[test]
+fn recovery_removes_created_empty_parent_directories() {
+    for fault_point in [
+        TransactionFaultPoint::ProjectDirectoriesCreated,
+        TransactionFaultPoint::ProjectFileRestored,
+    ] {
+        let (_guard, _temp, project, _view) = setup_project();
+        let created_root = project.join("Assets/New");
+        let file = created_root.join("Nested/Foo.asset");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "snapshot").unwrap();
+        let checkpoint =
+            crate::create_checkpoint(&project, "Nested", CreateCheckpointOptions::default())
+                .unwrap()
+                .checkpoint_id;
+        fs::remove_dir_all(&created_root).unwrap();
+        let context = crate::load_project(&project).unwrap();
+        let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+        apply_plan_inner(
+            &context,
+            plan,
+            ApplyOptions { yes: true },
+            None,
+            None,
+            Some(&|point| {
+                if point == fault_point {
+                    return Err(injected_fault(point));
+                }
+                Ok(())
+            }),
+        )
+        .unwrap_err();
+
+        assert!(created_root.is_dir(), "fault point: {fault_point:?}");
+        let recovered = crate::recover_transactions(&project).unwrap();
+        assert_eq!(
+            recovered.recovered_transaction_count, 1,
+            "fault point: {fault_point:?}; failures: {:?}",
+            recovered.failed_transactions
+        );
+        assert_eq!(recovered.failed_transaction_count, 0);
+        assert!(!created_root.exists(), "fault point: {fault_point:?}");
+        assert!(crate::pending_transactions(&project).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn recovery_restores_blocking_file_after_topology_files_were_applied() {
     let (_guard, _temp, project, _view) = setup_project();
     let target = project.join("Assets/Topology");

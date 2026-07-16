@@ -8,7 +8,7 @@ use crate::{
     relative_path_from_project, CheckPoError, InvalidManifestChunkLocation, InvalidObjectLocation,
     MissingBlobReference, ObjectId, OperationProgress, OrphanTempFile, Result, SkippedSnapshot,
     StorageGcPlan, StorageGcResult, StorageSummary, TempFileCleanupPlan, TempFileCleanupResult,
-    TrackedUnityFilePath, UnreferencedBlob, UnreferencedManifestChunk,
+    TrackedUnityFilePath, UnreferencedBlob, UnreferencedInventoryNode, UnreferencedManifestChunk,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -93,8 +93,21 @@ fn apply_gc_internal(
     crate::ensure_not_cancelled(cancellation)?;
 
     let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
+    let total_candidate_count = plan
+        .unreferenced_blobs
+        .len()
+        .saturating_add(plan.unreferenced_manifest_chunks.len())
+        .saturating_add(plan.unreferenced_inventory_nodes.len());
     let mut deleted_blob_count = 0_usize;
     let mut deleted_bytes = 0_u64;
+    let mut deleted_manifest_chunk_count = 0_usize;
+    let mut deleted_manifest_chunk_bytes = 0_u64;
+    let mut deleted_inventory_node_count = 0_usize;
+    let mut deleted_inventory_node_bytes = 0_u64;
+    let mut completed = true;
+    let mut failed_candidate = None;
+    let mut failure = None;
+
     let delete_total = plan.unreferenced_blobs.len();
     for (index, blob) in plan.unreferenced_blobs.iter().enumerate() {
         crate::report_operation_progress(
@@ -104,84 +117,228 @@ fn apply_gc_internal(
             delete_total,
             Some(blob.object_id.to_string()),
         );
-        let expected_fingerprint = candidate_fingerprints
-            .get(&blob.object_path)
-            .ok_or_else(|| CheckPoError::Corruption("GC object fingerprint is missing".into()))?;
-        if remove_repo_file_if_bound(
-            &anchored_repo,
-            &blob.object_path,
-            blob.size_bytes,
-            expected_fingerprint,
-        )? {
-            deleted_blob_count += 1;
-            deleted_bytes += blob.size_bytes;
-            remove_empty_repo_dirs_anchored(
+        let delete_result = (|| -> Result<()> {
+            let expected_fingerprint =
+                candidate_fingerprints
+                    .get(&blob.object_path)
+                    .ok_or_else(|| {
+                        CheckPoError::Corruption("GC object fingerprint is missing".into())
+                    })?;
+            let removal = remove_repo_file_if_bound(
                 &anchored_repo,
-                blob.object_path.parent(),
-                Path::new("objects/loose"),
+                &blob.object_path,
+                blob.size_bytes,
+                expected_fingerprint,
             )?;
+            if removal.removed {
+                deleted_blob_count += 1;
+                deleted_bytes += blob.size_bytes;
+                if let Some(error) = removal.post_unlink_error {
+                    return Err(error);
+                }
+                remove_empty_repo_dirs_anchored(
+                    &anchored_repo,
+                    blob.object_path.parent(),
+                    Path::new("objects/loose"),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = delete_result {
+            if deleted_blob_count == 0 {
+                return Err(error);
+            }
+            completed = false;
+            failed_candidate = Some(blob.object_path.clone());
+            failure = Some(error.to_string());
+            break;
         }
     }
-    crate::report_operation_progress(
-        progress,
-        "gcDeletingObjects",
-        delete_total,
-        delete_total,
-        None,
-    );
+    if completed {
+        crate::report_operation_progress(
+            progress,
+            "gcDeletingObjects",
+            delete_total,
+            delete_total,
+            None,
+        );
+    }
 
-    let mut deleted_manifest_chunk_count = 0_usize;
-    let mut deleted_manifest_chunk_bytes = 0_u64;
     let manifest_delete_total = plan.unreferenced_manifest_chunks.len();
-    for (index, chunk) in plan.unreferenced_manifest_chunks.iter().enumerate() {
+    if completed {
+        for (index, chunk) in plan.unreferenced_manifest_chunks.iter().enumerate() {
+            crate::report_operation_progress(
+                progress,
+                "gcDeletingManifestChunks",
+                index,
+                manifest_delete_total,
+                Some(chunk.chunk_path.display().to_string()),
+            );
+            let delete_result = (|| -> Result<()> {
+                let stop_at = if chunk.chunk_path.starts_with("manifests/v2/nodes") {
+                    Path::new("manifests/v2/nodes")
+                } else if chunk.chunk_path.starts_with("manifests/v2/leaves") {
+                    Path::new("manifests/v2/leaves")
+                } else {
+                    return Err(CheckPoError::Corruption(format!(
+                        "manifest GC candidate is outside the manifest stores: {}",
+                        chunk.chunk_path.display()
+                    )));
+                };
+                let expected_fingerprint = candidate_fingerprints
+                    .get(&chunk.chunk_path)
+                    .ok_or_else(|| {
+                        CheckPoError::Corruption("GC chunk fingerprint is missing".into())
+                    })?;
+                let removal = remove_repo_file_if_bound(
+                    &anchored_repo,
+                    &chunk.chunk_path,
+                    chunk.size_bytes,
+                    expected_fingerprint,
+                )?;
+                if removal.removed {
+                    deleted_manifest_chunk_count += 1;
+                    deleted_manifest_chunk_bytes += chunk.size_bytes;
+                    if let Some(error) = removal.post_unlink_error {
+                        return Err(error);
+                    }
+                    remove_empty_repo_dirs_anchored(
+                        &anchored_repo,
+                        chunk.chunk_path.parent(),
+                        stop_at,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = delete_result {
+                if deleted_blob_count == 0 && deleted_manifest_chunk_count == 0 {
+                    return Err(error);
+                }
+                completed = false;
+                failed_candidate = Some(chunk.chunk_path.clone());
+                failure = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    if completed {
         crate::report_operation_progress(
             progress,
             "gcDeletingManifestChunks",
-            index,
             manifest_delete_total,
-            Some(chunk.chunk_path.display().to_string()),
+            manifest_delete_total,
+            None,
         );
-        let stop_at = if chunk.chunk_path.starts_with("manifests/v2/nodes") {
-            Path::new("manifests/v2/nodes")
-        } else if chunk.chunk_path.starts_with("manifests/v2/leaves") {
-            Path::new("manifests/v2/leaves")
-        } else {
-            return Err(CheckPoError::Corruption(format!(
-                "manifest GC candidate is outside the manifest stores: {}",
-                chunk.chunk_path.display()
-            )));
-        };
-        let expected_fingerprint = candidate_fingerprints
-            .get(&chunk.chunk_path)
-            .ok_or_else(|| CheckPoError::Corruption("GC chunk fingerprint is missing".into()))?;
-        if remove_repo_file_if_bound(
-            &anchored_repo,
-            &chunk.chunk_path,
-            chunk.size_bytes,
-            expected_fingerprint,
-        )? {
-            deleted_manifest_chunk_count += 1;
-            deleted_manifest_chunk_bytes += chunk.size_bytes;
-            remove_empty_repo_dirs_anchored(&anchored_repo, chunk.chunk_path.parent(), stop_at)?;
+    }
+
+    let inventory_delete_total = plan.unreferenced_inventory_nodes.len();
+    if completed {
+        for (index, node) in plan.unreferenced_inventory_nodes.iter().enumerate() {
+            crate::report_operation_progress(
+                progress,
+                "gcDeletingInventoryNodes",
+                index,
+                inventory_delete_total,
+                Some(node.node_path.display().to_string()),
+            );
+            let delete_result = (|| -> Result<()> {
+                let expected_fingerprint =
+                    candidate_fingerprints.get(&node.node_path).ok_or_else(|| {
+                        CheckPoError::Corruption("GC inventory fingerprint is missing".into())
+                    })?;
+                let removal = remove_repo_file_if_bound(
+                    &anchored_repo,
+                    &node.node_path,
+                    node.size_bytes,
+                    expected_fingerprint,
+                )?;
+                if removal.removed {
+                    deleted_inventory_node_count += 1;
+                    deleted_inventory_node_bytes += node.size_bytes;
+                    if let Some(error) = removal.post_unlink_error {
+                        return Err(error);
+                    }
+                    let stop_at = if node.node_path.starts_with("inventory/snapshots/states") {
+                        Path::new("inventory/snapshots/states")
+                    } else if node.node_path.starts_with("inventory/snapshots/sets/roots") {
+                        Path::new("inventory/snapshots/sets/roots")
+                    } else if node
+                        .node_path
+                        .starts_with("inventory/snapshots/sets/leaves")
+                    {
+                        Path::new("inventory/snapshots/sets/leaves")
+                    } else {
+                        return Err(CheckPoError::Corruption(format!(
+                            "inventory GC candidate is outside inventory stores: {}",
+                            node.node_path.display()
+                        )));
+                    };
+                    remove_empty_repo_dirs_anchored(
+                        &anchored_repo,
+                        node.node_path.parent(),
+                        stop_at,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = delete_result {
+                if deleted_blob_count == 0
+                    && deleted_manifest_chunk_count == 0
+                    && deleted_inventory_node_count == 0
+                {
+                    return Err(error);
+                }
+                completed = false;
+                failed_candidate = Some(node.node_path.clone());
+                failure = Some(error.to_string());
+                break;
+            }
         }
     }
-    crate::report_operation_progress(
-        progress,
-        "gcDeletingManifestChunks",
-        manifest_delete_total,
-        manifest_delete_total,
-        None,
-    );
-    anchored_repo.verify_root_binding()?;
+    if completed {
+        crate::report_operation_progress(
+            progress,
+            "gcDeletingInventoryNodes",
+            inventory_delete_total,
+            inventory_delete_total,
+            None,
+        );
+        if let Err(error) = anchored_repo.verify_root_binding() {
+            if deleted_blob_count == 0
+                && deleted_manifest_chunk_count == 0
+                && deleted_inventory_node_count == 0
+            {
+                return Err(error);
+            }
+            completed = false;
+            failure = Some(error.to_string());
+        }
+    }
     truncate_gc_plan_details(&mut plan, 1_000);
 
+    let deleted_candidate_count = deleted_blob_count
+        .saturating_add(deleted_manifest_chunk_count)
+        .saturating_add(deleted_inventory_node_count);
     Ok(StorageGcResult {
         plan,
         applied: true,
+        completed,
+        committed_partially: !completed && deleted_candidate_count > 0,
         deleted_blob_count,
         deleted_manifest_chunk_count,
         deleted_manifest_chunk_bytes,
-        deleted_bytes: deleted_bytes + deleted_manifest_chunk_bytes,
+        deleted_inventory_node_count,
+        deleted_inventory_node_bytes,
+        deleted_bytes: deleted_bytes
+            .saturating_add(deleted_manifest_chunk_bytes)
+            .saturating_add(deleted_inventory_node_bytes),
+        failed_candidate,
+        failure,
+        remaining_candidate_count: if completed {
+            0
+        } else {
+            total_candidate_count.saturating_sub(deleted_candidate_count)
+        },
     })
 }
 
@@ -705,7 +862,7 @@ fn storage_gc_plan_id(
     candidate_fingerprints: &BTreeMap<PathBuf, String>,
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"checkpo.storage-gc-plan.v1\0");
+    hasher.update(b"checkpo.storage-gc-plan.v2\0");
     hash_plan_field(&mut hasher, project.project_id.as_str().as_bytes())?;
     hash_plan_field(&mut hasher, inventory_head.as_bytes())?;
     for blob in &plan.unreferenced_blobs {
@@ -725,6 +882,15 @@ fn storage_gc_plan_id(
         let fingerprint = candidate_fingerprints
             .get(&chunk.chunk_path)
             .ok_or_else(|| CheckPoError::Corruption("GC chunk fingerprint is missing".into()))?;
+        hash_plan_field(&mut hasher, fingerprint.as_bytes())?;
+    }
+    for node in &plan.unreferenced_inventory_nodes {
+        hasher.update(b"i");
+        hash_plan_path(&mut hasher, &node.node_path)?;
+        hasher.update(&node.size_bytes.to_be_bytes());
+        let fingerprint = candidate_fingerprints.get(&node.node_path).ok_or_else(|| {
+            CheckPoError::Corruption("GC inventory fingerprint is missing".into())
+        })?;
         hash_plan_field(&mut hasher, fingerprint.as_bytes())?;
     }
     Ok(hasher.finalize().to_hex().to_string())
@@ -891,6 +1057,18 @@ fn analyze_gc_for_project(
         .iter()
         .map(|chunk| chunk.size_bytes)
         .sum();
+    let unreferenced_inventory_nodes =
+        crate::storage::inventory_gc_candidates(&project.repo_root, &project.project_id)?
+            .into_iter()
+            .map(|(node_path, size_bytes)| UnreferencedInventoryNode {
+                node_path,
+                size_bytes,
+            })
+            .collect::<Vec<_>>();
+    let unreferenced_inventory_node_bytes = unreferenced_inventory_nodes
+        .iter()
+        .map(|node| node.size_bytes)
+        .sum();
     let has_integrity_problems = !missing_references.is_empty()
         || !invalid_locations.is_empty()
         || !invalid_manifest_chunk_locations.is_empty()
@@ -908,8 +1086,11 @@ fn analyze_gc_for_project(
         referenced_manifest_chunk_count: referenced_manifest_chunks.len(),
         unreferenced_manifest_chunk_count: unreferenced_manifest_chunks.len(),
         unreferenced_manifest_chunk_bytes,
+        unreferenced_inventory_node_count: unreferenced_inventory_nodes.len(),
+        unreferenced_inventory_node_bytes,
         unreferenced_blobs,
         unreferenced_manifest_chunks,
+        unreferenced_inventory_nodes,
         missing_references,
         invalid_object_locations: invalid_locations,
         invalid_manifest_chunk_locations,
@@ -928,6 +1109,11 @@ fn analyze_gc_for_project(
         let fingerprint =
             strong_anchored_file_fingerprint(&anchored_repo, &chunk.chunk_path, chunk.size_bytes)?;
         candidate_fingerprints.insert(chunk.chunk_path.clone(), fingerprint);
+    }
+    for node in &plan.unreferenced_inventory_nodes {
+        let fingerprint =
+            strong_anchored_file_fingerprint(&anchored_repo, &node.node_path, node.size_bytes)?;
+        candidate_fingerprints.insert(node.node_path.clone(), fingerprint);
     }
     anchored_repo.verify_root_binding()?;
     let current_inventory_head =
@@ -950,12 +1136,14 @@ fn analyze_gc_for_project(
 fn truncate_gc_plan_details(plan: &mut StorageGcPlan, limit: usize) {
     let truncated = plan.unreferenced_blobs.len() > limit
         || plan.unreferenced_manifest_chunks.len() > limit
+        || plan.unreferenced_inventory_nodes.len() > limit
         || plan.missing_references.len() > limit
         || plan.invalid_object_locations.len() > limit
         || plan.invalid_manifest_chunk_locations.len() > limit
         || plan.skipped_snapshots.len() > limit;
     plan.unreferenced_blobs.truncate(limit);
     plan.unreferenced_manifest_chunks.truncate(limit);
+    plan.unreferenced_inventory_nodes.truncate(limit);
     plan.missing_references.truncate(limit);
     plan.invalid_object_locations.truncate(limit);
     plan.invalid_manifest_chunk_locations.truncate(limit);
@@ -1349,7 +1537,7 @@ fn remove_repo_file_if_bound(
     relative: &Path,
     expected_size: u64,
     expected_fingerprint: &str,
-) -> Result<bool> {
+) -> Result<RepoFileRemoval> {
     remove_repo_file_if_bound_inner(repo, relative, expected_size, expected_fingerprint, || {})
 }
 
@@ -1359,18 +1547,18 @@ fn remove_repo_file_if_bound_inner(
     expected_size: u64,
     expected_fingerprint: &str,
     before_unlink: impl FnOnce(),
-) -> Result<bool> {
+) -> Result<RepoFileRemoval> {
     let (parent, leaf) = match repo.open_parent_for_mutation(relative, false) {
         Ok(value) => value,
         Err(CheckPoError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(false)
+            return Ok(RepoFileRemoval::not_removed())
         }
         Err(error) => return Err(error),
     };
     let mut file = match parent.open_file(&leaf) {
         Ok(file) => file,
         Err(CheckPoError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(false)
+            return Ok(RepoFileRemoval::not_removed())
         }
         Err(error) => return Err(error),
     };
@@ -1398,8 +1586,25 @@ fn remove_repo_file_if_bound_inner(
     before_unlink();
     repo.verify_parent_binding(parent_relative, &parent)?;
     parent.unlink_file_if_bound(&leaf, file)?;
-    parent.sync_all()?;
-    Ok(true)
+    let post_unlink_error = parent.sync_all().err();
+    Ok(RepoFileRemoval {
+        removed: true,
+        post_unlink_error,
+    })
+}
+
+struct RepoFileRemoval {
+    removed: bool,
+    post_unlink_error: Option<CheckPoError>,
+}
+
+impl RepoFileRemoval {
+    fn not_removed() -> Self {
+        Self {
+            removed: false,
+            post_unlink_error: None,
+        }
+    }
 }
 
 fn remove_empty_repo_dirs_anchored(

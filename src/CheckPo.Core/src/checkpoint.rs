@@ -486,7 +486,7 @@ fn create_checkpoint_internal(
     }
     metrics.snapshot_index_update_micros = elapsed_micros(snapshot_index_started);
     let journal_commit_started = profiling.then(Instant::now);
-    if let Some(warning) = create_journal.commit()? {
+    if let Some(warning) = create_journal.commit() {
         warnings.push(warning);
     }
     metrics.root_journal_ref_commit_micros = metrics
@@ -1062,7 +1062,16 @@ fn finish_checkpoint_deletion(
         )),
     }
     journal.state = CheckpointDeletionState::Committed;
-    write_checkpoint_deletion_journal(&project.repo_root, transaction_dir, journal)?;
+    if let Err(error) =
+        write_checkpoint_deletion_journal(&project.repo_root, transaction_dir, journal)
+    {
+        let warning = format!(
+            "checkpoint deletion was committed, but its journal could not be finalized and will be recovered later: {error}"
+        );
+        crate::diagnostics::log_warning("checkpoint-delete-commit", &warning);
+        warnings.push(warning);
+        return Ok(warnings);
+    }
     if let Some(warning) = cleanup_committed_checkpoint_deletion_transaction(
         &project.repo_root,
         &journal.transaction_id,

@@ -14,8 +14,8 @@
     objectHashMismatch: "チェックポイントの保存データが一致しません。破損チェックを実行してください。",
     workingTreeChanged: "処理中にUnity側のファイルが変わりました。保存が落ち着いてから、もう一度実行してください。",
     repositoryLocked: "別のCheckPo処理が実行中です。完了してから、もう一度実行してください。",
-    storageRootConflict: "指定した保存先と登録済みの保存先が一致しません。保存先の再接続を明示的に実行してください。",
-    storageRootUnavailable: "登録済みのチェックポイント保存先を読み込めません。移動先の保存フォルダーを選んで再接続してください。",
+    storageRootConflict: "指定した場所と登録済みの保存先が一致しません。手動移動済みの保存データへ再接続してください。",
+    storageRootUnavailable: "登録済みの保存データを読み込めません。手動移動済みの保存データがある場所を選んで再接続してください。",
     operationBusy: "別の処理が実行中です。完了してから、もう一度実行してください。",
     pendingTransaction: "中断された作業があります。先に復旧してください。",
     unresolvedTransactionQuarantine: "プロジェクトの状態を安全と確認できません。既知のチェックポイントへ全体復元してください。",
@@ -79,13 +79,18 @@
   function diffResultIsComplete(currentDiff, diffRefreshFailure) {
     return Boolean(currentDiff)
       && !diffRefreshFailure
+      && currentDiff.complete !== false
+      && !(Array.isArray(currentDiff.unknown) && currentDiff.unknown.length > 0)
       && !(Array.isArray(currentDiff.warnings) && currentDiff.warnings.length > 0);
   }
 
   function diffResultIsProvisionalZero(diff) {
     return Boolean(diff)
       && diffChangeCount(diff) === 0
-      && (!diff.exact || (Array.isArray(diff.warnings) && diff.warnings.length > 0));
+      && (!diff.exact
+        || diff.complete === false
+        || (Array.isArray(diff.unknown) && diff.unknown.length > 0)
+        || (Array.isArray(diff.warnings) && diff.warnings.length > 0));
   }
 
   function warningBannerText(warningGroups, limit = 5) {
@@ -118,13 +123,24 @@
     const objectBytes = number(value.unreferencedLogicalBytes);
     const manifestChunkCount = number(value.unreferencedManifestChunkCount);
     const manifestChunkBytes = number(value.unreferencedManifestChunkBytes);
+    const inventoryNodeCount = number(value.unreferencedInventoryNodeCount);
+    const inventoryNodeBytes = number(value.unreferencedInventoryNodeBytes);
+    const displayedCount = (Array.isArray(value.unreferencedBlobs) ? value.unreferencedBlobs.length : 0)
+      + (Array.isArray(value.unreferencedManifestChunks) ? value.unreferencedManifestChunks.length : 0)
+      + (Array.isArray(value.unreferencedInventoryNodes) ? value.unreferencedInventoryNodes.length : 0);
+    const totalCount = objectCount + manifestChunkCount + inventoryNodeCount;
     return {
       objectCount,
       objectBytes,
       manifestChunkCount,
       manifestChunkBytes,
-      totalCount: objectCount + manifestChunkCount,
-      totalBytes: objectBytes + manifestChunkBytes,
+      inventoryNodeCount,
+      inventoryNodeBytes,
+      totalCount,
+      totalBytes: objectBytes + manifestChunkBytes + inventoryNodeBytes,
+      detailsTruncated: Boolean(value.detailsTruncated),
+      displayedCount,
+      omittedCount: Math.max(0, totalCount - displayedCount),
     };
   }
 
@@ -136,11 +152,13 @@
 
   function latestDiffState(diff, exact) {
     const warnings = Array.isArray(diff?.warnings) ? diff.warnings.map(String) : [];
+    const complete = diff?.complete !== false
+      && !(Array.isArray(diff?.unknown) && diff.unknown.length > 0);
     const changeCount = diffChangeCount(diff);
     return {
       warnings,
-      exact: Boolean(exact) && warnings.length === 0,
-      changeCount: warnings.length || (!exact && changeCount === 0)
+      exact: Boolean(exact) && complete && warnings.length === 0,
+      changeCount: !complete || warnings.length || (!exact && changeCount === 0)
         ? null
         : changeCount,
     };
@@ -214,6 +232,10 @@
 
   function restorePlanCanApply(plan, unresolvedQuarantineCount = 0) {
     return restorePlanHasChanges(plan) || Number(unresolvedQuarantineCount || 0) > 0;
+  }
+
+  function restorePreviewIsRedundant(exactNoChanges, unresolvedQuarantineCount = 0) {
+    return Boolean(exactNoChanges) && Number(unresolvedQuarantineCount || 0) <= 0;
   }
 
   function pathConfirmationPreview(paths, limit = 30) {
@@ -584,6 +606,7 @@
     transactionCleanupPlanHasCandidates,
     restorePlanHasChanges,
     restorePlanCanApply,
+    restorePreviewIsRedundant,
     virtualTreeWindowRange,
     visibleProgressPhase,
     warningBannerText,

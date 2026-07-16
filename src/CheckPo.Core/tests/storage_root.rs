@@ -80,6 +80,108 @@ fn set_project_storage_root_uses_manually_moved_repository() {
 }
 
 #[test]
+fn set_project_storage_root_recovers_prepared_checkpoint_create_journal() {
+    let (_guard, _temp, project, data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = core::init_project(&project).unwrap();
+    let first = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let old_repo = view.storage_root_path.join("repos").join(&view.project_id);
+    let new_storage = data.join("new-store");
+    let new_repo = new_storage.join("repos").join(&view.project_id);
+    copy_dir(&old_repo, &new_repo);
+    let transaction_id = "11111111111111111111111111111111";
+    let journal_root = new_repo
+        .join("journals/checkpoint-create")
+        .join(transaction_id);
+    let inventory_head_before = fs::read_to_string(new_repo.join("inventory/snapshots/head"))
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::create_dir_all(&journal_root).unwrap();
+    fs::write(
+        journal_root.join("journal.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 3,
+            "transactionId": transaction_id,
+            "state": "prepared",
+            "checkpointId": "a".repeat(64),
+            "expectedOldLatest": first.checkpoint_id,
+            "inventoryHeadBefore": inventory_head_before,
+            "createdAtUtc": "2026-01-01T00:00:00Z",
+            "updatedAtUtc": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let updated = core::set_project_storage_root(&project, &new_storage).unwrap();
+
+    assert_eq!(
+        updated.storage_root_path,
+        new_storage.canonicalize().unwrap()
+    );
+    assert!(!journal_root.exists());
+    assert_eq!(
+        core::list_checkpoints(&project).unwrap()[0].checkpoint_id,
+        first.checkpoint_id
+    );
+}
+
+#[test]
+fn set_project_storage_root_recovers_staged_checkpoint_delete_journal() {
+    let (_guard, _temp, project, data) = setup();
+    let tracked = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&tracked, "one").unwrap();
+    let view = core::init_project(&project).unwrap();
+    let first = core::create_checkpoint(&project, "First", Default::default()).unwrap();
+    fs::write(&tracked, "two").unwrap();
+    let second = core::create_checkpoint(&project, "Second", Default::default()).unwrap();
+    let old_repo = view.storage_root_path.join("repos").join(&view.project_id);
+    let new_storage = data.join("new-store");
+    let new_repo = new_storage.join("repos").join(&view.project_id);
+    copy_dir(&old_repo, &new_repo);
+    let transaction_id = "22222222222222222222222222222222";
+    let transaction_root = new_repo
+        .join("journals/checkpoint-delete")
+        .join(transaction_id);
+    let inventory_head_before = fs::read_to_string(new_repo.join("inventory/snapshots/head"))
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::create_dir_all(&transaction_root).unwrap();
+    fs::rename(
+        core::snapshot_path(&new_repo, &second.checkpoint_id),
+        transaction_root.join("snapshot.root"),
+    )
+    .unwrap();
+    fs::write(
+        transaction_root.join("journal.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 4,
+            "transactionId": transaction_id,
+            "checkpointId": second.checkpoint_id,
+            "oldLatest": second.checkpoint_id,
+            "newLatest": first.checkpoint_id,
+            "remainingCheckpointCount": 1,
+            "updateIndex": true,
+            "inventoryHeadBefore": inventory_head_before,
+            "state": "staged",
+            "createdAtUtc": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    core::set_project_storage_root(&project, &new_storage).unwrap();
+
+    assert!(!transaction_root.exists());
+    let checkpoints = core::list_checkpoints(&project).unwrap();
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0].checkpoint_id, first.checkpoint_id);
+    assert!(core::verify_project(&project, false).unwrap().is_valid);
+}
+
+#[test]
 fn portable_repository_set_roundtrips_without_local_indexes_or_journals() {
     let (_guard, _temp, project, data) = setup();
     let tracked = project.join("Assets/Avatar/Foo.prefab");

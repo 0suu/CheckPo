@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const {
   buildChangeTreeModel,
   cancelAndWaitForIdle,
@@ -31,6 +33,7 @@ const {
   retainVisibleChangeSelection,
   restorePlanHasChanges,
   restorePlanCanApply,
+  restorePreviewIsRedundant,
   samePathInput,
   selectChangePaths,
   storageSummaryWithRetainedSize,
@@ -44,6 +47,9 @@ test("zero-change restore remains available to resolve an unresolved quarantine"
   const zeroPlan = { hasChanges: false };
   assert.equal(restorePlanCanApply(zeroPlan, 0), false);
   assert.equal(restorePlanCanApply(zeroPlan, 1), true);
+  assert.equal(restorePreviewIsRedundant(true, 0), true);
+  assert.equal(restorePreviewIsRedundant(true, 1), false);
+  assert.equal(restorePreviewIsRedundant(false, 0), false);
 });
 
 test("project identity changes when either id or path changes", () => {
@@ -81,9 +87,16 @@ test("project-scoped reset does not share mutable selection state", () => {
 });
 
 test("stale or warned diffs cannot drive destructive file operations", () => {
-  const complete = { added: ["Assets/A.asset"], warnings: [] };
+  const complete = {
+    added: ["Assets/A.asset"],
+    complete: true,
+    unknown: [],
+    warnings: [],
+  };
   assert.equal(diffResultIsComplete(complete, null), true);
   assert.equal(diffResultIsComplete({ ...complete, warnings: ["scan failed"] }, null), false);
+  assert.equal(diffResultIsComplete({ ...complete, complete: false }, null), false);
+  assert.equal(diffResultIsComplete({ ...complete, unknown: ["Assets/Unknown.asset"] }, null), false);
   assert.equal(diffResultIsComplete(complete, "refresh failed"), false);
   assert.equal(diffResultIsComplete(null, null), false);
 });
@@ -103,15 +116,46 @@ test("GC presentation includes manifest-only reclaimable data", () => {
     unreferencedLogicalBytes: 0,
     unreferencedManifestChunkCount: 1,
     unreferencedManifestChunkBytes: 4096,
+    unreferencedInventoryNodeCount: 0,
+    unreferencedInventoryNodeBytes: 0,
+    unreferencedBlobs: [],
+    unreferencedManifestChunks: [{ chunkPath: "manifests/v2/leaves/aa/id" }],
+    unreferencedInventoryNodes: [],
+    detailsTruncated: false,
   });
   assert.deepEqual(result, {
     objectCount: 0,
     objectBytes: 0,
     manifestChunkCount: 1,
     manifestChunkBytes: 4096,
+    inventoryNodeCount: 0,
+    inventoryNodeBytes: 0,
     totalCount: 1,
     totalBytes: 4096,
+    detailsTruncated: false,
+    displayedCount: 1,
+    omittedCount: 0,
   });
+});
+
+test("GC presentation reports candidates omitted from truncated details", () => {
+  const result = gcPlanPresentation({
+    unreferencedBlobCount: 1005,
+    unreferencedLogicalBytes: 1005,
+    unreferencedManifestChunkCount: 2,
+    unreferencedManifestChunkBytes: 2,
+    unreferencedInventoryNodeCount: 0,
+    unreferencedInventoryNodeBytes: 0,
+    unreferencedBlobs: Array.from({ length: 1000 }, (_, index) => ({ objectId: String(index) })),
+    unreferencedManifestChunks: [{ chunkPath: "one" }, { chunkPath: "two" }],
+    unreferencedInventoryNodes: [],
+    detailsTruncated: true,
+  });
+
+  assert.equal(result.totalCount, 1007);
+  assert.equal(result.displayedCount, 1002);
+  assert.equal(result.omittedCount, 5);
+  assert.equal(result.detailsTruncated, true);
 });
 
 test("diff counts and cancellation outcomes are classified explicitly", () => {
@@ -494,6 +538,21 @@ test("diff warnings make the latest change count unknown", () => {
   });
 });
 
+test("incomplete diff makes the latest change count unknown without relying on warnings", () => {
+  assert.deepEqual(latestDiffState({
+    added: [],
+    modified: [],
+    deleted: [],
+    unknown: ["Packages/locked.json"],
+    complete: false,
+    warnings: [],
+  }, true), {
+    warnings: [],
+    exact: false,
+    changeCount: null,
+  });
+});
+
 test("queued metadata refresh stays metadata-only only when every request is metadata-only", () => {
   const queued = mergeDiffRefreshOptions(
     { silent: true, metadataOnly: true },
@@ -583,4 +642,44 @@ test("change trees start collapsed and expose sibling positions for ARIA", () =>
   assert.deepEqual(rows.map((row) => row.posInSet), [1, 2]);
   assert.deepEqual(rows.map((row) => row.setSize), [2, 2]);
   assert.ok(rows.every((row) => row.depth === 0));
+});
+
+test("GUI usability guards keep dialogs reachable and accessible", () => {
+  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const dialogsJs = fs.readFileSync(path.join(__dirname, "dialogs.js"), "utf8");
+  const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  const stylesCss = fs.readFileSync(path.join(__dirname, "styles.css"), "utf8");
+  const themeJs = fs.readFileSync(path.join(__dirname, "theme.js"), "utf8");
+  const tauriConfig = JSON.parse(fs.readFileSync(
+    path.join(__dirname, "..", "src-tauri", "tauri.conf.json"),
+    "utf8",
+  ));
+
+  assert.match(appJs, /async function reconnectProjectStorageAfterLoadFailure/);
+  assert.match(appJs, /storageRootUnavailable" && storageRootPath\) throw error/);
+  assert.match(appJs, /statusBannerText/);
+  assert.match(appJs, /contextMenuReturnFocus/);
+  assert.match(appJs, /visibleModalOverlay\(\) \|\| document\.body/);
+  assert.match(stylesCss, /\.confirm-box \{[\s\S]*?max-height: calc\(100vh - 36px\);[\s\S]*?overflow: auto;/);
+  assert.match(stylesCss, /#projectStatusPath \{[\s\S]*?text-overflow: ellipsis;/);
+  assert.match(indexHtml, /id="checkpointName"[^>]*aria-label="チェックポイント名"/);
+  assert.match(indexHtml, /id="themeSystem"[^>]*aria-pressed="true"/);
+  assert.match(indexHtml, /class="busy-box"[^>]*tabindex="-1"/);
+  assert.match(themeJs, /setAttribute\("aria-pressed", String\(selected\)\)/);
+  assert.match(dialogsJs, /\[role='dialog'\]\[tabindex\]/);
+  assert.equal(tauriConfig.app.windows[0].minWidth, 480);
+  assert.equal(tauriConfig.app.windows[0].minHeight, 560);
+});
+
+test("GUI uses user-facing maintenance and storage reconnect wording", () => {
+  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  const i18nJs = fs.readFileSync(path.join(__dirname, "i18n.js"), "utf8");
+  const agents = fs.readFileSync(path.join(__dirname, "..", "..", "..", "AGENTS.md"), "utf8");
+
+  assert.match(indexHtml, /手動移動済みの保存データへ再接続/);
+  assert.match(i18nJs, /gcDryRun: "不要なバックアップデータ"/);
+  assert.match(i18nJs, /transactionCleanup: "復旧用データの片付け"/);
+  assert.doesNotMatch(appJs, /不要 object|manifest chunk|inventory node|transaction cleanup/);
+  assert.match(agents, /更新確認・ダウンロード・適用はMVP対象/);
 });

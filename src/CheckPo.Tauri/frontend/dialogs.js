@@ -50,7 +50,8 @@ function setupModalAccessibility() {
     }
     activeOverlay = nextOverlay;
     if (overlayChanged && activeOverlay && !activeOverlay.contains(document.activeElement)) {
-      const first = activeOverlay.querySelector(MODAL_FOCUSABLE_SELECTOR);
+      const first = activeOverlay.querySelector(MODAL_FOCUSABLE_SELECTOR)
+        || activeOverlay.querySelector("[role='dialog'][tabindex], [role='alertdialog'][tabindex]");
       if (first) queueMicrotask(() => first.focus());
     }
     if (!activeOverlay && returnFocus?.isConnected) {
@@ -77,6 +78,9 @@ function setupModalAccessibility() {
       .filter((element) => !element.hidden && element.getClientRects().length > 0);
     if (!focusable.length) {
       event.preventDefault();
+      activeOverlay
+        .querySelector("[role='dialog'][tabindex], [role='alertdialog'][tabindex]")
+        ?.focus();
       return;
     }
     const first = focusable[0];

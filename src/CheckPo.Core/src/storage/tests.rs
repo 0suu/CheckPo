@@ -4,7 +4,7 @@ use crate::{SnapshotContent, SnapshotEntry, TrackedUnityFilePath};
 #[test]
 fn open_db_sets_busy_timeout() {
     let temp = tempfile::tempdir().unwrap();
-    let conn = open_db(temp.path()).unwrap();
+    let conn = open_db_path(&temp.path().join("local.db")).unwrap();
 
     let timeout_ms: i64 = conn
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
@@ -19,16 +19,17 @@ fn fingerprint_database_open_rejects_leaf_symlink_without_touching_target() {
     use std::os::unix::fs::symlink;
 
     let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(repo.join("indexes")).unwrap();
     let target = temp.path().join("outside.db");
     fs::write(&target, b"outside-must-not-change").unwrap();
-    let cache = file_fingerprint_db_path(&repo);
+    let cache = temp
+        .path()
+        .join("derived-indexes/project/working-tree-cache.db");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
     symlink(&target, &cache).unwrap();
     let before = fs::read(&target).unwrap();
 
-    assert!(open_file_fingerprint_db(&repo).is_err());
-    assert!(remove_file_fingerprint_db_if_exists(&repo).is_err());
+    assert!(open_db_path(&cache).is_err());
+    assert!(remove_db_path_if_exists(&cache).is_err());
     assert_eq!(fs::read(&target).unwrap(), before);
     assert!(fs::symlink_metadata(&cache)
         .unwrap()
@@ -39,12 +40,13 @@ fn fingerprint_database_open_rejects_leaf_symlink_without_touching_target() {
 #[test]
 fn fingerprint_database_removal_is_identity_bound() {
     let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(repo.join("indexes")).unwrap();
-    let cache = file_fingerprint_db_path(&repo);
+    let cache = temp
+        .path()
+        .join("derived-indexes/project/working-tree-cache.db");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
     fs::write(&cache, b"cache").unwrap();
 
-    remove_file_fingerprint_db_if_exists(&repo).unwrap();
+    remove_db_path_if_exists(&cache).unwrap();
 
     assert!(!cache.exists());
 }
