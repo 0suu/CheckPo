@@ -228,6 +228,54 @@ fn portable_repository_set_roundtrips_without_local_indexes_or_journals() {
     assert!(!gc.has_integrity_problems);
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+#[ignore = "requires CHECKPO_CROSS_DEVICE_TEST_ROOT on a different volume"]
+fn cross_device_restore_publishes_verified_staged_content() {
+    let external_root = std::env::var_os("CHECKPO_CROSS_DEVICE_TEST_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("CHECKPO_CROSS_DEVICE_TEST_ROOT is required");
+    let external = tempfile::Builder::new()
+        .prefix("checkpo-cross-device-")
+        .tempdir_in(external_root)
+        .unwrap();
+    let storage = external.path().join("storage");
+    let (_guard, _temp, project, _data) = setup();
+    fs::create_dir_all(&storage).unwrap();
+
+    let probe_source = storage.join("volume-probe");
+    let probe_destination = project.join("volume-probe");
+    fs::write(&probe_source, b"probe").unwrap();
+    let rename_error = fs::rename(&probe_source, &probe_destination)
+        .expect_err("test roots must be on different volumes");
+    #[cfg(unix)]
+    assert_eq!(rename_error.raw_os_error(), Some(libc::EXDEV));
+    #[cfg(windows)]
+    assert_eq!(rename_error.raw_os_error(), Some(17));
+
+    let tracked = project.join("Assets/Avatar/Large.asset");
+    let expected = vec![0x5a_u8; 16 * 1024 * 1024];
+    fs::write(&tracked, &expected).unwrap();
+    core::init_project_with_storage_root(&project, &storage).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "cross-device", Default::default())
+        .unwrap()
+        .checkpoint_id;
+    fs::remove_file(&tracked).unwrap();
+
+    let plan = core::preview_restore(&project, checkpoint.as_str()).unwrap();
+    core::apply_restore_plan(
+        &project,
+        checkpoint.as_str(),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&tracked).unwrap(), expected);
+    let diff = core::diff_checkpoint(&project, checkpoint.as_str()).unwrap();
+    assert!(diff.added.is_empty() && diff.modified.is_empty() && diff.deleted.is_empty());
+}
+
 #[test]
 fn set_project_storage_root_locks_old_repository_when_copy_exists() {
     let (_guard, _temp, project, data) = setup();

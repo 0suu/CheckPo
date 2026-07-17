@@ -543,19 +543,17 @@ pub(super) fn restore_new_staged_file_to_project_deferred(
             CheckPoError::Corruption(message) => CheckPoError::ObjectHashMismatch(message),
             error => error,
         })?;
-    let staged_hash = staged_file.hash()?;
-    if staged_hash.metadata.len() != expected_size || &staged_hash.object_id != expected_hash {
+    let staged_metadata = staged_file.metadata()?;
+    if staged_metadata.len() != expected_size {
         return Err(CheckPoError::ObjectHashMismatch(format!(
-            "{} expected {} bytes with hash {}, got {} bytes with hash {}",
+            "{} expected {} bytes, got {} bytes",
             staged.display(),
             expected_size,
-            expected_hash,
-            staged_hash.metadata.len(),
-            staged_hash.object_id
+            staged_metadata.len()
         )));
     }
     verify_file_mtime(
-        &staged_hash.metadata,
+        &staged_metadata,
         staged,
         operation.after_modified_at_utc.as_deref(),
     )?;
@@ -567,36 +565,59 @@ pub(super) fn restore_new_staged_file_to_project_deferred(
         anchored_project.open_parent_batched(project_relative, true, project_sync_batch)?;
     let project_parent_relative = project_relative.parent().unwrap_or_else(|| Path::new(""));
     anchored_project.verify_parent_binding(project_parent_relative, &destination_parent)?;
-    match staged_parent.rename_no_replace_to(
-        &staged_leaf,
-        &staged_file,
-        &destination_parent,
-        &destination_leaf,
-    ) {
-        Ok(()) => {
-            if let Err(error) =
-                anchored_project.verify_parent_binding(project_parent_relative, &destination_parent)
-            {
-                let _ = destination_parent.rename_no_replace_to(
-                    &destination_leaf,
-                    &staged_file,
-                    &staged_parent,
-                    &staged_leaf,
-                );
-                return Err(error);
-            }
-            project_sync_batch.record(destination_parent)?;
-            staged_sync_batch.record(staged_parent)?;
-            anchored_project.verify_root_binding()?;
-            anchored_repo.verify_root_binding()?;
-            return Ok(false);
+    let definitely_different_volume =
+        staged_file.is_definitely_on_different_volume(&destination_parent);
+    if !definitely_different_volume {
+        let staged_hash = staged_file.hash()?;
+        if staged_hash.metadata.len() != expected_size || &staged_hash.object_id != expected_hash {
+            return Err(CheckPoError::ObjectHashMismatch(format!(
+                "{} expected {} bytes with hash {}, got {} bytes with hash {}",
+                staged.display(),
+                expected_size,
+                expected_hash,
+                staged_hash.metadata.len(),
+                staged_hash.object_id
+            )));
         }
-        Err(error) if is_cross_device_error(&error) => {}
-        Err(error) => {
-            return Err(map_destination_exists_to_working_tree_changed(
-                error,
-                &operation.path,
-            ))
+        verify_file_mtime(
+            &staged_hash.metadata,
+            staged,
+            operation.after_modified_at_utc.as_deref(),
+        )?;
+        staged_parent.verify_file_binding(&staged_leaf, &staged_file)?;
+        anchored_repo.verify_root_binding()?;
+
+        match staged_parent.rename_no_replace_to(
+            &staged_leaf,
+            &staged_file,
+            &destination_parent,
+            &destination_leaf,
+        ) {
+            Ok(()) => {
+                if let Err(error) = anchored_project
+                    .verify_parent_binding(project_parent_relative, &destination_parent)
+                {
+                    let _ = destination_parent.rename_no_replace_to(
+                        &destination_leaf,
+                        &staged_file,
+                        &staged_parent,
+                        &staged_leaf,
+                    );
+                    return Err(error);
+                }
+                project_sync_batch.record(destination_parent)?;
+                staged_sync_batch.record(staged_parent)?;
+                anchored_project.verify_root_binding()?;
+                anchored_repo.verify_root_binding()?;
+                return Ok(false);
+            }
+            Err(error) if is_cross_device_error(&error) => {}
+            Err(error) => {
+                return Err(map_destination_exists_to_working_tree_changed(
+                    error,
+                    &operation.path,
+                ))
+            }
         }
     }
 
@@ -618,6 +639,11 @@ pub(super) fn restore_new_staged_file_to_project_deferred(
                 copied.object_id
             )));
         }
+        verify_file_mtime(
+            &copied.metadata,
+            staged,
+            operation.after_modified_at_utc.as_deref(),
+        )?;
         if let Some(modified) = parse_mtime(operation.after_modified_at_utc.as_deref())? {
             output.set_mtime(modified)?;
         }

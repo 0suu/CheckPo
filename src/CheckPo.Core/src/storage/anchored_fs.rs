@@ -1189,6 +1189,14 @@ impl AnchoredFile {
             .map_err(|error| io_error(&self.display_path, error))
     }
 
+    pub(crate) fn is_definitely_on_different_volume(
+        &self,
+        destination_parent: &AnchoredParent,
+    ) -> bool {
+        self.identity
+            .is_definitely_on_different_volume(&destination_parent.identity)
+    }
+
     fn current_version(&self) -> Result<FileVersion> {
         let metadata = self.metadata()?;
         if !metadata.is_file() {
@@ -3375,6 +3383,26 @@ fn anchored_file_from_open_file(display_path: PathBuf, file: File) -> Result<Anc
 }
 
 impl FileIdentity {
+    fn is_definitely_on_different_volume(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device != other.device
+        }
+
+        #[cfg(windows)]
+        {
+            self.volume_serial_number != 0
+                && other.volume_serial_number != 0
+                && self.volume_serial_number != other.volume_serial_number
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = other;
+            false
+        }
+    }
+
     #[cfg(not(windows))]
     fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
         #[cfg(unix)]
@@ -4340,6 +4368,25 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn volume_identity_treats_only_different_devices_as_definitive() {
+        let source = FileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        let same_volume = FileIdentity {
+            device: 7,
+            inode: 12,
+        };
+        let different_volume = FileIdentity {
+            device: 8,
+            inode: 11,
+        };
+
+        assert!(!source.is_definitely_on_different_volume(&same_volume));
+        assert!(source.is_definitely_on_different_volume(&different_volume));
+    }
+
+    #[test]
     fn anchored_hash_polls_for_cancellation_after_eof() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("root");
@@ -5179,6 +5226,31 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+
+    #[test]
+    fn volume_identity_treats_only_known_different_volumes_as_definitive() {
+        let source = FileIdentity {
+            volume_serial_number: 7,
+            file_id: [1; 16],
+        };
+        let same_volume = FileIdentity {
+            volume_serial_number: 7,
+            file_id: [2; 16],
+        };
+        let different_volume = FileIdentity {
+            volume_serial_number: 8,
+            file_id: [1; 16],
+        };
+        let unknown_volume = FileIdentity {
+            volume_serial_number: 0,
+            file_id: [3; 16],
+        };
+
+        assert!(!source.is_definitely_on_different_volume(&same_volume));
+        assert!(source.is_definitely_on_different_volume(&different_volume));
+        assert!(!source.is_definitely_on_different_volume(&unknown_volume));
+        assert!(!unknown_volume.is_definitely_on_different_volume(&source));
+    }
 
     #[test]
     fn mutation_root_rebinds_to_the_held_identity_and_flushes() {
