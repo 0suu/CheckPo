@@ -334,7 +334,7 @@ fn restore_fault_after_first_publish_rolls_back_all_paths() {
 fn successful_restore_never_hard_links_project_file_to_cas_object() {
     use std::os::unix::fs::MetadataExt;
 
-    let (_guard, _temp, project, _view) = setup_project();
+    let (_guard, _temp, project, view) = setup_project();
     let file = project.join("Assets/Avatar/Foo.prefab");
     fs::write(&file, "one").unwrap();
     let checkpoint =

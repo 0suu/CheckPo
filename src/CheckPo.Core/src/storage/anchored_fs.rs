@@ -104,6 +104,7 @@ struct FileVersion {
     changed: i64,
 }
 
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReplaceProtocolPhase {
     RecoveryRecordDurable,
@@ -1009,7 +1010,7 @@ impl AnchoredParentSyncBatch {
         }
     }
 
-    pub(crate) fn record(&mut self, mut parent: AnchoredParent) -> Result<()> {
+    pub(crate) fn record(&mut self, parent: AnchoredParent) -> Result<()> {
         if self
             .parents
             .iter()
@@ -1021,13 +1022,15 @@ impl AnchoredParentSyncBatch {
             self.flush()?;
         }
         #[cfg(windows)]
-        {
+        let parent = {
+            let mut parent = parent;
             // Directory flushing requires a write-capable handle on Windows.
             // Rebind by path only after proving that the new handle still
             // names the directory represented by the held anchor.
             parent.directory =
                 reopen_windows_directory_for_mutation(&parent.directory, &parent.display_path)?;
-        }
+            parent
+        };
         self.parents.push(parent);
         Ok(())
     }
@@ -2020,6 +2023,7 @@ impl AnchoredParent {
             destination,
             true,
             || {},
+            #[cfg(windows)]
             |_| Ok(()),
         );
         #[cfg(windows)]
@@ -2044,6 +2048,7 @@ impl AnchoredParent {
             destination,
             false,
             || {},
+            #[cfg(windows)]
             |_| Ok(()),
         );
         #[cfg(windows)]
@@ -2071,7 +2076,7 @@ impl AnchoredParent {
         destination: &AnchoredFile,
         sync_immediately: bool,
         before_replace: impl FnOnce(),
-        mut after_windows_phase: impl FnMut(ReplaceProtocolPhase) -> Result<()>,
+        #[cfg(windows)] mut after_windows_phase: impl FnMut(ReplaceProtocolPhase) -> Result<()>,
     ) -> Result<()> {
         #[cfg(windows)]
         self.recover_windows_replace_record(destination_leaf)?;
@@ -2215,6 +2220,7 @@ impl AnchoredParent {
             destination,
             true,
             before_replace,
+            #[cfg(windows)]
             |_| Ok(()),
         )
     }

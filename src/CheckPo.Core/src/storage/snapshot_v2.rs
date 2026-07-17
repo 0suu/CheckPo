@@ -13,6 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use unicode_normalization::UnicodeNormalization;
 
 /// Persistent v2 format constant. Changing it requires a new path-key policy.
+// The compile-time dependency-version assertion below is not considered a use
+// by rustc 1.88's dead-code analysis.
+#[allow(dead_code)]
 pub const PATH_KEY_UNICODE_VERSION: (u8, u8, u8) = (16, 0, 0);
 /// Frozen for repository format v5 after 8/16/32/64 KiB real-project comparison.
 pub const MANIFEST_LEAF_TARGET_BYTES: usize = 32 * 1024;
@@ -547,8 +550,7 @@ fn validate_subtree<S: ManifestChunkSource>(
             > MAX_MANIFEST_VALIDATION_CACHE_BYTES
         {
             return Err(SnapshotV2Error::Invalid(format!(
-                "manifest validation cache exceeds {} bytes",
-                MAX_MANIFEST_VALIDATION_CACHE_BYTES
+                "manifest validation cache exceeds {MAX_MANIFEST_VALIDATION_CACHE_BYTES} bytes"
             )));
         }
         cache.validated.insert(reference, info.clone());

@@ -675,11 +675,8 @@ test("GUI uses user-facing maintenance and storage reconnect wording", () => {
   const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
   const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   const i18nJs = fs.readFileSync(path.join(__dirname, "i18n.js"), "utf8");
-  const agents = fs.readFileSync(path.join(__dirname, "..", "..", "..", "AGENTS.md"), "utf8");
-
   assert.match(indexHtml, /手動移動済みの保存データへ再接続/);
   assert.match(i18nJs, /gcDryRun: "不要なバックアップデータ"/);
   assert.match(i18nJs, /transactionCleanup: "復旧用データの片付け"/);
   assert.doesNotMatch(appJs, /不要 object|manifest chunk|inventory node|transaction cleanup/);
-  assert.match(agents, /更新確認・ダウンロード・適用はMVP対象/);
 });

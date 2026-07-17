@@ -251,8 +251,7 @@ fn plan_directory_topology_changes(
         match fs::symlink_metadata(&destination) {
             Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) => {
                 return Err(CheckPoError::InvalidTrackedPath(format!(
-                    "{} is a symbolic link or reparse point",
-                    path
+                    "{path} is a symbolic link or reparse point"
                 )))
             }
             Ok(metadata) if metadata.is_dir() => {
@@ -298,8 +297,7 @@ fn plan_directory_topology_changes(
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => {
                 return Err(CheckPoError::InvalidTrackedPath(format!(
-                    "{} is not a regular file or directory",
-                    path
+                    "{path} is not a regular file or directory"
                 )))
             }
             Err(error)
@@ -475,17 +473,13 @@ fn current_path_kind(
 
     let full_path = path.to_project_path(project.project_root.as_path());
     match fs::symlink_metadata(&full_path) {
-        Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) => {
-            Err(CheckPoError::InvalidTrackedPath(format!(
-                "{} is a symbolic link or reparse point",
-                path
-            )))
-        }
+        Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) => Err(
+            CheckPoError::InvalidTrackedPath(format!("{path} is a symbolic link or reparse point")),
+        ),
         Ok(metadata) if metadata.is_file() => Ok(CurrentPathKind::File),
         Ok(metadata) if metadata.is_dir() => Ok(CurrentPathKind::Directory),
         Ok(_) => Err(CheckPoError::InvalidTrackedPath(format!(
-            "{} is not a regular file or directory",
-            path
+            "{path} is not a regular file or directory"
         ))),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(CurrentPathKind::Missing),
         Err(error) => Err(crate::io_error(&full_path, error)),
