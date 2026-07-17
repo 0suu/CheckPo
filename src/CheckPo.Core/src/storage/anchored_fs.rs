@@ -2204,7 +2204,7 @@ impl AnchoredParent {
         result
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     fn replace_from_temporary_with_hook(
         &self,
         temporary_leaf: &std::ffi::OsStr,
