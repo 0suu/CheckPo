@@ -7,13 +7,14 @@ mod recovery;
 mod tests;
 
 use crate::{
-    acquire_repository_lock, hash_file, load_project_snapshot, move_file_no_replace,
-    report_operation_progress, storage::copy_object_to_file, write_json_atomic, ApplyOptions,
-    ApplyResult, CancellationToken, CheckPoError, FileOperation, FileOperationType, ObjectId,
-    OperationPlan, OperationPlanKind, OperationProgress, PendingTransaction, ProjectContext,
-    Result, SnapshotId, TrackedUnityFilePath, TransactionCleanupResult, TransactionRecoveryFailure,
-    TransactionRecoveryResult,
+    load_project_snapshot, report_operation_progress, ApplyOptions, ApplyResult, CancellationToken,
+    CheckPoError, FileOperation, FileOperationType, ObjectId, OperationPlan, OperationPlanKind,
+    OperationProgress, PendingTransaction, ProjectContext, Result, SnapshotId,
+    TrackedUnityFilePath, TransactionCleanupCandidate, TransactionCleanupPlan,
+    TransactionCleanupResult, TransactionQuarantineResult, TransactionRecoveryFailure,
+    TransactionRecoveryResult, UnresolvedTransactionQuarantine,
 };
+#[cfg(test)]
 use filetime::FileTime;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,23 +24,31 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub use apply::apply_plan;
+pub(crate) use apply::apply_restore_plan_and_resolve_quarantines;
 #[cfg(test)]
 use apply::{
     apply_plan_inner, ensure_available_space, estimated_project_required_bytes,
-    estimated_repository_required_bytes, TransactionFaultPoint,
+    estimated_repository_required_bytes, TransactionFaultPoint, TRANSACTION_BACKUP_FILE_BATCH_SIZE,
 };
 pub use journal::{
-    cleanup_journals, ensure_no_pending_transactions, pending_transactions,
-    pending_transactions_for_project,
+    analyze_transaction_cleanup, cleanup_journals_with_expected_plan,
+    ensure_no_pending_transactions, pending_transactions, pending_transactions_for_project,
 };
 use journal::{
-    directory_is_empty_or_missing, journals_dir, write_journal, JournalState, TransactionJournal,
-    JOURNAL_STATE_UNREADABLE,
+    dir_size, journals_dir, read_transaction_journal, validate_transaction_journal_identity,
+    write_journal, JournalState, TransactionJournal, JOURNAL_STATE_UNREADABLE,
+    TRANSACTION_JOURNAL_SCHEMA_VERSION,
 };
 pub use plan::build_plan_with_progress_and_cancellation;
-use plan::validate_expected_plan;
+pub(crate) use plan::normalize_discard_selection;
+use plan::{
+    validate_expected_plan, validate_journal_directory_topology, validate_journal_operations,
+};
 #[cfg(test)]
-use project_file_ops::backup_project_file_by_copy;
+use project_file_ops::backup_project_file_by_reflink_or_copy;
 use project_file_ops::*;
 use recovery::invalidate_operation_fingerprints;
-pub use recovery::recover_transactions;
+pub use recovery::{
+    ensure_no_unresolved_transaction_quarantines, quarantine_transaction, recover_transactions,
+    unresolved_transaction_quarantines, unresolved_transaction_quarantines_for_project,
+};

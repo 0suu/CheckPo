@@ -3,7 +3,6 @@ use crate::{
     read_latest_snapshot_id, ApplyOptions, ApplyResult, CancellationToken, CheckPoError,
     OperationPlan, OperationPlanKind, OperationProgress, Result, SnapshotId, TrackedUnityFilePath,
 };
-use std::collections::BTreeSet;
 use std::path::Path;
 
 pub fn preview_discard(
@@ -22,6 +21,7 @@ pub fn preview_discard_with_progress_and_cancellation(
     cancellation: Option<&CancellationToken>,
 ) -> Result<OperationPlan> {
     let project = load_project(project_path)?;
+    let _lock = crate::acquire_project_repository_shared_lock(&project, "discard-preview")?;
     let snapshot_id = match checkpoint_id {
         Some(id) => SnapshotId::parse(id)?,
         None => read_latest_snapshot_id(&project.repo_root)?
@@ -92,12 +92,11 @@ pub fn apply_discard_plan_with_progress_and_cancellation(
             "discard checkpoint changed after preview".to_string(),
         ));
     }
-    let selected = paths
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let selected = {
+        let _lock =
+            crate::acquire_project_repository_shared_lock(&project, "discard-apply-validation")?;
+        crate::transaction::normalize_discard_selection(&project, &snapshot_id, paths)?
+    };
     if plan.selected_paths.as_deref() != Some(selected.as_slice()) {
         return Err(CheckPoError::WorkingTreeChanged(
             "discard path set changed after preview".to_string(),

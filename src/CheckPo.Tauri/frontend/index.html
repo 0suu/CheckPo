@@ -33,16 +33,20 @@
               <span data-i18n="searchCheckpoints">Search checkpoints</span>
               <input id="checkpointSearch" type="text" autocomplete="off" data-i18n-placeholder="searchCheckpointsPlaceholder" />
             </label>
+            <section class="checkpoint-index-notice" id="checkpointIndexNotice" role="region" aria-labelledby="checkpointIndexMessage" hidden>
+              <p id="checkpointIndexMessage" role="status"></p>
+              <button class="button" id="rebuildIndexButton" type="button" data-command="rebuild_index">索引を再構築</button>
+            </section>
           </section>
 
           <div class="checkpoint-list" id="checkpointList" role="listbox" tabindex="0"></div>
 
           <section class="savebox">
-            <div class="savebox-hint">
+            <label class="savebox-hint" for="checkpointName">
               <span data-i18n="saveCurrentChanges">いまの変更に名前を付けて保存</span>
               <b id="pendingFileCount">0<span data-i18n="fileUnit">ファイル</span></b>
-            </div>
-            <input id="checkpointName" type="text" data-i18n-placeholder="checkpointNamePlaceholder" />
+            </label>
+            <input id="checkpointName" type="text" data-i18n-placeholder="checkpointNamePlaceholder" data-i18n-aria-label="checkpointName" aria-label="チェックポイント名" />
             <button class="button primary" id="createCheckpointButton" type="button" data-command="create_checkpoint">
               <span data-i18n="createCheckpoint">チェックポイントを作成</span>
             </button>
@@ -51,7 +55,7 @@
 
         <section class="detail-pane">
           <header class="detail-toolbar">
-            <div class="active-checkpoint-card" id="activeCheckpointCard" role="button" tabindex="0">
+            <div class="active-checkpoint-card" id="activeCheckpointCard">
               <h2 id="activeCheckpointTitle" data-i18n="noSelection">No checkpoint selected</h2>
               <p id="diffSummary" data-i18n="diffEmpty">Create a checkpoint to see changes since the latest checkpoint.</p>
             </div>
@@ -90,6 +94,28 @@
             <button class="button danger-secondary" id="recoverTransactionsButton" type="button" data-i18n="recoverTransactions">Recover</button>
           </section>
 
+          <section class="error-banner" id="errorBanner" role="alert" aria-live="assertive" hidden>
+            <div>
+              <strong>操作を完了できませんでした</strong>
+              <span id="errorBannerText"></span>
+            </div>
+            <button class="ghost-button" id="dismissErrorButton" type="button">閉じる</button>
+          </section>
+
+          <section class="warning-banner" id="warningBanner" role="status" aria-live="polite" hidden>
+            <div>
+              <strong data-i18n="warningBannerTitle">一部を完全に確認できませんでした</strong>
+              <span id="warningBannerText"></span>
+            </div>
+          </section>
+
+          <section class="quarantine-banner" id="unresolvedQuarantineBanner" hidden>
+            <div>
+              <strong data-i18n="unresolvedQuarantineTitle">プロジェクトの状態を確認できません</strong>
+              <span id="unresolvedQuarantineText"></span>
+            </div>
+          </section>
+
           <section class="project-warning-banner" id="projectWarningBanner" hidden>
             <div>
               <strong data-i18n="projectWarningTitle">Project path warning</strong>
@@ -97,6 +123,11 @@
             </div>
             <button class="button" id="confirmProjectLocationButton" type="button" data-command="confirm_project_location" data-i18n="confirmProjectLocation">Use this location</button>
             <button class="button danger-secondary" id="startSeparateProjectButton" type="button" data-command="start_as_separate_project" data-i18n="startSeparateProject">Start separately</button>
+          </section>
+
+          <section class="status-banner" id="statusBanner" role="status" aria-live="polite" hidden>
+            <span id="statusBannerText"></span>
+            <button class="ghost-button" id="dismissStatusButton" type="button">閉じる</button>
           </section>
 
           <section class="detail-content">
@@ -109,8 +140,8 @@
           </section>
 
           <footer class="status-bar">
-            <span>📌 <strong id="checkpointCount">0</strong> CP · <strong id="storedSize">-</strong></span>
-            <span>📂 <strong id="projectStatusPath">-</strong></span>
+            <span data-i18n-title="referencedStorageDescription">📌 <strong id="checkpointCount">0</strong> CP · <span data-i18n="referencedStorage">使用中の保存データ</span> <strong id="storedSize">-</strong></span>
+            <span class="status-path">📂 <strong id="projectStatusPath">-</strong></span>
             <span class="auto-refresh-status" id="autoRefreshStatus" hidden>
               <span class="activity-dot" aria-hidden="true"></span>
               <span data-i18n="refreshingDiffView">差分表示を更新中</span>
@@ -132,12 +163,14 @@
 
         <section class="settings-section" aria-labelledby="themeTitle">
           <h3 id="themeTitle" data-i18n="theme">Theme</h3>
-          <div class="language-switcher settings-language-switcher" role="group" aria-label="Theme">
-            <button class="segmented is-active" id="themeSystem" type="button" data-theme-option="system" data-i18n="themeSystem">System</button>
-            <button class="segmented" id="themeLight" type="button" data-theme-option="light" data-i18n="themeLight">Light</button>
-            <button class="segmented" id="themeDark" type="button" data-theme-option="dark" data-i18n="themeDark">Dark</button>
+          <div class="language-switcher settings-language-switcher" role="group" data-i18n-aria-label="theme" aria-label="テーマ">
+            <button class="segmented is-active" id="themeSystem" type="button" data-theme-option="system" data-i18n="themeSystem" aria-pressed="true">System</button>
+            <button class="segmented" id="themeLight" type="button" data-theme-option="light" data-i18n="themeLight" aria-pressed="false">Light</button>
+            <button class="segmented" id="themeDark" type="button" data-theme-option="dark" data-i18n="themeDark" aria-pressed="false">Dark</button>
           </div>
         </section>
+
+        <p class="dialog-status" id="settingsStatus" role="status" aria-live="polite" hidden></p>
 
         <section class="settings-section" aria-labelledby="updateSettingsTitle">
           <h3 id="updateSettingsTitle" data-i18n="updates">Updates</h3>
@@ -148,7 +181,7 @@
         </section>
 
         <section class="settings-section" aria-labelledby="storageSettingsTitle">
-          <h3 id="storageSettingsTitle" data-i18n="storageRootPath">Checkpoint storage</h3>
+          <h3 id="storageSettingsTitle" data-i18n="storageRootPath">保存データの再接続</h3>
           <label class="field">
             <span data-i18n="defaultNewProjectStorageRoot">Default storage for new projects</span>
             <span class="field-with-button">
@@ -178,16 +211,16 @@
             </span>
           </label>
           <div class="project-actions">
-            <button class="button primary" id="setStorageRootButton" type="button" data-command="set_storage_root" data-i18n="setStorageRoot">Change storage folder</button>
+            <button class="button primary" id="setStorageRootButton" type="button" data-command="set_storage_root" data-i18n="setStorageRoot">手動移動済みの保存データへ再接続</button>
           </div>
         </section>
 
         <section class="settings-section" aria-labelledby="gcSettingsTitle">
-          <h3 id="gcSettingsTitle" data-i18n="gcDryRun">Unused data</h3>
+          <h3 id="gcSettingsTitle" data-i18n="gcDryRun">不要なバックアップデータ</h3>
           <p id="gcSummary" data-i18n="gcEmpty">GC analysis has not run.</p>
           <div class="project-actions">
-            <button class="button" id="analyzeGcButton" type="button" data-command="analyze_gc" data-i18n="analyzeGc">Analyze GC</button>
-            <button class="button danger-secondary" id="applyGcButton" type="button" data-command="apply_gc" data-i18n="applyGc">Delete unused data</button>
+            <button class="button" id="analyzeGcButton" type="button" data-command="analyze_gc" data-i18n="analyzeGc">不要なバックアップデータを確認</button>
+            <button class="button danger-secondary" id="applyGcButton" type="button" data-command="apply_gc" data-i18n="applyGc">不要なバックアップデータを削除</button>
           </div>
           <p id="gcResult">-</p>
         </section>
@@ -200,6 +233,8 @@
           <h2 id="advancedTitle" data-i18n="advancedActions">More</h2>
           <button class="ghost-button" id="closeAdvancedButton" type="button" data-i18n="close">Close</button>
         </header>
+
+        <p class="dialog-status" id="advancedStatus" role="status" aria-live="polite" hidden></p>
 
         <div class="result-strip">
           <article class="info-band small">
@@ -228,9 +263,18 @@
               <button class="button" id="previewCleanupButton" type="button" data-command="preview_transaction_cleanup" data-i18n="previewCleanup">Preview cleanup</button>
               <button class="button danger-secondary" id="applyCleanupButton" type="button" data-command="apply_transaction_cleanup" data-i18n="applyCleanup">Apply cleanup</button>
             </div>
-            <h4 data-i18n="transactionCleanup">Transaction cleanup</h4>
+            <h4 data-i18n="transactionCleanup">復旧用データの片付け</h4>
             <p id="cleanupSummary" data-i18n="cleanupEmpty">Cleanup preview has not run.</p>
             <p id="cleanupResult">-</p>
+          </article>
+          <article class="storage-widget">
+            <div class="maintenance-actions">
+              <button class="button" id="previewTempCleanupButton" type="button" data-command="preview_temp_cleanup">一時ファイル確認</button>
+              <button class="button danger-secondary" id="applyTempCleanupButton" type="button" data-command="apply_temp_cleanup" data-destructive="true">一時ファイル削除</button>
+            </div>
+            <h4>一時ファイルの片付け</h4>
+            <p id="tempCleanupSummary">未確認</p>
+            <p id="tempCleanupResult">-</p>
           </article>
         </details>
 
@@ -239,7 +283,10 @@
           <article class="log-panel">
             <div class="section-heading compact">
               <h3 data-i18n="operationLog">Operation log</h3>
-              <button class="ghost-button" id="clearLogButton" type="button" data-i18n="clear">Clear</button>
+              <span>
+                <button class="ghost-button" id="openDiagnosticLogsButton" type="button">診断ログフォルダ</button>
+                <button class="ghost-button" id="clearLogButton" type="button" data-i18n="clear">Clear</button>
+              </span>
             </div>
             <ol class="log-list" id="logList"></ol>
           </article>
@@ -264,6 +311,8 @@
           <h2 id="projectRegistrationTitle" data-i18n="addProject">Add project</h2>
           <button class="ghost-button" id="closeProjectRegistrationButton" type="button" data-i18n="close">Close</button>
         </header>
+
+        <p class="dialog-status" id="projectRegistrationStatus" role="status" aria-live="polite" hidden></p>
 
         <label class="field">
           <span data-i18n="projectPath">Project path</span>
@@ -318,7 +367,9 @@
           <button class="ghost-button" id="closeProjectSelectionButton" type="button" data-i18n="close">Close</button>
         </header>
 
-        <div class="project-selection-list" id="projectSelectionList" role="listbox"></div>
+        <p class="dialog-status" id="projectSelectionStatus" role="status" aria-live="polite" hidden></p>
+
+        <div class="project-selection-list" id="projectSelectionList" role="listbox" aria-label="登録済みプロジェクト"></div>
 
         <div class="dialog-actions">
           <button class="button primary" id="addProjectFromSelectionButton" type="button" data-i18n="addProject">Add project</button>
@@ -336,10 +387,13 @@
           <button class="ghost-button" id="closeRollbackDialogButton" type="button" data-i18n="close">Close</button>
         </header>
 
+        <p class="dialog-status" id="rollbackStatus" role="status" aria-live="polite" hidden></p>
+
         <section class="rollback-zone">
           <div class="danger-band">
             <h2 data-i18n="rollbackTitle">Rollback modifies the current Unity project</h2>
             <p id="rollbackSummary" data-i18n="rollbackEmpty">Preview rollback before applying it.</p>
+            <p class="dialog-error" id="rollbackError" role="alert" hidden></p>
             <ul id="rollbackWarnings"></ul>
           </div>
           <div class="rollback-confirm">
@@ -378,13 +432,24 @@
       </section>
     </div>
 
+    <div class="confirm-overlay error-overlay" id="errorOverlay" hidden>
+      <section class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="errorDialogTitle" aria-describedby="errorDialogText">
+        <h2 id="errorDialogTitle">操作を完了できませんでした</h2>
+        <p id="errorDialogText"></p>
+        <div class="confirm-actions">
+          <button class="button primary" id="dismissErrorDialogButton" type="button">閉じる</button>
+        </div>
+      </section>
+    </div>
+
     <div class="busy-overlay" id="busyOverlay" hidden>
-      <div class="busy-box">
+      <div class="busy-box" role="dialog" aria-modal="true" aria-labelledby="busyTitle" aria-describedby="busyCommand busyProgressText busyCloseNotice" tabindex="-1">
         <div class="spinner" aria-hidden="true"></div>
         <strong id="busyTitle" data-i18n="working">Working...</strong>
         <span id="busyCommand"></span>
         <progress id="busyProgress" class="busy-progress" max="100"></progress>
         <span id="busyProgressText" class="busy-progress-text"></span>
+        <span id="busyCloseNotice" class="busy-close-notice" role="status" aria-live="assertive" hidden></span>
         <button class="button" id="cancelOperationButton" type="button" data-i18n="cancelOperation">Cancel</button>
       </div>
     </div>
@@ -392,6 +457,7 @@
     <script src="./config.js" defer></script>
     <script src="./utils.js" defer></script>
     <script src="./i18n.js" defer></script>
+    <script src="./frontend-state.js" defer></script>
     <script src="./app.js" defer></script>
     <script src="./theme.js" defer></script>
     <script src="./diff-tree.js" defer></script>

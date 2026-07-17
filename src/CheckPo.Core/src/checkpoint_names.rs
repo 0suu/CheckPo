@@ -2,10 +2,12 @@ use crate::{CheckpointSummary, ProjectContext, Result, SnapshotId};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+const MAX_CHECKPOINT_NAMES_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub(crate) fn apply_checkpoint_name_overrides(
     project: &ProjectContext,
     checkpoints: &mut [CheckpointSummary],
-) {
+) -> Vec<String> {
     let (names, warnings) = read_checkpoint_name_overrides(project);
     if !names.is_empty() {
         for checkpoint in checkpoints.iter_mut() {
@@ -14,18 +16,24 @@ pub(crate) fn apply_checkpoint_name_overrides(
             }
         }
     }
-    attach_warnings(checkpoints, warnings);
+    attach_warnings(checkpoints, warnings.clone());
+    warnings
 }
 
 pub(crate) fn read_checkpoint_name_overrides(
     project: &ProjectContext,
 ) -> (BTreeMap<String, String>, Vec<String>) {
     let path = crate::checkpoint_names_path(&project.repo_root);
-    if !path.exists() {
-        return (BTreeMap::new(), Vec::new());
-    }
-    let value = match crate::read_json::<Value>(&path) {
+    let value = match crate::storage::AnchoredRoot::open(&project.repo_root).and_then(|root| {
+        let bytes = root.read_bytes_bounded_path(&path, MAX_CHECKPOINT_NAMES_FILE_BYTES)?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|error| crate::json_error(&path, error))
+    }) {
         Ok(value) => value,
+        Err(crate::CheckPoError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return (BTreeMap::new(), Vec::new());
+        }
         Err(error) => {
             return (
                 BTreeMap::new(),
@@ -63,6 +71,13 @@ pub(crate) fn read_checkpoint_name_overrides(
             ));
             continue;
         };
+        if name.len() > crate::storage::merkle_codec::MAX_CHECKPOINT_NAME_BYTES {
+            warnings.push(format!(
+                "checkpoint display name for {checkpoint_id} exceeds {} bytes and was ignored",
+                crate::storage::merkle_codec::MAX_CHECKPOINT_NAME_BYTES
+            ));
+            continue;
+        }
         names.insert(checkpoint_id.clone(), name.to_string());
     }
     (names, warnings)
@@ -72,18 +87,32 @@ pub(crate) fn write_checkpoint_name_overrides(
     project: &ProjectContext,
     names: &BTreeMap<String, String>,
 ) -> Result<()> {
-    crate::write_json_atomic(&crate::checkpoint_names_path(&project.repo_root), names)
+    crate::storage::AnchoredRoot::open(&project.repo_root)?
+        .write_json_atomic(std::path::Path::new("refs/checkpoint_names.json"), names)
+}
+
+fn read_checkpoint_name_overrides_for_mutation(
+    project: &ProjectContext,
+) -> Result<BTreeMap<String, String>> {
+    let (names, warnings) = read_checkpoint_name_overrides(project);
+    if warnings.is_empty() {
+        return Ok(names);
+    }
+    Err(crate::CheckPoError::Corruption(format!(
+        "checkpoint display names cannot be modified until their metadata is repaired: {}",
+        warnings.join("; ")
+    )))
 }
 
 pub(crate) fn remove_checkpoint_name_override(
     project: &ProjectContext,
     checkpoint_id: &SnapshotId,
 ) -> Result<Vec<String>> {
-    let (mut names, warnings) = read_checkpoint_name_overrides(project);
+    let mut names = read_checkpoint_name_overrides_for_mutation(project)?;
     if names.remove(checkpoint_id.as_str()).is_some() {
         write_checkpoint_name_overrides(project, &names)?;
     }
-    Ok(warnings)
+    Ok(Vec::new())
 }
 
 fn attach_warnings(checkpoints: &mut [CheckpointSummary], warnings: Vec<String>) {

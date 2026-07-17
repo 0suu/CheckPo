@@ -51,6 +51,24 @@ impl TrackedUnityFilePath {
             if *segment == "." || *segment == ".." {
                 return Err(invalid_path(input, "dot segments are not allowed"));
             }
+            if segment.ends_with(' ') || segment.ends_with('.') {
+                return Err(invalid_path(
+                    input,
+                    "segments ending with space or dot are not allowed",
+                ));
+            }
+            if segment.chars().any(is_windows_forbidden_character) {
+                return Err(invalid_path(
+                    input,
+                    "Windows-forbidden characters are not allowed",
+                ));
+            }
+            if is_windows_reserved_name(segment) {
+                return Err(invalid_path(
+                    input,
+                    "Windows reserved file names are not allowed",
+                ));
+            }
         }
         Ok(Self(value.to_string()))
     }
@@ -97,6 +115,14 @@ impl SnapshotId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_digest_bytes(bytes: [u8; 32]) -> Self {
+        Self(encode_lower_hex(&bytes))
+    }
+
+    pub(crate) fn digest_bytes(&self) -> [u8; 32] {
+        decode_lower_hex(self.as_str()).expect("SnapshotId is validated at construction")
+    }
 }
 
 impl<'de> Deserialize<'de> for SnapshotId {
@@ -128,6 +154,14 @@ impl ObjectId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_digest_bytes(bytes: [u8; 32]) -> Self {
+        Self(encode_lower_hex(&bytes))
+    }
+
+    pub(crate) fn digest_bytes(&self) -> [u8; 32] {
+        decode_lower_hex(self.as_str()).expect("ObjectId is validated at construction")
+    }
 }
 
 impl ProjectId {
@@ -138,6 +172,14 @@ impl ProjectId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn uuid_bytes(&self) -> [u8; 16] {
+        decode_lower_hex(self.as_str()).expect("ProjectId is validated at construction")
+    }
+
+    pub(crate) fn from_uuid_bytes(bytes: [u8; 16]) -> Self {
+        Self(encode_lower_hex(&bytes))
     }
 }
 
@@ -230,6 +272,35 @@ pub fn validate_project_id(input: &str) -> Result<()> {
     Ok(())
 }
 
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn decode_lower_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
 pub fn relative_path_from_project(project_root: &Path, full_path: &Path) -> Result<String> {
     let relative = full_path
         .strip_prefix(project_root)
@@ -252,6 +323,175 @@ pub fn relative_path_from_project(project_root: &Path, full_path: &Path) -> Resu
     Ok(parts.join("/"))
 }
 
+pub(crate) fn is_checkpo_temporary_file(path: &Path) -> bool {
+    is_checkpo_owned_temporary_file(path)
+}
+
+pub(crate) fn is_checkpo_owned_temporary_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_checkpo_owned_temporary_file_name)
+}
+
+pub(crate) fn is_checkpo_atomic_materialization_temporary_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_checkpo_atomic_materialization_temporary_file_name)
+}
+
+fn is_checkpo_owned_temporary_file_name(name: &str) -> bool {
+    is_checkpo_atomic_materialization_temporary_file_name(name)
+        || name
+            .strip_prefix(".checkpo-r-")
+            .and_then(|body| body.strip_suffix(".tmp"))
+            .and_then(|body| body.split_once('-'))
+            .is_some_and(|(digest, transaction_id)| {
+                is_lowercase_hex(digest, 16) && is_lowercase_hex_uuid(transaction_id)
+            })
+}
+
+fn is_checkpo_atomic_materialization_temporary_file_name(name: &str) -> bool {
+    name.strip_prefix(".checkpo-")
+        .and_then(|body| body.strip_suffix(".tmp"))
+        .is_some_and(is_lowercase_hex_uuid)
+}
+
+fn is_lowercase_hex_uuid(value: &str) -> bool {
+    is_lowercase_hex(value, 32)
+}
+
+fn is_lowercase_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn invalid_path(input: &str, reason: &str) -> CheckPoError {
     CheckPoError::InvalidTrackedPath(format!("{input}: {reason}"))
+}
+
+fn is_windows_reserved_name(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or(segment);
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || upper
+        .strip_prefix("COM")
+        .is_some_and(is_reserved_device_digit)
+        || upper
+            .strip_prefix("LPT")
+            .is_some_and(is_reserved_device_digit)
+}
+
+fn is_reserved_device_digit(value: &str) -> bool {
+    matches!(
+        value,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+    )
+}
+
+fn is_windows_forbidden_character(value: char) -> bool {
+    value <= '\u{1f}' || matches!(value, '<' | '>' | '"' | '|' | '?' | '*')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_checkpo_atomic_materialization_temporary_file, is_checkpo_owned_temporary_file,
+        TrackedUnityFilePath,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn atomic_materialization_temporary_file_name_is_strict() {
+        let owned = Path::new("Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp");
+        assert!(is_checkpo_atomic_materialization_temporary_file(owned));
+        assert!(is_checkpo_owned_temporary_file(owned));
+
+        for path in [
+            "Assets/.checkpo-0123456789abcdef0123456789abcde.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef0.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdeF.tmp",
+            "Assets/.checkpo-note-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/checkpo-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp.txt",
+        ] {
+            assert!(
+                !is_checkpo_atomic_materialization_temporary_file(Path::new(path)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_temporary_file_name_is_limited_to_generated_formats() {
+        for path in [
+            "Assets/.checkpo-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdef-0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            assert!(is_checkpo_owned_temporary_file(Path::new(path)), "{path}");
+        }
+
+        for path in [
+            "Assets/.Foo.prefab.0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-Foo.prefab-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-anything-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcde-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdef0-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdeF-0123456789abcdef0123456789abcdef.tmp",
+            "Assets/.checkpo-r-0123456789abcdef-0123456789abcdef0123456789abcdeF.tmp",
+            "Assets/.checkpo-r-extra-0123456789abcdef-0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            assert!(!is_checkpo_owned_temporary_file(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_windows_reserved_names() {
+        for path in [
+            "Assets/CON",
+            "Assets/con.txt",
+            "Assets/Aux.asset",
+            "Assets/COM1.prefab",
+            "Assets/LPT9.meta",
+            "Assets/COM¹.prefab",
+            "Assets/com².asset",
+            "Assets/LPT³.meta",
+            "Assets/CONIN$",
+            "Assets/conout$.txt",
+            "ProjectSettings/NUL",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_windows_forbidden_characters_and_controls() {
+        for path in [
+            "Assets/Foo<Bar.prefab",
+            "Assets/Foo>Bar.prefab",
+            "Assets/Foo\"Bar.prefab",
+            "Assets/Foo|Bar.prefab",
+            "Assets/Foo?Bar.prefab",
+            "Assets/Foo*Bar.prefab",
+            "Assets/Foo\u{0}Bar.prefab",
+            "Assets/Foo\u{1f}Bar.prefab",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn tracked_path_rejects_segments_ending_with_dot_or_space() {
+        for path in [
+            "Assets/Foo.",
+            "Assets/Foo ",
+            "Assets/Folder./File.asset",
+            "Assets/Folder /File.asset",
+        ] {
+            assert!(TrackedUnityFilePath::parse(path).is_err(), "{path}");
+        }
+    }
 }

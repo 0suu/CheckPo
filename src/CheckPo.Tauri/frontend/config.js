@@ -1,5 +1,3 @@
-const INITIAL_CHECKPOINT_NAME = "初回チェックポイント";
-
 const immediatelyCancellableCommands = new Set([
   "create_checkpoint",
   "diff_checkpoint_full",
@@ -9,6 +7,8 @@ const immediatelyCancellableCommands = new Set([
   "apply_discard_files",
   "verify_project",
   "rebuild_index",
+  "analyze_gc",
+  "apply_gc",
 ]);
 
 const progressCancellableStartCommands = new Set([

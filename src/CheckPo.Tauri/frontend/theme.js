@@ -12,7 +12,9 @@ function applyTheme() {
 
 function updateThemeControls() {
   document.querySelectorAll("[data-theme-option]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.themeOption === state.theme);
+    const selected = button.dataset.themeOption === state.theme;
+    button.classList.toggle("is-active", selected);
+    button.setAttribute("aria-pressed", String(selected));
   });
 }
 

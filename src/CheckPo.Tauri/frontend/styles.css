@@ -241,12 +241,6 @@ p {
   min-width: 0;
   border-radius: 8px;
   padding: 6px 8px;
-  cursor: context-menu;
-}
-
-.active-checkpoint-card:focus-visible {
-  outline: 2px solid var(--primary);
-  outline-offset: 2px;
 }
 
 .active-checkpoint-card.is-disabled {
@@ -582,8 +576,12 @@ p {
 }
 
 .update-banner,
+.error-banner,
+.warning-banner,
 .pending-banner,
-.project-warning-banner {
+.quarantine-banner,
+.project-warning-banner,
+.status-banner {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -596,16 +594,35 @@ p {
   background: var(--success-soft);
 }
 
+.error-banner {
+  background: var(--danger-soft);
+}
+
+.warning-banner {
+  background: var(--warning-soft);
+}
+
 .pending-banner {
   background: var(--warning-soft);
+}
+
+.quarantine-banner {
+  background: var(--danger-soft);
 }
 
 .project-warning-banner {
   background: var(--warning-soft);
 }
 
+.status-banner {
+  background: var(--primary-soft);
+}
+
 .update-banner div,
+.error-banner div,
+.warning-banner div,
 .pending-banner div,
+.quarantine-banner div,
 .project-warning-banner div {
   display: grid;
   gap: 2px;
@@ -622,17 +639,55 @@ p {
   font-size: 13px;
 }
 
+.error-banner strong {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.warning-banner strong {
+  color: var(--warning);
+  font-size: 13px;
+}
+
+.quarantine-banner strong {
+  color: var(--danger);
+  font-size: 13px;
+}
+
 .project-warning-banner strong {
   color: var(--warning);
   font-size: 13px;
 }
 
 .update-banner span,
+.error-banner span,
+.warning-banner span,
 .pending-banner span,
-.project-warning-banner span {
+.quarantine-banner span,
+.project-warning-banner span,
+.status-banner span {
   color: var(--muted);
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.dialog-status {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--primary-soft);
+  color: var(--text);
+  padding: 9px 11px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.dialog-error {
+  margin: 8px 0 0;
+  color: var(--danger);
+  font-weight: 700;
+  white-space: pre-wrap;
 }
 
 .work-surface {
@@ -1627,6 +1682,14 @@ pre {
   display: none;
 }
 
+.busy-close-notice {
+  max-width: 36rem;
+  color: var(--text);
+  font-size: 0.86rem;
+  font-weight: 700;
+  text-align: center;
+}
+
 .confirm-overlay {
   position: fixed;
   inset: 0;
@@ -1636,6 +1699,10 @@ pre {
   background: rgba(15, 23, 42, 0.32);
   backdrop-filter: blur(4px);
   padding: 18px;
+}
+
+.error-overlay {
+  z-index: 25;
 }
 
 .settings-overlay {
@@ -1784,6 +1851,8 @@ pre {
   display: grid;
   gap: 16px;
   width: min(560px, 100%);
+  max-height: calc(100vh - 36px);
+  overflow: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-elevated);
@@ -1794,6 +1863,7 @@ pre {
 .confirm-box p {
   color: var(--text);
   font-weight: 700;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
   line-height: 1.55;
 }
@@ -1917,6 +1987,35 @@ body {
   display: none;
 }
 
+.checkpoint-index-notice {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  border: 1px solid var(--warning-border, #f59e0b);
+  border-radius: 8px;
+  background: var(--warning-soft, #fffbeb);
+  padding: 10px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.checkpoint-index-notice[hidden] {
+  display: none;
+}
+
+.checkpoint-index-notice p {
+  margin: 0;
+}
+
+.checkpoint-index-notice .button {
+  justify-self: start;
+}
+
+.checkpoint-index-empty {
+  padding: 16px 10px;
+}
+
 .field-label {
   display: block;
   margin-bottom: 6px;
@@ -1986,6 +2085,22 @@ input[type="text"] {
   text-transform: uppercase;
 }
 
+.checkpoint-virtual-spacer {
+  position: relative;
+  min-width: 100%;
+}
+
+.checkpoint-row.checkpoint-virtual-row,
+.history-sidebar .checkpoint-row.checkpoint-virtual-row {
+  position: absolute;
+  right: 0;
+  left: 0;
+  box-sizing: border-box;
+  height: 32px;
+  min-height: 32px;
+  overflow: hidden;
+}
+
 .checkpoint-row,
 .history-sidebar .checkpoint-row {
   display: grid;
@@ -1999,6 +2114,11 @@ input[type="text"] {
   background: transparent;
   box-shadow: none;
   padding: 7px 10px;
+}
+
+.checkpoint-row[hidden],
+.checkpoint-section[hidden] {
+  display: none;
 }
 
 .history-sidebar .checkpoint-row::before {
@@ -2215,27 +2335,36 @@ input[type="text"] {
 }
 
 .diff-tree {
+  --diff-tree-row-height: 36px;
+
+  position: relative;
   height: 100%;
   min-height: 0;
   max-height: 100%;
   overflow-y: auto;
   overscroll-behavior: contain;
   background: var(--surface);
-  padding: 4px 0 14px;
+  padding: 0;
 }
 
-.tree-children {
+.diff-tree:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.diff-tree-spacer {
   position: relative;
+  min-width: 100%;
 }
 
-.tree-children::before {
+.tree-row.virtual-row {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: calc(var(--ind) + 7px);
-  width: 1px;
-  background: var(--border-soft);
-  content: "";
+  right: 0;
+  left: 0;
+  box-sizing: border-box;
+  height: var(--diff-tree-row-height);
+  min-height: var(--diff-tree-row-height);
+  overflow: hidden;
 }
 
 .tree-row {
@@ -2249,6 +2378,10 @@ input[type="text"] {
 
 .tree-row:hover {
   background: var(--control-hover);
+}
+
+.tree-row.is-active {
+  box-shadow: inset 2px 0 0 var(--muted);
 }
 
 .tree-row.folder {
@@ -2383,9 +2516,12 @@ input[type="text"] {
   color: var(--primary);
   padding: 2.5px 9px;
   font-size: 10.5px;
+  white-space: nowrap;
 }
 
-.tree-row:hover .tree-op {
+.tree-row:hover .tree-op,
+.tree-row:focus-within .tree-op,
+.tree-row.is-active .tree-op {
   visibility: visible;
 }
 
@@ -2413,6 +2549,19 @@ input[type="text"] {
 
 .status-bar strong {
   font-weight: 700;
+}
+
+.status-path {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#projectStatusPath {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .auto-refresh-status {
@@ -2445,8 +2594,12 @@ input[type="text"] {
 }
 
 .update-banner,
+.error-banner,
+.warning-banner,
 .pending-banner,
-.project-warning-banner {
+.quarantine-banner,
+.project-warning-banner,
+.status-banner {
   min-height: 44px;
 }
 
@@ -2744,7 +2897,11 @@ input[type="text"] {
   .rollback-confirm,
   .toolbar-actions,
   .update-banner,
-  .project-warning-banner {
+  .error-banner,
+  .warning-banner,
+  .quarantine-banner,
+  .project-warning-banner,
+  .status-banner {
     align-items: stretch;
     flex-direction: column;
   }
@@ -2955,6 +3112,13 @@ input[type="text"],
   background: #ffffff;
 }
 
+.button.primary:disabled {
+  border-color: var(--border);
+  background: var(--control-bg);
+  color: var(--muted);
+  box-shadow: none;
+}
+
 :root[data-theme="dark"] .button.danger {
   border-color: #b42318;
   background: #b42318;
@@ -3030,5 +3194,31 @@ input[type="text"],
   .detail-content {
     flex: 1 1 0;
     min-height: 0;
+  }
+}
+
+@media (max-width: 1120px) {
+  .diff-filter-row,
+  .status-bar {
+    flex-wrap: wrap;
+  }
+
+  .tree-tools {
+    width: 100%;
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+}
+
+@media (min-width: 761px) and (max-width: 900px) {
+  .detail-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar-actions {
+    width: 100%;
+    margin-left: 0;
+    flex-wrap: wrap;
   }
 }

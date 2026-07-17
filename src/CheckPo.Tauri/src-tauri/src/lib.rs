@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(not(test))]
+use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 
@@ -36,10 +38,24 @@ impl fmt::Display for AppError {
 #[derive(Clone, Default)]
 struct OperationState {
     current: Arc<Mutex<Option<RunningOperation>>>,
+    #[cfg(not(test))]
+    pending_exit: Arc<Mutex<Option<AppHandle>>>,
 }
 
 struct RunningOperation {
     cancellation: Option<core::CancellationToken>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationClosePending {
+    cancellation_requested: bool,
+}
+
+fn operation_close_pending(operation: Option<&RunningOperation>) -> Option<OperationClosePending> {
+    operation.map(|operation| OperationClosePending {
+        cancellation_requested: operation.cancellation.is_some(),
+    })
 }
 
 #[derive(Default)]
@@ -132,10 +148,15 @@ async fn start_as_separate_project(
             .as_deref()
             .filter(|path| !path.trim().is_empty())
         {
-            Some(storage_root_path) => {
-                core::start_as_separate_project_with_storage_root(&project_path, storage_root_path)
-            }
-            None => core::start_as_separate_project(&project_path),
+            Some(storage_root_path) => core::start_as_separate_project_with_storage_root(
+                &project_path,
+                storage_root_path,
+                core::ApplyOptions { yes: confirmed },
+            ),
+            None => core::start_as_separate_project(
+                &project_path,
+                core::ApplyOptions { yes: confirmed },
+            ),
         }
         .map_err(to_app_error)?;
         project_snapshot_after_start(
@@ -181,7 +202,7 @@ async fn create_checkpoint(
     init_if_needed: Option<bool>,
 ) -> AppResult {
     run_cancellable_blocking(app, state, move |token, progress| {
-        core::create_checkpoint(
+        core::create_checkpoint_profiled(
             &project_path,
             &name,
             core::CreateCheckpointOptions {
@@ -190,7 +211,10 @@ async fn create_checkpoint(
                 cancellation: Some(token),
             },
         )
-        .map(|summary| json!(summary))
+        .map(|result| {
+            core::log_checkpoint_create_metrics(std::path::Path::new(&project_path), &result);
+            json!(result)
+        })
         .map_err(to_app_error)
     })
     .await
@@ -204,6 +228,19 @@ async fn list_checkpoints(
     run_guarded_blocking(state, None, move || {
         core::list_checkpoints(&project_path)
             .map(|items| json!(items))
+            .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn calculate_storage_summary(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+) -> AppResult {
+    run_guarded_blocking(state, None, move || {
+        core::storage_summary(&project_path)
+            .map(|summary| json!(summary))
             .map_err(to_app_error)
     })
     .await
@@ -261,15 +298,32 @@ async fn open_project_in_file_manager(
 }
 
 #[tauri::command]
+async fn open_diagnostic_logs() -> AppResult {
+    let path = core::diagnostic_log_directory().map_err(to_app_error)?;
+    std::fs::create_dir_all(&path)
+        .map_err(|error| AppError::new("io", format!("{}: {error}", path.display())))?;
+    open_folder_in_file_manager(&path)?;
+    Ok(json!({ "path": path }))
+}
+
+#[tauri::command]
 async fn diff_checkpoint(
     state: tauri::State<'_, OperationState>,
     project_path: String,
     checkpoint_id: String,
 ) -> AppResult {
-    run_guarded_blocking(state, None, move || {
-        core::diff_checkpoint(&project_path, &checkpoint_id)
-            .map(|result| json!(result))
-            .map_err(to_app_error)
+    let token = core::CancellationToken::new();
+    run_guarded_blocking(state, Some(token.clone()), move || {
+        core::diff_checkpoint_with_options(
+            &project_path,
+            &checkpoint_id,
+            core::DiffOptions {
+                progress: None,
+                cancellation: Some(token),
+            },
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
     })
     .await
 }
@@ -280,10 +334,15 @@ async fn diff_checkpoint_metadata(
     project_path: String,
     checkpoint_id: String,
 ) -> AppResult {
-    run_guarded_blocking(state, None, move || {
-        core::diff_checkpoint_metadata(&project_path, &checkpoint_id)
-            .map(|result| json!(result))
-            .map_err(to_app_error)
+    let token = core::CancellationToken::new();
+    run_guarded_blocking(state, Some(token.clone()), move || {
+        core::diff_checkpoint_metadata_with_cancellation(
+            &project_path,
+            &checkpoint_id,
+            Some(&token),
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
     })
     .await
 }
@@ -456,26 +515,41 @@ async fn rebuild_index(
 }
 
 #[tauri::command]
-async fn analyze_gc(state: tauri::State<'_, OperationState>, project_path: String) -> AppResult {
-    run_guarded_blocking(state, None, move || {
-        core::analyze_gc(&project_path)
-            .map(|plan| json!(plan))
-            .map_err(to_app_error)
+async fn analyze_gc(
+    app: AppHandle,
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+) -> AppResult {
+    run_cancellable_blocking(app, state, move |token, progress| {
+        core::analyze_gc_with_progress_and_cancellation(
+            &project_path,
+            Some(progress.as_ref()),
+            Some(&token),
+        )
+        .map(|plan| json!(plan))
+        .map_err(to_app_error)
     })
     .await
 }
 
 #[tauri::command]
 async fn apply_gc(
+    app: AppHandle,
     state: tauri::State<'_, OperationState>,
     project_path: String,
+    expected_plan_id: String,
     confirmed: bool,
 ) -> AppResult {
     require_confirmation(confirmed, "storage gc apply requires confirmation.")?;
-    run_guarded_blocking(state, None, move || {
-        core::apply_gc(&project_path)
-            .map(|result| json!(result))
-            .map_err(to_app_error)
+    run_cancellable_blocking(app, state, move |token, progress| {
+        core::apply_gc_with_expected_plan_and_progress_and_cancellation(
+            &project_path,
+            &expected_plan_id,
+            Some(progress.as_ref()),
+            Some(&token),
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
     })
     .await
 }
@@ -507,14 +581,87 @@ async fn recover_transactions(
 }
 
 #[tauri::command]
-async fn cleanup_journals(
+async fn quarantine_transaction(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    transaction_id: String,
+    confirmed: bool,
+) -> AppResult {
+    require_confirmation(confirmed, "transaction quarantine requires confirmation.")?;
+    run_guarded_blocking(state, None, move || {
+        core::quarantine_transaction(
+            &project_path,
+            &transaction_id,
+            core::ApplyOptions { yes: confirmed },
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn analyze_transaction_cleanup(
     state: tauri::State<'_, OperationState>,
     project_path: String,
 ) -> AppResult {
     run_guarded_blocking(state, None, move || {
-        core::cleanup_journals(&project_path)
+        core::analyze_transaction_cleanup(&project_path)
             .map(|result| json!(result))
             .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn cleanup_journals(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    expected_plan: core::TransactionCleanupPlan,
+    confirmed: bool,
+) -> AppResult {
+    require_confirmation(confirmed, "journal cleanup requires confirmation.")?;
+    run_guarded_blocking(state, None, move || {
+        core::cleanup_journals_with_expected_plan(
+            &project_path,
+            &expected_plan,
+            core::ApplyOptions { yes: confirmed },
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn analyze_orphan_temp_files(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+) -> AppResult {
+    run_guarded_blocking(state, None, move || {
+        core::analyze_orphan_temp_files(&project_path)
+            .map(|result| json!(result))
+            .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn cleanup_orphan_temp_files(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    expected_plan_id: String,
+    confirmed: bool,
+) -> AppResult {
+    require_confirmation(confirmed, "temporary file cleanup requires confirmation.")?;
+    run_guarded_blocking(state, None, move || {
+        core::cleanup_orphan_temp_files_with_expected_plan(
+            &project_path,
+            &expected_plan_id,
+            core::ApplyOptions { yes: true },
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
     })
     .await
 }
@@ -568,26 +715,50 @@ async fn check_for_update(
 #[tauri::command]
 async fn install_update(
     app: AppHandle,
+    state: tauri::State<'_, OperationState>,
     pending_update: tauri::State<'_, PendingUpdate>,
 ) -> AppResult {
+    let (_guard, update) = take_pending_update_for_install(&state, &pending_update)?;
+    if let Err(error) = update.download_and_install(|_, _| {}, || {}).await {
+        let mut pending = pending_update
+            .0
+            .lock()
+            .map_err(|_| AppError::new("updateStatePoisoned", "Update state lock is poisoned."))?;
+        if pending.is_none() {
+            *pending = Some(update);
+        }
+        return Err(to_update_error(error));
+    }
+    app.restart();
+}
+
+fn take_pending_update_for_install(
+    state: &OperationState,
+    pending_update: &PendingUpdate,
+) -> Result<(OperationGuard, Update), AppError> {
+    let guard = OperationGuard::begin(state, None)?;
     let update = pending_update
         .0
         .lock()
         .map_err(|_| AppError::new("updateStatePoisoned", "Update state lock is poisoned."))?
         .take()
         .ok_or_else(|| AppError::new("updateNotFound", "No pending update is available."))?;
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(to_update_error)?;
-    app.restart();
+    Ok((guard, update))
 }
 
 pub fn run() {
+    let _diagnostics = match core::init_diagnostics() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("Diagnostic logging is unavailable: {error}");
+            None
+        }
+    };
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OperationState::default())
         .manage(PendingUpdate::default())
+        .on_window_event(handle_window_event)
         .invoke_handler(tauri::generate_handler![
             pick_folder,
             load_project,
@@ -598,9 +769,11 @@ pub fn run() {
             refresh_project,
             create_checkpoint,
             list_checkpoints,
+            calculate_storage_summary,
             delete_checkpoint,
             rename_checkpoint,
             open_project_in_file_manager,
+            open_diagnostic_logs,
             diff_checkpoint,
             diff_checkpoint_metadata,
             diff_checkpoint_full,
@@ -614,7 +787,11 @@ pub fn run() {
             apply_gc,
             list_transactions,
             recover_transactions,
+            quarantine_transaction,
+            analyze_transaction_cleanup,
             cleanup_journals,
+            analyze_orphan_temp_files,
+            cleanup_orphan_temp_files,
             cancel_current_operation,
             check_for_update,
             install_update
@@ -622,6 +799,36 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("failed to run CheckPo Tauri app");
 }
+
+#[cfg(not(test))]
+fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        let state = window.state::<OperationState>();
+        let Ok(current) = state.current.lock() else {
+            api.prevent_close();
+            return;
+        };
+        let Some(close_pending) = operation_close_pending(current.as_ref()) else {
+            return;
+        };
+        let cancellation = current
+            .as_ref()
+            .and_then(|operation| operation.cancellation.clone());
+        let Ok(mut pending_exit) = state.pending_exit.lock() else {
+            api.prevent_close();
+            return;
+        };
+        *pending_exit = Some(window.app_handle().clone());
+        api.prevent_close();
+        if let Some(token) = cancellation.as_ref() {
+            token.cancel();
+        }
+        let _ = window.emit("operation-close-pending", close_pending);
+    }
+}
+
+#[cfg(test)]
+fn handle_window_event(_window: &tauri::Window, _event: &tauri::WindowEvent) {}
 
 fn to_update_error(error: UpdaterError) -> AppError {
     match error {
@@ -667,46 +874,68 @@ fn open_folder_in_file_manager(path: &std::path::Path) -> Result<(), AppError> {
 }
 
 fn project_snapshot(project_path: String) -> AppResult {
-    let context = core::load_project(&project_path).map_err(to_app_error)?;
+    let mut context = core::load_project(&project_path).map_err(to_app_error)?;
+    if context.location_status != core::ProjectLocationStatus::CopiedSuspected {
+        core::recover_checkpoint_deletions(&project_path).map_err(to_app_error)?;
+        context = core::load_project(&project_path).map_err(to_app_error)?;
+    }
     let project = core::project_view(&context).map_err(to_app_error)?;
-    let pending_transactions =
-        core::pending_transactions_for_project(&context).map_err(to_app_error)?;
+    let pending_transactions = core::pending_transactions(&project_path).map_err(to_app_error)?;
+    let unresolved_quarantines =
+        core::unresolved_transaction_quarantines(&project_path).map_err(to_app_error)?;
     let mut warnings = Vec::new();
-    let checkpoints = match core::list_checkpoints_for_project(&context) {
-        Ok(checkpoints) => checkpoints,
-        Err(error)
-            if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                || !pending_transactions.is_empty() =>
-        {
-            warnings.push(format!("チェックポイント一覧を読み込めません: {error}"));
-            Vec::new()
+    let mut checkpoint_index = core::checkpoint_index_status(&context).map_err(to_app_error)?;
+    let checkpoints = if checkpoint_index.state == core::CheckpointIndexState::Current {
+        match core::list_checkpoints_with_warnings_for_project(&context) {
+            Ok(result) => {
+                warnings.extend(result.warnings);
+                result.checkpoints
+            }
+            Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                checkpoint_index = core::CheckpointIndexStatus {
+                    state: core::CheckpointIndexState::Corrupt,
+                    rebuildable: true,
+                    detail: Some(detail),
+                };
+                Vec::new()
+            }
+            Err(error) => return Err(to_app_error(error)),
         }
-        Err(error) => return Err(to_app_error(error)),
+    } else {
+        Vec::new()
     };
-    let storage = match core::storage_summary_from_index(&context) {
-        Ok(storage) => Some(storage),
-        Err(error)
-            if context.location_status == core::ProjectLocationStatus::CopiedSuspected
-                || !pending_transactions.is_empty() =>
-        {
-            let prefix = if pending_transactions.is_empty() {
-                "保存容量の集計を読み込めません"
-            } else {
-                "復旧が完了するまで保存容量の集計を読み込めません"
-            };
-            warnings.push(format!("{prefix}: {error}"));
-            None
+    let storage = if checkpoint_index.state == core::CheckpointIndexState::Current {
+        match core::storage_index_summary_from_index(&context) {
+            Ok(storage) => Some(json!({
+                "checkpointCount": storage.checkpoint_count,
+                "logicalSizeBytes": storage.logical_size_bytes,
+                "storedSizeBytes": Value::Null,
+                "uniqueBlobCount": storage.unique_blob_count,
+            })),
+            Err(core::CheckPoError::IndexUnavailable(detail)) => {
+                checkpoint_index = core::CheckpointIndexStatus {
+                    state: core::CheckpointIndexState::Corrupt,
+                    rebuildable: true,
+                    detail: Some(detail),
+                };
+                None
+            }
+            Err(error) => return Err(to_app_error(error)),
         }
-        Err(error) => return Err(to_app_error(error)),
+    } else {
+        None
     };
-    Ok(json!({
+    let snapshot = json!({
         "project": project,
         "projectPath": project_path,
+        "checkpointIndex": checkpoint_index,
         "checkpoints": checkpoints,
         "storage": storage,
         "pendingTransactions": pending_transactions,
+        "unresolvedQuarantines": unresolved_quarantines,
         "warnings": warnings
-    }))
+    });
+    Ok(snapshot)
 }
 
 fn project_snapshot_after_start(
@@ -717,7 +946,7 @@ fn project_snapshot_after_start(
     progress: ProgressFn,
 ) -> AppResult {
     let initial_checkpoint_result = if create_initial_checkpoint {
-        Some(core::create_checkpoint(
+        Some(core::create_checkpoint_profiled(
             &project_path,
             &initial_checkpoint_name_or_default(initial_checkpoint_name),
             core::CreateCheckpointOptions {
@@ -729,11 +958,12 @@ fn project_snapshot_after_start(
     } else {
         None
     };
-    let mut snapshot = project_snapshot(project_path)?;
+    let mut snapshot = project_snapshot(project_path.clone())?;
     match initial_checkpoint_result {
-        Some(Ok(summary)) => {
+        Some(Ok(result)) => {
+            core::log_checkpoint_create_metrics(std::path::Path::new(&project_path), &result);
             if let Value::Object(map) = &mut snapshot {
-                map.insert("initialCheckpoint".to_string(), json!(summary));
+                map.insert("initialCheckpoint".to_string(), json!(result));
             }
         }
         Some(Err(core::CheckPoError::Cancelled)) => {
@@ -832,11 +1062,34 @@ impl Drop for OperationGuard {
     fn drop(&mut self) {
         if let Ok(mut current) = self.state.current.lock() {
             *current = None;
+            #[cfg(not(test))]
+            {
+                drop(current);
+                self.exit_when_close_is_pending();
+            }
+        }
+    }
+}
+
+impl OperationGuard {
+    #[cfg(not(test))]
+    fn exit_when_close_is_pending(&self) {
+        let pending_exit = self
+            .state
+            .pending_exit
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+        if let Some(app) = pending_exit {
+            app.exit(0);
         }
     }
 }
 
 fn to_app_error(error: core::CheckPoError) -> AppError {
+    if !matches!(&error, core::CheckPoError::Cancelled) {
+        core::log_operation_error("tauri-command", &error.to_string());
+    }
     let kind = match &error {
         core::CheckPoError::User(_) => "user",
         core::CheckPoError::InvalidProject(_) => "invalidProject",
@@ -848,9 +1101,14 @@ fn to_app_error(error: core::CheckPoError) -> AppError {
         core::CheckPoError::ObjectHashMismatch(_) => "objectHashMismatch",
         core::CheckPoError::WorkingTreeChanged(_) => "workingTreeChanged",
         core::CheckPoError::RepositoryLocked(_) => "repositoryLocked",
+        core::CheckPoError::StorageRootConflict { .. } => "storageRootConflict",
+        core::CheckPoError::StorageRootUnavailable(_) => "storageRootUnavailable",
         core::CheckPoError::PendingTransaction(_) => "pendingTransaction",
+        core::CheckPoError::UnresolvedTransactionQuarantine(_) => "unresolvedTransactionQuarantine",
         core::CheckPoError::IndexUnavailable(_) => "indexUnavailable",
+        core::CheckPoError::UnsupportedFormat { .. } => "unsupportedFormat",
         core::CheckPoError::CopiedProjectSuspected(_) => "copiedProjectSuspected",
+        core::CheckPoError::UnsafeFolderMetaOperation(_) => "unsafeFolderMetaOperation",
         core::CheckPoError::Cancelled => "cancelled",
         core::CheckPoError::Io { .. } => "io",
         core::CheckPoError::Json { .. } => "json",
@@ -874,6 +1132,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn close_decision_distinguishes_idle_cancellable_and_non_cancellable_operations() {
+        assert!(operation_close_pending(None).is_none());
+
+        let cancellable = RunningOperation {
+            cancellation: Some(core::CancellationToken::new()),
+        };
+        assert!(
+            operation_close_pending(Some(&cancellable))
+                .unwrap()
+                .cancellation_requested
+        );
+
+        let non_cancellable = RunningOperation { cancellation: None };
+        assert!(
+            !operation_close_pending(Some(&non_cancellable))
+                .unwrap()
+                .cancellation_requested
+        );
+    }
+
+    #[test]
+    fn project_snapshot_includes_existing_checkpoint_history() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "checkpo-tauri-snapshot-{}-{unique}",
+            std::process::id()
+        ));
+        let project = root.join("UnityProject");
+        let data = root.join("CheckPoData");
+        std::fs::create_dir_all(project.join("Assets")).unwrap();
+        std::fs::create_dir_all(project.join("Packages")).unwrap();
+        std::fs::create_dir_all(project.join("ProjectSettings")).unwrap();
+        std::fs::write(
+            project.join("ProjectSettings/ProjectVersion.txt"),
+            "m_EditorVersion: 2022.3.0f1\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("Assets/One.asset"), "one").unwrap();
+        std::env::set_var("CHECKPO_DATA_DIR", &data);
+        core::init_project(&project).unwrap();
+        core::create_checkpoint(&project, "one", Default::default()).unwrap();
+
+        let snapshot = project_snapshot(project.to_string_lossy().to_string()).unwrap();
+
+        assert_eq!(
+            snapshot
+                .get("checkpoints")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/storage/checkpointCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn copied_project_error_is_structured() {
         let error = to_app_error(core::CheckPoError::CopiedProjectSuspected(
             "This Unity project appears to be a copy.".to_string(),
@@ -889,11 +1211,56 @@ mod tests {
         let invalid = to_app_error(core::CheckPoError::InvalidProject(
             "missing marker".to_string(),
         ));
+        let unsupported = to_app_error(core::CheckPoError::UnsupportedFormat {
+            artifact: "snapshot schema".to_string(),
+            found: 2,
+            supported: 1,
+        });
+        let unsafe_folder_meta = to_app_error(core::CheckPoError::UnsafeFolderMetaOperation(
+            "Assets/Folder.meta".to_string(),
+        ));
 
         assert_eq!(cancelled.kind, "cancelled");
         assert_eq!(cancelled.message, "operation cancelled");
         assert_eq!(invalid.kind, "invalidProject");
         assert_eq!(invalid.message, "invalid Unity project: missing marker");
+        assert_eq!(unsupported.kind, "unsupportedFormat");
+        assert!(unsupported.message.contains("snapshot schema"));
+        assert_eq!(unsafe_folder_meta.kind, "unsafeFolderMetaOperation");
+    }
+
+    #[test]
+    fn confirmation_is_required_before_destructive_commands() {
+        let error = require_confirmation(false, "journal cleanup requires confirmation.")
+            .expect_err("missing confirmation must be rejected");
+
+        assert_eq!(error.kind, "confirmationRequired");
+        assert_eq!(error.message, "journal cleanup requires confirmation.");
+        assert!(require_confirmation(true, "ignored").is_ok());
+    }
+
+    #[test]
+    fn update_install_does_not_consume_pending_state_while_an_operation_is_running() {
+        let state = OperationState::default();
+        let pending_update = PendingUpdate::default();
+        let active_operation = OperationGuard::begin(&state, None).unwrap();
+
+        let error = match take_pending_update_for_install(&state, &pending_update) {
+            Err(error) => error,
+            Ok(_) => panic!("a competing update install must be rejected"),
+        };
+
+        assert_eq!(error.kind, "operationBusy");
+        assert!(state.current.lock().unwrap().is_some());
+        assert!(pending_update.0.lock().unwrap().is_none());
+
+        drop(active_operation);
+        let error = match take_pending_update_for_install(&state, &pending_update) {
+            Err(error) => error,
+            Ok(_) => panic!("an idle installer without an update must report updateNotFound"),
+        };
+        assert_eq!(error.kind, "updateNotFound");
+        assert!(state.current.lock().unwrap().is_none());
     }
 
     #[test]
@@ -903,21 +1270,73 @@ mod tests {
         )
         .unwrap();
 
-        assert!(app_js.contains(
-            r#"const diffCommand = options.metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint";"#
-        ));
+        assert!(
+            app_js.contains(r#"metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint","#)
+        );
+        assert!(app_js.contains("return { diff, exact: !metadataOnly };"));
+        assert!(app_js.contains("requestedCheckpointId === latestId"));
+        assert!(app_js.contains("}, context.checkpointId, { exact: true });"));
         assert!(app_js.contains(r#"refreshLatestDiff({ silent: true, metadataOnly: true });"#));
         assert!(!app_js.contains(
             r#"refreshLatestDiff({ refreshProject: true, silent: true, metadataOnly: true });"#
         ));
-        assert_eq!(
+        assert!(
             app_js
                 .matches(r#"refreshLatestDiff({ allowBusy: true, metadataOnly: true });"#)
-                .count(),
-            2
+                .count()
+                >= 2
         );
         assert!(app_js.contains(r#"invokeCommand("diff_checkpoint_full""#));
         assert!(app_js.contains(r#"await refreshLatestDiff({ allowBusy: true });"#));
+        assert!(app_js.contains(r#"cancel: () => tauriInvoke("cancel_current_operation")"#));
+        assert!(app_js.contains("AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS"));
+        assert!(!app_js.contains("while (state.autoRefreshInFlight)"));
+        assert!(
+            !app_js.contains("state.autoRefreshGeneration += 1;\n  state.diffRequestSerial += 1;")
+        );
+        assert!(app_js.contains("resetProjectScopedSettingsResults();"));
+        assert!(app_js.contains("await restoreLastProject();"));
+        assert!(app_js.contains("snapshot.pendingTransactions?.length"));
+    }
+
+    #[test]
+    fn frontend_checkpoint_history_delegates_events_and_patches_renamed_row() {
+        let app_js = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/app.js"),
+        )
+        .unwrap();
+
+        assert!(app_js.contains(
+            r#"$("checkpointList").addEventListener("click", handleCheckpointListClick);"#
+        ));
+        assert!(app_js.contains(
+            r#"$("checkpointList").addEventListener("contextmenu", handleCheckpointListContextMenu);"#
+        ));
+        assert!(app_js.contains(
+            r#"$("checkpointList").addEventListener("keydown", handleCheckpointListKeyDown);"#
+        ));
+        assert!(app_js.contains("checkpointNavigationIndex("));
+        assert!(app_js.contains("aria-activedescendant"));
+        assert!(app_js.contains("checkpointRowCache.delete(checkpointId);"));
+        assert!(app_js.contains("const replacement = checkpointRow(checkpoint);"));
+        assert!(app_js.contains("existing.replaceWith(replacement);"));
+        assert!(app_js.contains("applyCheckpointSearchFilter({ resetScroll: false });"));
+        assert!(!app_js.contains(r#"row.addEventListener("click""#));
+        assert!(!app_js.contains(r#"row.addEventListener("contextmenu""#));
+    }
+
+    #[test]
+    fn frontend_binds_maintenance_apply_to_preview_and_reports_deferred_close() {
+        let frontend_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend");
+        let app_js = std::fs::read_to_string(frontend_root.join("app.js")).unwrap();
+        let index_html = std::fs::read_to_string(frontend_root.join("index.html")).unwrap();
+
+        assert!(app_js.contains("expectedPlanId: state.gcPlan.planId"));
+        assert!(app_js.contains("expectedPlanId: state.tempCleanupPlan.planId"));
+        assert!(app_js.contains(r#"tauriListen("operation-close-pending""#));
+        assert!(app_js.contains("function renderPendingClose(payload)"));
+        assert!(!app_js.contains("処理中は終了できません。"));
+        assert!(index_html.contains(r#"id="busyCloseNotice""#));
     }
 }
 
@@ -939,32 +1358,24 @@ struct ProgressEmitState {
     last_emit_at: Option<Instant>,
     last_phase: Option<String>,
     last_total: usize,
-    last_percent: Option<usize>,
 }
 
 impl ProgressEmitState {
     fn should_emit(&mut self, progress: &core::OperationProgress) -> bool {
         let now = Instant::now();
-        let percent =
-            (progress.total > 0).then(|| progress.completed.saturating_mul(100) / progress.total);
         let phase_changed = self.last_phase.as_deref() != Some(progress.phase.as_str());
         let total_changed = progress.total != self.last_total;
         let completed = progress.phase == "complete"
             || (progress.total > 0 && progress.completed >= progress.total);
-        let percent_advanced = percent
-            .zip(self.last_percent)
-            .is_some_and(|(current, previous)| current > previous);
         let elapsed = self
             .last_emit_at
             .map(|last| now.duration_since(last) >= Duration::from_millis(80))
             .unwrap_or(true);
-        let should_emit =
-            phase_changed || total_changed || completed || percent_advanced || elapsed;
+        let should_emit = phase_changed || total_changed || completed || elapsed;
         if should_emit {
             self.last_emit_at = Some(now);
             self.last_phase = Some(progress.phase.clone());
             self.last_total = progress.total;
-            self.last_percent = percent;
         }
         should_emit
     }

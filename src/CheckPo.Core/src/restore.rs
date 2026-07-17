@@ -19,6 +19,7 @@ pub fn preview_restore_with_progress_and_cancellation(
     cancellation: Option<&CancellationToken>,
 ) -> Result<OperationPlan> {
     let project = load_project(project_path)?;
+    let _lock = crate::acquire_project_repository_shared_lock(&project, "restore-preview")?;
     let snapshot_id = SnapshotId::parse(checkpoint_id)?;
     build_plan_with_progress_and_cancellation(
         &project,
@@ -69,5 +70,12 @@ pub fn apply_restore_plan_with_progress_and_cancellation(
             "restore checkpoint changed after preview".to_string(),
         ));
     }
-    crate::apply_plan(&project, plan, options, progress, cancellation)
+    crate::transaction::apply_restore_plan_and_resolve_quarantines(
+        &project,
+        plan,
+        options,
+        progress,
+        cancellation,
+        &snapshot_id,
+    )
 }
