@@ -140,8 +140,12 @@ pub fn build_plan_with_progress_and_cancellation(
             for (index, path) in selected_paths.iter().enumerate() {
                 crate::ensure_not_cancelled(cancellation)?;
                 let snapshot_file = snapshot_map.get(path);
-                let current =
-                    current_file_state_for_discard(project, path, snapshot_file.is_some())?;
+                let current = current_file_state_for_discard(
+                    project,
+                    path,
+                    snapshot_file.is_some(),
+                    &selected_paths,
+                )?;
                 match snapshot_file {
                     Some(file) => match current {
                         None => operations.push(FileOperation {
@@ -536,10 +540,23 @@ fn current_file_state_for_discard(
     project: &ProjectContext,
     path: &TrackedUnityFilePath,
     exists_in_snapshot: bool,
+    selected_paths: &BTreeSet<TrackedUnityFilePath>,
 ) -> Result<Option<CurrentFileState>> {
     match current_path_kind(project, path)? {
         CurrentPathKind::Missing => Ok(None),
         CurrentPathKind::File => current_file_state(project, path),
+        CurrentPathKind::BlockedByFile(blocker) if selected_paths.contains(&blocker) => Ok(None),
+        CurrentPathKind::Directory
+            if !exists_in_snapshot
+                && selected_paths.iter().any(|candidate| {
+                    candidate
+                        .as_str()
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                }) =>
+        {
+            Ok(None)
+        }
         CurrentPathKind::Directory | CurrentPathKind::BlockedByFile(_) if exists_in_snapshot => {
             Ok(None)
         }

@@ -1034,6 +1034,61 @@ pub(super) fn set_project_file_mtime(
     anchored_project.verify_root_binding()
 }
 
+pub(super) fn set_project_file_mtime_to_target(
+    project: &ProjectContext,
+    operation: &FileOperation,
+) -> Result<()> {
+    let target_modified_at_utc = operation.after_modified_at_utc.as_deref().ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "target operation missing mtime for {}",
+            operation.path
+        ))
+    })?;
+    let expected_hash = required_after_hash(operation)?;
+    let expected_size = operation.after_size_bytes.ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "target operation missing size for {}",
+            operation.path
+        ))
+    })?;
+    let path = operation
+        .path
+        .to_project_path(project.project_root.as_path());
+    let relative = Path::new(operation.path.as_str());
+    let anchored_project = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    let mut file = anchored_project.open_file_read_write(relative)?;
+    let hashed = file.hash()?;
+    if &hashed.object_id != expected_hash || hashed.metadata.len() != expected_size {
+        return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
+    }
+    let current_modified_at_utc = hashed
+        .metadata
+        .modified()
+        .map(crate::canonical_utc)
+        .map_err(|error| crate::io_error(&path, error))?;
+    if current_modified_at_utc != target_modified_at_utc {
+        let time = chrono::DateTime::parse_from_rfc3339(target_modified_at_utc)
+            .map_err(|error| CheckPoError::Corruption(error.to_string()))?
+            .with_timezone(&chrono::Utc);
+        file.set_mtime(time.into())?;
+        file.sync_all()?;
+    }
+    let readback = file.hash()?;
+    let readback_modified_at_utc = readback
+        .metadata
+        .modified()
+        .map(crate::canonical_utc)
+        .map_err(|error| crate::io_error(&path, error))?;
+    if readback.object_id != *expected_hash
+        || readback.metadata.len() != expected_size
+        || readback_modified_at_utc != target_modified_at_utc
+    {
+        return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
+    }
+    anchored_project.verify_binding(relative, &file)?;
+    anchored_project.verify_root_binding()
+}
+
 pub(super) fn recover_project_file_mtime(
     project: &ProjectContext,
     operation: &FileOperation,

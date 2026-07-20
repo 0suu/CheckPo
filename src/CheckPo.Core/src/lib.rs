@@ -58,10 +58,12 @@ pub use models::{
     SnapshotFile, StorageGcPlan, StorageGcResult, StorageIndexSummary, StorageSummary,
     TempFileCleanupPlan, TempFileCleanupResult, TransactionCleanupCandidate,
     TransactionCleanupPlan, TransactionCleanupResult, TransactionQuarantineResult,
-    TransactionRecoveryFailure, TransactionRecoveryResult, UnreferencedBlob,
-    UnreferencedInventoryNode, UnreferencedManifestChunk, UnresolvedTransactionQuarantine,
-    VerificationResult, OPERATION_PLAN_SCHEMA_VERSION, STORAGE_GC_PLAN_SCHEMA_VERSION,
-    TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION, TRANSACTION_CLEANUP_PLAN_SCHEMA_VERSION,
+    TransactionRecoveryConflict, TransactionRecoveryConflictPlan,
+    TransactionRecoveryConflictResult, TransactionRecoveryFailure, TransactionRecoveryResult,
+    UnreferencedBlob, UnreferencedInventoryNode, UnreferencedManifestChunk,
+    UnresolvedTransactionQuarantine, VerificationResult, OPERATION_PLAN_SCHEMA_VERSION,
+    STORAGE_GC_PLAN_SCHEMA_VERSION, TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION,
+    TRANSACTION_CLEANUP_PLAN_SCHEMA_VERSION, TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION,
 };
 pub use path::{
     hash_bytes, parse_tracked_paths, ObjectId, ProjectId, ProjectRoot, SnapshotId, StorageRoot,
@@ -82,10 +84,10 @@ pub use storage::{
 };
 pub use storage_root_setting::set_project_storage_root;
 pub use transaction::{
-    analyze_transaction_cleanup, apply_plan, cleanup_journals_with_expected_plan,
-    pending_transactions, pending_transactions_for_project, quarantine_transaction,
-    recover_transactions, unresolved_transaction_quarantines,
-    unresolved_transaction_quarantines_for_project,
+    analyze_transaction_cleanup, analyze_transaction_recovery_conflicts, apply_plan,
+    cleanup_journals_with_expected_plan, pending_transactions, pending_transactions_for_project,
+    quarantine_transaction, recover_transaction_with_conflict_export, recover_transactions,
+    unresolved_transaction_quarantines, unresolved_transaction_quarantines_for_project,
 };
 pub use verify::{
     verify_checkpoint, verify_checkpoint_with_progress_and_cancellation, verify_project,

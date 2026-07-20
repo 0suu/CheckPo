@@ -2,6 +2,60 @@ use super::*;
 
 const QUARANTINE_RECORD_SCHEMA_VERSION_V1: u32 = 1;
 const MAX_QUARANTINE_RECORD_BYTES: u64 = 1024 * 1024;
+const RECOVERY_RESCUE_RECORD_SCHEMA_VERSION: u32 = 1;
+const RECOVERY_EXPORT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MAX_RECOVERY_RESCUE_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+const RECOVERY_EXPORT_MANIFEST_FILE: &str = "CheckPo-Recovery.json";
+const RECOVERY_EXPORT_COMPLETE_FILE: &str = "保存が完了しました.txt";
+const TARGET_RECONCILE_MAX_ROUNDS: usize = 5;
+const TARGET_RECONCILE_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(15);
+const TARGET_VERIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum RecoveryRescueState {
+    Prepared,
+    Resolving,
+    Recovered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoveryRescueEntry {
+    conflict: TransactionRecoveryConflict,
+    exported: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoveryRescueRecord {
+    schema_version: u32,
+    transaction_id: String,
+    checkpoint_id: SnapshotId,
+    plan_id: String,
+    created_at_utc: String,
+    state: RecoveryRescueState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    export_directory: Option<PathBuf>,
+    entries: Vec<RecoveryRescueEntry>,
+    completed_paths: Vec<TrackedUnityFilePath>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryExportManifest<'a> {
+    schema_version: u32,
+    transaction_id: &'a str,
+    created_at_utc: String,
+    files: Vec<&'a TransactionRecoveryConflict>,
+}
+
+struct RecoveryExportStage {
+    export_root: PathBuf,
+    staging_name: std::ffi::OsString,
+    final_name: std::ffi::OsString,
+    staging_directory: PathBuf,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,7 +210,7 @@ pub fn recover_transactions(project_path: impl AsRef<Path>) -> Result<Transactio
         failed_transactions: Vec::new(),
     };
     for pending in pending_transactions_for_project(&project)? {
-        match recover_one(&project, &pending) {
+        match recover_one_with_active_rescue(&project, &pending) {
             Ok(()) => {
                 result.recovered_transaction_count += 1;
                 result
@@ -165,15 +219,907 @@ pub fn recover_transactions(project_path: impl AsRef<Path>) -> Result<Transactio
             }
             Err(error) => {
                 crate::log_operation_error("transaction-recovery", &error.to_string());
+                let failed_journal = read_transaction_journal(&pending.journal_path).ok();
+                let awaiting_unity = failed_journal
+                    .as_ref()
+                    .is_some_and(|journal| journal.state == JournalState::AwaitingUnity);
+                let recovery_conflict_count = if failed_journal
+                    .as_ref()
+                    .is_some_and(|journal| journal.intent == TransactionIntent::CompleteToTarget)
+                {
+                    0
+                } else {
+                    analyze_transaction_recovery_conflicts_locked(&project, &pending.transaction_id)
+                        .map(|plan| plan.conflicts.len())
+                        .unwrap_or(0)
+                };
                 result.failed_transaction_count += 1;
                 result.failed_transactions.push(TransactionRecoveryFailure {
                     transaction_id: pending.transaction_id,
                     error: error.to_string(),
+                    recovery_conflict_count,
+                    awaiting_unity,
                 });
             }
         }
     }
     Ok(result)
+}
+
+pub(super) fn resume_complete_to_target_after_apply_error(
+    project: &ProjectContext,
+    checkpoint_id: &SnapshotId,
+    kind: OperationPlanKind,
+) -> Result<Option<(String, PathBuf)>> {
+    let matching = pending_transactions_for_project(project)?
+        .into_iter()
+        .find_map(|pending| {
+            let journal = read_transaction_journal(&pending.journal_path).ok()?;
+            (journal.intent == TransactionIntent::CompleteToTarget
+                && &journal.checkpoint_id == checkpoint_id
+                && journal.kind == kind)
+                .then_some((pending.transaction_id, pending.journal_path))
+        });
+    let Some((transaction_id, journal_path)) = matching else {
+        return Ok(None);
+    };
+    let recovered = recover_transactions(project.project_root.as_path())?;
+    if recovered
+        .recovered_transaction_ids
+        .iter()
+        .any(|candidate| candidate == &transaction_id)
+    {
+        return Ok(Some((transaction_id, journal_path)));
+    }
+    let detail = recovered
+        .failed_transactions
+        .iter()
+        .find(|failure| failure.transaction_id == transaction_id)
+        .map(|failure| failure.error.as_str())
+        .unwrap_or("the target-authoritative transaction is still pending");
+    Err(CheckPoError::WorkingTreeChanged(format!(
+        "Unity is still updating the project. Close Unity and continue recovery: {detail}"
+    )))
+}
+
+pub fn analyze_transaction_recovery_conflicts(
+    project_path: impl AsRef<Path>,
+    transaction_id: &str,
+) -> Result<TransactionRecoveryConflictPlan> {
+    validate_transaction_id(transaction_id)?;
+    let project = crate::load_project(project_path)?;
+    let _lock = crate::acquire_project_repository_shared_lock(
+        &project,
+        "transaction-recovery-conflict-analyze",
+    )?;
+    analyze_transaction_recovery_conflicts_locked(&project, transaction_id)
+}
+
+pub fn recover_transaction_with_conflict_export(
+    project_path: impl AsRef<Path>,
+    transaction_id: &str,
+    expected_plan_id: &str,
+    selected_paths: &[TrackedUnityFilePath],
+    export_root: &Path,
+    options: ApplyOptions,
+) -> Result<TransactionRecoveryConflictResult> {
+    if !options.yes {
+        return Err(crate::user_error(
+            "transaction conflict recovery requires --yes.",
+        ));
+    }
+    validate_transaction_id(transaction_id)?;
+    validate_recovery_conflict_plan_id(expected_plan_id)?;
+    let project = crate::load_project(project_path)?;
+    crate::ensure_project_location_allows_mutation(&project)?;
+    let _lock =
+        crate::acquire_project_repository_lock(&project, "transaction-recovery-conflict-apply")?;
+    let plan = analyze_transaction_recovery_conflicts_locked(&project, transaction_id)?;
+    if plan.plan_id != expected_plan_id {
+        return Err(CheckPoError::WorkingTreeChanged(
+            "recovery conflict files changed after preview".to_string(),
+        ));
+    }
+    if plan.conflicts.is_empty() {
+        return Err(crate::user_error(
+            "the transaction no longer has file conflicts; run normal recovery again.",
+        ));
+    }
+
+    let conflict_paths = plan
+        .conflicts
+        .iter()
+        .map(|conflict| conflict.path.clone())
+        .collect::<BTreeSet<_>>();
+    let selected = selected_paths.iter().cloned().collect::<BTreeSet<_>>();
+    if selected.len() != selected_paths.len() || !selected.is_subset(&conflict_paths) {
+        return Err(crate::user_error(
+            "selected recovery files are not part of the analyzed conflict plan.",
+        ));
+    }
+
+    let export_directory = if selected.is_empty() {
+        None
+    } else {
+        let export_stage = create_recovery_export_stage(&project, export_root, transaction_id)?;
+        for conflict in plan
+            .conflicts
+            .iter()
+            .filter(|conflict| selected.contains(&conflict.path))
+        {
+            copy_recovery_conflict_to_export(&project, conflict, &export_stage.staging_directory)?;
+        }
+        Some(complete_recovery_export(
+            export_stage,
+            transaction_id,
+            plan.conflicts
+                .iter()
+                .filter(|conflict| selected.contains(&conflict.path)),
+        )?)
+    };
+
+    let pending = pending_transaction_by_id(&project, transaction_id)?;
+    let journal = read_valid_recovery_journal(&project, &pending)?;
+    prepare_recovery_conflict_rescue(
+        &project,
+        &journal,
+        &plan,
+        &selected,
+        export_directory.as_deref(),
+    )?;
+    recover_one_with_active_rescue(&project, &pending)?;
+    Ok(TransactionRecoveryConflictResult {
+        transaction_id: transaction_id.to_string(),
+        recovered: true,
+        export_directory,
+        exported_paths: selected.into_iter().collect(),
+        restored_without_export_count: plan.conflicts.len().saturating_sub(selected_paths.len()),
+    })
+}
+
+fn analyze_transaction_recovery_conflicts_locked(
+    project: &ProjectContext,
+    transaction_id: &str,
+) -> Result<TransactionRecoveryConflictPlan> {
+    let pending = pending_transaction_by_id(project, transaction_id)?;
+    let journal = read_valid_recovery_journal(project, &pending)?;
+    let before_paths = journal_before_paths(&journal.operations);
+    let mut conflicts = Vec::new();
+    for operation in &journal.operations {
+        let Some(current) =
+            current_file_state_for_recovery(project, &operation.path, &before_paths)?
+        else {
+            if operation.operation_type == FileOperationType::SetMetadata {
+                return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
+            }
+            continue;
+        };
+        let matches_before = operation.before_hash.as_ref() == Some(&current.hash)
+            && operation.before_size_bytes == Some(current.size_bytes);
+        let matches_after = operation.after_hash.as_ref() == Some(&current.hash)
+            && operation.after_size_bytes == Some(current.size_bytes);
+        let metadata_only = operation.operation_type == FileOperationType::SetMetadata
+            && matches_before
+            && operation.before_modified_at_utc.as_deref()
+                != Some(current.modified_at_utc.as_str())
+            && operation.after_modified_at_utc.as_deref() != Some(current.modified_at_utc.as_str());
+        let content_conflict = match operation.operation_type {
+            FileOperationType::Restore => !matches_after,
+            FileOperationType::Replace => !matches_before && !matches_after,
+            FileOperationType::Delete => !matches_before,
+            FileOperationType::SetMetadata => {
+                if !matches_before {
+                    return Err(CheckPoError::WorkingTreeChanged(format!(
+                        "{} changed content during a metadata-only operation",
+                        operation.path
+                    )));
+                }
+                false
+            }
+        };
+        if content_conflict || metadata_only {
+            conflicts.push(TransactionRecoveryConflict {
+                path: operation.path.clone(),
+                current_hash: current.hash,
+                size_bytes: current.size_bytes,
+                modified_at_utc: current.modified_at_utc,
+                metadata_only,
+            });
+        }
+    }
+    conflicts.sort_by(|left, right| left.path.cmp(&right.path));
+    let journal_bytes = serde_json::to_vec(&journal)
+        .map_err(|error| CheckPoError::Corruption(error.to_string()))?;
+    let journal_digest = blake3::hash(&journal_bytes).to_hex().to_string();
+    let plan_id = recovery_conflict_plan_id(
+        &project.project_id,
+        &journal.transaction_id,
+        &journal.checkpoint_id,
+        &journal_digest,
+        &conflicts,
+    )?;
+    Ok(TransactionRecoveryConflictPlan {
+        schema_version: crate::TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION,
+        plan_id,
+        transaction_id: journal.transaction_id,
+        checkpoint_id: journal.checkpoint_id,
+        conflicts,
+    })
+}
+
+fn pending_transaction_by_id(
+    project: &ProjectContext,
+    transaction_id: &str,
+) -> Result<PendingTransaction> {
+    pending_transactions_for_project(project)?
+        .into_iter()
+        .find(|pending| pending.transaction_id == transaction_id)
+        .ok_or_else(|| crate::user_error("the interrupted transaction is no longer pending."))
+}
+
+fn read_valid_recovery_journal(
+    project: &ProjectContext,
+    pending: &PendingTransaction,
+) -> Result<TransactionJournal> {
+    let tx_root = pending
+        .journal_path
+        .parent()
+        .ok_or_else(|| CheckPoError::Corruption("invalid journal path".into()))?;
+    ensure_regular_transaction_directory(tx_root)?;
+    let metadata = fs::symlink_metadata(&pending.journal_path)
+        .map_err(|error| crate::io_error(&pending.journal_path, error))?;
+    if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(CheckPoError::Corruption(
+            "transaction journal is not a regular file".to_string(),
+        ));
+    }
+    let journal = read_transaction_journal(&pending.journal_path)?;
+    validate_transaction_journal_identity(tx_root, &journal)?;
+    if journal.operations.is_empty() {
+        return Err(CheckPoError::Corruption(
+            "transaction journal contains no operations".to_string(),
+        ));
+    }
+    validate_journal_operations(project, &journal.checkpoint_id, &journal.operations)?;
+    validate_journal_directory_topology(
+        &journal.operations,
+        &journal.directories_to_remove,
+        &journal.directories_to_create,
+    )?;
+    match (journal.kind, journal.selected_paths.as_deref()) {
+        (OperationPlanKind::Restore, None) => {}
+        (OperationPlanKind::Discard, Some(selected)) if !selected.is_empty() => {
+            let selected = selected.iter().collect::<BTreeSet<_>>();
+            if journal
+                .operations
+                .iter()
+                .any(|operation| !selected.contains(&operation.path))
+            {
+                return Err(CheckPoError::Corruption(
+                    "discard journal operations exceed the selected target scope".to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(CheckPoError::Corruption(
+                "transaction target scope does not match its operation kind".to_string(),
+            ))
+        }
+    }
+    let backup_root = tx_root.join("backup");
+    validate_transaction_payload(
+        &backup_root,
+        journal
+            .operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.operation_type,
+                    FileOperationType::Delete | FileOperationType::Replace
+                )
+            })
+            .map(|operation| operation.path.clone())
+            .collect(),
+    )?;
+    let staged_root = tx_root.join("staged");
+    validate_transaction_payload(
+        &staged_root,
+        journal
+            .operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.operation_type,
+                    FileOperationType::Restore | FileOperationType::Replace
+                )
+            })
+            .map(|operation| operation.path.clone())
+            .collect(),
+    )?;
+    Ok(journal)
+}
+
+fn validate_transaction_id(transaction_id: &str) -> Result<()> {
+    if transaction_id.len() == 32
+        && transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(crate::user_error("invalid transaction id."))
+    }
+}
+
+fn validate_recovery_conflict_plan_id(plan_id: &str) -> Result<()> {
+    if plan_id.len() == 64
+        && plan_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(crate::user_error("invalid recovery conflict plan id."))
+    }
+}
+
+fn recovery_conflict_plan_id(
+    project_id: &crate::ProjectId,
+    transaction_id: &str,
+    checkpoint_id: &SnapshotId,
+    journal_digest: &str,
+    conflicts: &[TransactionRecoveryConflict],
+) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"checkpo.transaction-recovery-conflict-plan.v1\0");
+    hash_recovery_plan_field(&mut hasher, project_id.as_str().as_bytes())?;
+    hash_recovery_plan_field(&mut hasher, transaction_id.as_bytes())?;
+    hash_recovery_plan_field(&mut hasher, checkpoint_id.as_str().as_bytes())?;
+    hash_recovery_plan_field(&mut hasher, journal_digest.as_bytes())?;
+    for conflict in conflicts {
+        hash_recovery_plan_field(&mut hasher, conflict.path.as_str().as_bytes())?;
+        hash_recovery_plan_field(&mut hasher, conflict.current_hash.as_str().as_bytes())?;
+        hasher.update(&conflict.size_bytes.to_be_bytes());
+        hash_recovery_plan_field(&mut hasher, conflict.modified_at_utc.as_bytes())?;
+        hasher.update(&[u8::from(conflict.metadata_only)]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn hash_recovery_plan_field(hasher: &mut blake3::Hasher, value: &[u8]) -> Result<()> {
+    let length = u64::try_from(value.len())
+        .map_err(|_| CheckPoError::Corruption("recovery plan field is too large".into()))?;
+    hasher.update(&length.to_be_bytes());
+    hasher.update(value);
+    Ok(())
+}
+
+fn create_recovery_export_stage(
+    project: &ProjectContext,
+    export_root: &Path,
+    transaction_id: &str,
+) -> Result<RecoveryExportStage> {
+    if !export_root.is_absolute() {
+        return Err(crate::user_error(
+            "recovery save location must be an absolute path.",
+        ));
+    }
+    let export_root = export_root
+        .canonicalize()
+        .map_err(|error| crate::io_error(export_root, error))?;
+    let project_root = project
+        .project_root
+        .as_path()
+        .canonicalize()
+        .map_err(|error| crate::io_error(project.project_root.as_path(), error))?;
+    let repo_root = project
+        .repo_root
+        .canonicalize()
+        .map_err(|error| crate::io_error(&project.repo_root, error))?;
+    if export_root.starts_with(&project_root) || export_root.starts_with(&repo_root) {
+        return Err(crate::user_error(
+            "recovery files must be saved outside the Unity project and CheckPo storage.",
+        ));
+    }
+    let root = crate::storage::AnchoredRoot::open(&export_root)?;
+    for _ in 0..16 {
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let final_name = std::ffi::OsString::from(format!(
+            "CheckPo-Recovery-{}-{}",
+            &transaction_id[..8],
+            suffix
+        ));
+        let staging_name = std::ffi::OsString::from(format!(
+            ".CheckPo-Recovery-{}-{}-incomplete",
+            &transaction_id[..8],
+            suffix
+        ));
+        let relative = Path::new(&staging_name);
+        let (parent, leaf) = root.open_parent_for_mutation(relative, false)?;
+        match parent.create_directory(&leaf) {
+            Ok(_) => {
+                parent.sync_all()?;
+                root.verify_root_binding()?;
+                return Ok(RecoveryExportStage {
+                    staging_directory: export_root.join(&staging_name),
+                    export_root,
+                    staging_name,
+                    final_name,
+                });
+            }
+            Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(CheckPoError::Unexpected(
+        "could not create a unique recovery export directory".to_string(),
+    ))
+}
+
+fn complete_recovery_export<'a>(
+    stage: RecoveryExportStage,
+    transaction_id: &str,
+    conflicts: impl Iterator<Item = &'a TransactionRecoveryConflict>,
+) -> Result<PathBuf> {
+    let files = conflicts.collect::<Vec<_>>();
+    let staging_root = crate::storage::AnchoredRoot::open(&stage.staging_directory)?;
+    staging_root.write_json_atomic_new(
+        Path::new(RECOVERY_EXPORT_MANIFEST_FILE),
+        &RecoveryExportManifest {
+            schema_version: RECOVERY_EXPORT_MANIFEST_SCHEMA_VERSION,
+            transaction_id,
+            created_at_utc: crate::now_utc_string(),
+            files,
+        },
+    )?;
+    staging_root.write_bytes_atomic_new(
+        Path::new(RECOVERY_EXPORT_COMPLETE_FILE),
+        "このフォルダーの保存は完了しています。\r\n".as_bytes(),
+    )?;
+    staging_root.verify_root_binding()?;
+
+    let export_root = crate::storage::AnchoredRoot::open(&stage.export_root)?;
+    let (parent, staging_leaf) =
+        export_root.open_parent_for_mutation(Path::new(&stage.staging_name), false)?;
+    let staging_directory = parent.open_directory(&staging_leaf)?;
+    parent.rename_directory_no_replace_to_owned(
+        &staging_leaf,
+        staging_directory,
+        &parent,
+        &stage.final_name,
+    )?;
+    parent.sync_all()?;
+    export_root.verify_root_binding()?;
+    Ok(stage.export_root.join(stage.final_name))
+}
+
+fn copy_recovery_conflict_to_export(
+    project: &ProjectContext,
+    conflict: &TransactionRecoveryConflict,
+    export_directory: &Path,
+) -> Result<()> {
+    let source_root = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
+    let relative = Path::new(conflict.path.as_str());
+    let (source_parent, source_leaf) = source_root.open_parent(relative, false)?;
+    let mut source = source_parent.open_file(&source_leaf)?;
+    let source_hash = source.hash()?;
+    let source_modified_at_utc = source_hash
+        .metadata
+        .modified()
+        .map(crate::canonical_utc)
+        .map_err(|error| crate::io_error(conflict.path.to_string(), error))?;
+    if source_hash.object_id != conflict.current_hash
+        || source_hash.metadata.len() != conflict.size_bytes
+        || source_modified_at_utc != conflict.modified_at_utc
+    {
+        return Err(CheckPoError::WorkingTreeChanged(conflict.path.to_string()));
+    }
+
+    let export_root = crate::storage::AnchoredRoot::open(export_directory)?;
+    let (destination_parent, destination_leaf) =
+        export_root.open_parent_for_mutation(relative, true)?;
+    let (temporary_leaf, mut output) =
+        destination_parent.create_unique_temporary_file("recovery-export")?;
+    let copy_result = (|| -> Result<()> {
+        let copied = source.copy_and_hash_to(&mut output, &export_directory.join(relative))?;
+        if copied.object_id != conflict.current_hash || copied.metadata.len() != conflict.size_bytes
+        {
+            return Err(CheckPoError::ObjectHashMismatch(format!(
+                "recovery export mismatch for {}",
+                conflict.path
+            )));
+        }
+        let modified = chrono::DateTime::parse_from_rfc3339(&conflict.modified_at_utc)
+            .map_err(|error| CheckPoError::Corruption(error.to_string()))?
+            .with_timezone(&chrono::Utc);
+        output.set_mtime(modified.into())?;
+        output.sync_all()?;
+        let readback = output.hash()?;
+        if readback.object_id != conflict.current_hash
+            || readback.metadata.len() != conflict.size_bytes
+        {
+            return Err(CheckPoError::ObjectHashMismatch(format!(
+                "recovery export readback mismatch for {}",
+                conflict.path
+            )));
+        }
+        source_parent.verify_file_binding(&source_leaf, &source)?;
+        destination_parent.verify_file_binding(&temporary_leaf, &output)?;
+        destination_parent.rename_no_replace_to(
+            &temporary_leaf,
+            &output,
+            &destination_parent,
+            &destination_leaf,
+        )?;
+        destination_parent.verify_file_binding(&destination_leaf, &output)?;
+        destination_parent.sync_all()?;
+        source_root.verify_root_binding()?;
+        export_root.verify_root_binding()
+    })();
+    if let Err(error) = copy_result {
+        let cleanup_leaf = if destination_parent
+            .verify_file_binding(&destination_leaf, &output)
+            .is_ok()
+        {
+            destination_leaf.as_os_str()
+        } else {
+            temporary_leaf.as_os_str()
+        };
+        let _ = destination_parent.unlink_file_if_bound(cleanup_leaf, output);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn prepare_recovery_conflict_rescue(
+    project: &ProjectContext,
+    journal: &TransactionJournal,
+    plan: &TransactionRecoveryConflictPlan,
+    selected: &BTreeSet<TrackedUnityFilePath>,
+    export_directory: Option<&Path>,
+) -> Result<()> {
+    if journal.transaction_id != plan.transaction_id || journal.checkpoint_id != plan.checkpoint_id
+    {
+        return Err(CheckPoError::WorkingTreeChanged(
+            "recovery transaction changed while preparing rescue data".to_string(),
+        ));
+    }
+    let rescue_files_root = project
+        .repo_root
+        .join(recovery_rescue_plan_relative(plan))
+        .join("files");
+    let before_paths = journal_before_paths(&journal.operations);
+    for conflict in &plan.conflicts {
+        verify_recovery_conflict_is_current(project, conflict, &before_paths)?;
+        if !conflict.metadata_only {
+            let source = conflict
+                .path
+                .to_project_path(project.project_root.as_path());
+            preserve_after_file_for_recovery(
+                project,
+                &source,
+                &conflict.current_hash,
+                &rescue_files_root,
+            )?;
+        }
+    }
+    // Publish the durable path-to-copy mapping only after every private copy
+    // and any user-visible export have been fully verified.
+    for conflict in &plan.conflicts {
+        verify_recovery_conflict_is_current(project, conflict, &before_paths)?;
+    }
+    write_recovery_rescue_record(
+        project,
+        &RecoveryRescueRecord {
+            schema_version: RECOVERY_RESCUE_RECORD_SCHEMA_VERSION,
+            transaction_id: plan.transaction_id.clone(),
+            checkpoint_id: plan.checkpoint_id.clone(),
+            plan_id: plan.plan_id.clone(),
+            created_at_utc: crate::now_utc_string(),
+            state: RecoveryRescueState::Prepared,
+            export_directory: export_directory.map(Path::to_path_buf),
+            entries: plan
+                .conflicts
+                .iter()
+                .cloned()
+                .map(|conflict| RecoveryRescueEntry {
+                    exported: selected.contains(&conflict.path),
+                    conflict,
+                })
+                .collect(),
+            completed_paths: Vec::new(),
+        },
+    )
+}
+
+#[cfg(test)]
+pub(super) fn prepare_recovery_conflict_rescue_for_test(
+    project: &ProjectContext,
+    plan: &TransactionRecoveryConflictPlan,
+) -> Result<()> {
+    let pending = pending_transaction_by_id(project, &plan.transaction_id)?;
+    let journal = read_valid_recovery_journal(project, &pending)?;
+    prepare_recovery_conflict_rescue(project, &journal, plan, &BTreeSet::new(), None)
+}
+
+#[cfg(test)]
+pub(super) fn prepare_recovery_conflict_rescue_and_remove_first_for_test(
+    project: &ProjectContext,
+    plan: &TransactionRecoveryConflictPlan,
+) -> Result<()> {
+    prepare_recovery_conflict_rescue_for_test(project, plan)?;
+    let conflict = plan
+        .conflicts
+        .iter()
+        .find(|conflict| !conflict.metadata_only)
+        .ok_or_else(|| CheckPoError::Unexpected("test plan has no content conflict".to_string()))?;
+    let source = conflict
+        .path
+        .to_project_path(project.project_root.as_path());
+    remove_anchored_project_file(project, &source, &conflict.current_hash)
+}
+
+fn verify_recovery_conflict_is_current(
+    project: &ProjectContext,
+    conflict: &TransactionRecoveryConflict,
+    before_paths: &BTreeSet<TrackedUnityFilePath>,
+) -> Result<()> {
+    let current = current_file_state_for_recovery(project, &conflict.path, before_paths)?
+        .ok_or_else(|| CheckPoError::WorkingTreeChanged(conflict.path.to_string()))?;
+    if current.hash != conflict.current_hash
+        || current.size_bytes != conflict.size_bytes
+        || current.modified_at_utc != conflict.modified_at_utc
+    {
+        return Err(CheckPoError::WorkingTreeChanged(conflict.path.to_string()));
+    }
+    Ok(())
+}
+
+fn recovery_rescue_plan_relative(plan: &TransactionRecoveryConflictPlan) -> PathBuf {
+    Path::new("recovery-rescues")
+        .join(&plan.transaction_id)
+        .join("records")
+        .join(&plan.plan_id)
+}
+
+fn recovery_rescue_record_relative(record: &RecoveryRescueRecord) -> PathBuf {
+    Path::new("recovery-rescues")
+        .join(&record.transaction_id)
+        .join("records")
+        .join(format!("{}.json", record.plan_id))
+}
+
+fn recovery_rescue_files_relative(record: &RecoveryRescueRecord) -> PathBuf {
+    Path::new("recovery-rescues")
+        .join(&record.transaction_id)
+        .join("records")
+        .join(&record.plan_id)
+        .join("files")
+}
+
+fn recovery_rescue_active_relative(transaction_id: &str) -> PathBuf {
+    Path::new("recovery-rescues")
+        .join(transaction_id)
+        .join("active.json")
+}
+
+fn write_recovery_rescue_record(
+    project: &ProjectContext,
+    record: &RecoveryRescueRecord,
+) -> Result<()> {
+    validate_transaction_id(&record.transaction_id)?;
+    validate_recovery_conflict_plan_id(&record.plan_id)?;
+    let repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
+    repo.write_json_atomic(&recovery_rescue_record_relative(record), record)?;
+    repo.write_json_atomic(
+        &recovery_rescue_active_relative(&record.transaction_id),
+        record,
+    )
+}
+
+fn read_active_recovery_rescue_record(
+    project: &ProjectContext,
+    transaction_id: &str,
+) -> Result<Option<RecoveryRescueRecord>> {
+    let path = project
+        .repo_root
+        .join(recovery_rescue_active_relative(transaction_id));
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(crate::io_error(&path, error)),
+        Ok(metadata) if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
+            return Err(CheckPoError::Corruption(format!(
+                "recovery rescue record is not a regular file: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+    }
+    let bytes = crate::storage::AnchoredRoot::open(&project.repo_root)?
+        .read_bytes_bounded_path(&path, MAX_RECOVERY_RESCUE_RECORD_BYTES)?;
+    let record: RecoveryRescueRecord =
+        serde_json::from_slice(&bytes).map_err(|error| crate::json_error(&path, error))?;
+    validate_recovery_rescue_record(&record, transaction_id)?;
+    Ok(Some(record))
+}
+
+fn validate_recovery_rescue_record(
+    record: &RecoveryRescueRecord,
+    transaction_id: &str,
+) -> Result<()> {
+    if record.schema_version != RECOVERY_RESCUE_RECORD_SCHEMA_VERSION {
+        return Err(CheckPoError::Corruption(format!(
+            "unsupported recovery rescue schema version: {}",
+            record.schema_version
+        )));
+    }
+    validate_transaction_id(&record.transaction_id)?;
+    validate_recovery_conflict_plan_id(&record.plan_id)?;
+    if record.transaction_id != transaction_id || record.entries.is_empty() {
+        return Err(CheckPoError::Corruption(
+            "recovery rescue record identity is invalid".to_string(),
+        ));
+    }
+    let entry_paths = record
+        .entries
+        .iter()
+        .map(|entry| entry.conflict.path.clone())
+        .collect::<BTreeSet<_>>();
+    if entry_paths.len() != record.entries.len()
+        || record
+            .completed_paths
+            .iter()
+            .any(|path| !entry_paths.contains(path))
+        || record.completed_paths.iter().collect::<BTreeSet<_>>().len()
+            != record.completed_paths.len()
+    {
+        return Err(CheckPoError::Corruption(
+            "recovery rescue record contains invalid paths".to_string(),
+        ));
+    }
+    if record
+        .export_directory
+        .as_deref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(CheckPoError::Corruption(
+            "recovery rescue export path is not absolute".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_one_with_active_rescue(
+    project: &ProjectContext,
+    pending: &PendingTransaction,
+) -> Result<()> {
+    if pending.state != JOURNAL_STATE_UNREADABLE {
+        if let Ok(journal) = read_transaction_journal(&pending.journal_path) {
+            if journal.intent == TransactionIntent::CompleteToTarget {
+                return recover_one(project, pending);
+            }
+        }
+    }
+    let Some(mut rescue) = read_active_recovery_rescue_record(project, &pending.transaction_id)?
+    else {
+        return recover_one(project, pending);
+    };
+    if rescue.state == RecoveryRescueState::Recovered {
+        return recover_one(project, pending);
+    }
+    let journal = read_valid_recovery_journal(project, pending)?;
+    resolve_recovery_conflict_rescue(project, &journal, &mut rescue)?;
+    recover_one(project, pending)?;
+    rescue.state = RecoveryRescueState::Recovered;
+    write_recovery_rescue_record(project, &rescue)
+}
+
+fn resolve_recovery_conflict_rescue(
+    project: &ProjectContext,
+    journal: &TransactionJournal,
+    rescue: &mut RecoveryRescueRecord,
+) -> Result<()> {
+    if rescue.transaction_id != journal.transaction_id
+        || rescue.checkpoint_id != journal.checkpoint_id
+    {
+        return Err(CheckPoError::Corruption(
+            "recovery rescue record does not match its transaction journal".to_string(),
+        ));
+    }
+    verify_recovery_rescue_payload(project, rescue)?;
+    rescue.state = RecoveryRescueState::Resolving;
+    write_recovery_rescue_record(project, rescue)?;
+    let before_paths = journal_before_paths(&journal.operations);
+    for entry in rescue.entries.clone() {
+        if rescue.completed_paths.contains(&entry.conflict.path) {
+            continue;
+        }
+        let operation = journal
+            .operations
+            .iter()
+            .find(|operation| operation.path == entry.conflict.path)
+            .ok_or_else(|| {
+                CheckPoError::Corruption(format!(
+                    "recovery conflict operation is missing for {}",
+                    entry.conflict.path
+                ))
+            })?;
+        let current =
+            current_file_state_for_recovery(project, &entry.conflict.path, &before_paths)?;
+        let matches_before = current.as_ref().map(|state| &state.hash)
+            == operation.before_hash.as_ref()
+            && current.as_ref().map(|state| state.size_bytes) == operation.before_size_bytes
+            && current.as_ref().map(|state| state.modified_at_utc.as_str())
+                == operation.before_modified_at_utc.as_deref();
+        let matches_rescued = current.as_ref().is_some_and(|state| {
+            state.hash == entry.conflict.current_hash
+                && state.size_bytes == entry.conflict.size_bytes
+                && state.modified_at_utc == entry.conflict.modified_at_utc
+        });
+        if entry.conflict.metadata_only {
+            if !matches_before {
+                if !matches_rescued {
+                    return Err(CheckPoError::WorkingTreeChanged(
+                        entry.conflict.path.to_string(),
+                    ));
+                }
+                restore_before_mtime_for_recovery(project, operation)?;
+            }
+        } else if !matches_before {
+            if current.is_none() {
+                // A crash may occur after the identity-bound unlink and before
+                // the completion record update. The durable rescue copy makes
+                // treating that state as completed safe and repeatable.
+            } else if matches_rescued {
+                let source = entry
+                    .conflict
+                    .path
+                    .to_project_path(project.project_root.as_path());
+                remove_anchored_project_file(project, &source, &entry.conflict.current_hash)?;
+            } else {
+                return Err(CheckPoError::WorkingTreeChanged(
+                    entry.conflict.path.to_string(),
+                ));
+            }
+        }
+        rescue.completed_paths.push(entry.conflict.path);
+        rescue.completed_paths.sort();
+        write_recovery_rescue_record(project, rescue)?;
+    }
+    Ok(())
+}
+
+fn verify_recovery_rescue_payload(
+    project: &ProjectContext,
+    rescue: &RecoveryRescueRecord,
+) -> Result<()> {
+    let repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
+    let files_root = recovery_rescue_files_relative(rescue);
+    for entry in rescue
+        .entries
+        .iter()
+        .filter(|entry| !entry.conflict.metadata_only)
+    {
+        let relative = files_root.join(entry.conflict.current_hash.as_str());
+        let (parent, leaf) = repo.open_parent(&relative, false)?;
+        let mut file = parent.open_file(&leaf).map_err(|error| {
+            CheckPoError::Corruption(format!(
+                "recovery rescue copy is unavailable for {}: {error}",
+                entry.conflict.path
+            ))
+        })?;
+        let hashed = file.hash()?;
+        if hashed.object_id != entry.conflict.current_hash
+            || hashed.metadata.len() != entry.conflict.size_bytes
+        {
+            return Err(CheckPoError::Corruption(format!(
+                "recovery rescue copy is damaged for {}",
+                entry.conflict.path
+            )));
+        }
+        parent.verify_file_binding(&leaf, &file)?;
+    }
+    repo.verify_root_binding()
 }
 
 pub fn quarantine_transaction(
@@ -203,7 +1149,10 @@ pub fn quarantine_transaction(
         if validate_transaction_journal_identity(&tx_root, &journal).is_ok()
             && matches!(
                 journal.state,
-                JournalState::Committed | JournalState::Recovered
+                JournalState::CommittedTarget
+                    | JournalState::RolledBack
+                    | JournalState::Committed
+                    | JournalState::Recovered
             )
         {
             return Err(crate::user_error(
@@ -555,6 +1504,9 @@ fn recover_one(project: &ProjectContext, pending: &PendingTransaction) -> Result
     }
     let mut journal = read_transaction_journal(&pending.journal_path)?;
     validate_transaction_journal_identity(tx_root, &journal)?;
+    if journal.intent == TransactionIntent::CompleteToTarget {
+        return recover_complete_to_target(project, pending, tx_root, journal);
+    }
     if journal.operations.is_empty() {
         return Err(CheckPoError::Corruption(
             "transaction journal contains no operations".to_string(),
@@ -608,6 +1560,343 @@ fn recover_one(project: &ProjectContext, pending: &PendingTransaction) -> Result
     journal.updated_at_utc = crate::now_utc_string();
     write_journal(&pending.journal_path, &journal)?;
     Ok(())
+}
+
+fn recover_complete_to_target(
+    project: &ProjectContext,
+    pending: &PendingTransaction,
+    tx_root: &Path,
+    mut journal: TransactionJournal,
+) -> Result<()> {
+    if journal.operations.is_empty() {
+        return Err(CheckPoError::Corruption(
+            "complete-to-target journal contains no original operations".to_string(),
+        ));
+    }
+    validate_journal_operations(project, &journal.checkpoint_id, &journal.operations)?;
+    validate_journal_directory_topology(
+        &journal.operations,
+        &journal.directories_to_remove,
+        &journal.directories_to_create,
+    )?;
+    validate_transaction_payload_unscoped(&tx_root.join("backup"))?;
+    validate_transaction_payload_unscoped(&tx_root.join("staged"))?;
+    cleanup_transaction_materialization_temps(project, &journal)?;
+    match journal.state {
+        JournalState::Created | JournalState::Staged => {
+            remove_repository_tree_if_exists(&project.repo_root, &tx_root.join("staged"))?;
+            journal.state = JournalState::RolledBack;
+            journal.updated_at_utc = crate::now_utc_string();
+            write_journal(&pending.journal_path, &journal)?;
+            return Ok(());
+        }
+        JournalState::ApplyingTarget
+        | JournalState::VerifyingTarget
+        | JournalState::AwaitingUnity => {
+            remove_repository_tree_if_exists(&project.repo_root, &tx_root.join("staged"))?;
+            remove_repository_tree_if_exists(&project.repo_root, &tx_root.join("forward-staged"))?;
+        }
+        JournalState::CommittedTarget | JournalState::RolledBack => return Ok(()),
+        state => {
+            return Err(CheckPoError::Corruption(format!(
+                "complete-to-target transaction has incompatible state: {state:?}"
+            )))
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let mut last_retryable_error = None;
+    for round in 0..TARGET_RECONCILE_MAX_ROUNDS {
+        if started.elapsed() >= TARGET_RECONCILE_MAX_ELAPSED {
+            break;
+        }
+        let plan = super::plan::build_plan(
+            project,
+            journal.checkpoint_id.clone(),
+            journal.kind,
+            journal.selected_paths.as_deref(),
+        )?;
+        if !plan.warnings.is_empty() {
+            return Err(crate::user_error(format!(
+                "target verification cannot continue while scan warnings exist: {}",
+                plan.warnings.join("; ")
+            )));
+        }
+        if !plan.has_changes {
+            journal.state = JournalState::VerifyingTarget;
+            journal.updated_at_utc = crate::now_utc_string();
+            write_journal(&pending.journal_path, &journal)?;
+            std::thread::sleep(TARGET_VERIFY_DEBOUNCE);
+            let verified = super::plan::build_plan(
+                project,
+                journal.checkpoint_id.clone(),
+                journal.kind,
+                journal.selected_paths.as_deref(),
+            )?;
+            if verified.warnings.is_empty() && !verified.has_changes {
+                remove_repository_tree_if_exists(&project.repo_root, &tx_root.join("staged"))?;
+                remove_repository_tree_if_exists(
+                    &project.repo_root,
+                    &tx_root.join("forward-staged"),
+                )?;
+                journal.state = JournalState::CommittedTarget;
+                journal.updated_at_utc = crate::now_utc_string();
+                write_journal(&pending.journal_path, &journal)?;
+                invalidate_operation_fingerprints(project, &journal.operations)?;
+                return Ok(());
+            }
+            last_retryable_error = Some(CheckPoError::WorkingTreeChanged(
+                "Unity changed the project during target verification".to_string(),
+            ));
+            continue;
+        }
+
+        validate_journal_operations(project, &journal.checkpoint_id, &plan.operations)?;
+        validate_journal_directory_topology(
+            &plan.operations,
+            &plan.directories_to_remove,
+            &plan.directories_to_create,
+        )?;
+        journal.operations = plan.operations;
+        journal.directories_to_remove = plan.directories_to_remove;
+        journal.directories_to_create = plan.directories_to_create;
+        journal.state = JournalState::ApplyingTarget;
+        journal.updated_at_utc = crate::now_utc_string();
+        write_journal(&pending.journal_path, &journal)?;
+        invalidate_operation_fingerprints(project, &journal.operations)?;
+
+        match apply_target_reconcile_round(project, tx_root, &journal, round) {
+            Ok(()) => {
+                last_retryable_error = None;
+            }
+            Err(error) if target_reconcile_error_is_retryable(&error) => {
+                last_retryable_error = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    journal.state = JournalState::AwaitingUnity;
+    journal.updated_at_utc = crate::now_utc_string();
+    write_journal(&pending.journal_path, &journal)?;
+    Err(CheckPoError::WorkingTreeChanged(format!(
+        "Unity is still updating the project; close Unity and continue recovery{}",
+        last_retryable_error
+            .as_ref()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    )))
+}
+
+fn apply_target_reconcile_round(
+    project: &ProjectContext,
+    tx_root: &Path,
+    journal: &TransactionJournal,
+    round: usize,
+) -> Result<()> {
+    let round_root = tx_root
+        .join("forward-staged")
+        .join(format!("{round}-{}", Uuid::new_v4().simple()));
+    let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
+    let mut stage_sync_batch = crate::storage::AnchoredParentSyncBatch::new();
+    let target_operations = journal
+        .operations
+        .iter()
+        .filter(|operation| operation.after_hash.is_some())
+        .collect::<Vec<_>>();
+    let mut destination_parents = BTreeSet::new();
+    for operation in &target_operations {
+        let destination = staged_path(&round_root, &operation.path);
+        let parent = destination.parent().ok_or_else(|| {
+            CheckPoError::Corruption(format!(
+                "forward stage destination has no parent: {}",
+                destination.display()
+            ))
+        })?;
+        destination_parents.insert(parent.to_path_buf());
+    }
+    for parent in destination_parents {
+        prepare_stage_destination_parent(project, &anchored_repo, &parent, &mut stage_sync_batch)?;
+    }
+    for operation in &target_operations {
+        stage_object_for_transaction_prepared(
+            project,
+            &anchored_repo,
+            required_after_hash(operation)?,
+            &staged_path(&round_root, &operation.path),
+            operation.after_size_bytes.ok_or_else(|| {
+                CheckPoError::Corruption(format!(
+                    "target operation missing size for {}",
+                    operation.path
+                ))
+            })?,
+            operation.after_modified_at_utc.as_deref(),
+            &mut stage_sync_batch,
+            None,
+        )?;
+    }
+    stage_sync_batch.flush()?;
+    anchored_repo.verify_root_binding()?;
+
+    let target_paths = journal
+        .operations
+        .iter()
+        .filter(|operation| operation.after_hash.is_some())
+        .map(|operation| operation.path.clone())
+        .collect::<BTreeSet<_>>();
+    let mut conflicts = Vec::new();
+    for operation in &journal.operations {
+        let Some(current) =
+            current_file_state_for_recovery(project, &operation.path, &target_paths)?
+        else {
+            continue;
+        };
+        let matches_target = operation.after_hash.as_ref() == Some(&current.hash)
+            && operation.after_size_bytes == Some(current.size_bytes);
+        if operation.after_hash.is_none() || !matches_target {
+            conflicts.push(TransactionRecoveryConflict {
+                path: operation.path.clone(),
+                current_hash: current.hash,
+                size_bytes: current.size_bytes,
+                modified_at_utc: current.modified_at_utc,
+                metadata_only: false,
+            });
+        }
+    }
+    if !conflicts.is_empty() {
+        preserve_and_remove_target_conflicts(project, journal, conflicts)?;
+    }
+
+    for directory in &journal.directories_to_remove {
+        remove_project_directory(project, directory)?;
+    }
+    for directory in &journal.directories_to_create {
+        create_project_directory(project, directory)?;
+    }
+
+    let mut project_sync_batch = crate::storage::AnchoredParentSyncBatch::new();
+    let mut staged_sync_batch = crate::storage::AnchoredParentSyncBatch::new();
+    for operation in target_operations {
+        let current = current_file_state_for_recovery(project, &operation.path, &target_paths)?;
+        let matches_target = current.as_ref().is_some_and(|state| {
+            operation.after_hash.as_ref() == Some(&state.hash)
+                && operation.after_size_bytes == Some(state.size_bytes)
+        });
+        if matches_target {
+            set_project_file_mtime_to_target(project, operation)?;
+            continue;
+        }
+        if current.is_some() {
+            return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
+        }
+        let mut publish_operation = (*operation).clone();
+        publish_operation.operation_type = FileOperationType::Restore;
+        publish_operation.before_hash = None;
+        publish_operation.before_size_bytes = None;
+        publish_operation.before_modified_at_utc = None;
+        restore_new_staged_file_to_project_deferred(
+            project,
+            &publish_operation,
+            &staged_path(&round_root, &operation.path),
+            &operation
+                .path
+                .to_project_path(project.project_root.as_path()),
+            &journal.transaction_id,
+            &mut staged_sync_batch,
+            &mut project_sync_batch,
+        )?;
+    }
+    project_sync_batch.flush()?;
+    staged_sync_batch.flush()?;
+    remove_repository_tree_if_exists(&project.repo_root, &round_root)?;
+    Ok(())
+}
+
+fn preserve_and_remove_target_conflicts(
+    project: &ProjectContext,
+    journal: &TransactionJournal,
+    mut conflicts: Vec<TransactionRecoveryConflict>,
+) -> Result<()> {
+    conflicts.sort_by(|left, right| left.path.cmp(&right.path));
+    let journal_bytes =
+        serde_json::to_vec(journal).map_err(|error| CheckPoError::Corruption(error.to_string()))?;
+    let journal_digest = blake3::hash(&journal_bytes).to_hex().to_string();
+    let plan_id = recovery_conflict_plan_id(
+        &project.project_id,
+        &journal.transaction_id,
+        &journal.checkpoint_id,
+        &journal_digest,
+        &conflicts,
+    )?;
+    let plan = TransactionRecoveryConflictPlan {
+        schema_version: crate::TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION,
+        plan_id,
+        transaction_id: journal.transaction_id.clone(),
+        checkpoint_id: journal.checkpoint_id.clone(),
+        conflicts,
+    };
+    prepare_recovery_conflict_rescue(project, journal, &plan, &BTreeSet::new(), None)?;
+    let mut rescue = read_active_recovery_rescue_record(project, &journal.transaction_id)?
+        .ok_or_else(|| {
+            CheckPoError::Corruption("target reconcile rescue record was not published".to_string())
+        })?;
+    verify_recovery_rescue_payload(project, &rescue)?;
+    rescue.state = RecoveryRescueState::Resolving;
+    write_recovery_rescue_record(project, &rescue)?;
+    let target_paths = journal
+        .operations
+        .iter()
+        .filter(|operation| operation.after_hash.is_some())
+        .map(|operation| operation.path.clone())
+        .collect::<BTreeSet<_>>();
+    for entry in rescue.entries.clone() {
+        if rescue.completed_paths.contains(&entry.conflict.path) {
+            continue;
+        }
+        let current =
+            current_file_state_for_recovery(project, &entry.conflict.path, &target_paths)?;
+        match current {
+            None => {}
+            Some(current)
+                if current.hash == entry.conflict.current_hash
+                    && current.size_bytes == entry.conflict.size_bytes
+                    && current.modified_at_utc == entry.conflict.modified_at_utc =>
+            {
+                let source = entry
+                    .conflict
+                    .path
+                    .to_project_path(project.project_root.as_path());
+                remove_anchored_project_file(project, &source, &entry.conflict.current_hash)?;
+            }
+            Some(_) => {
+                return Err(CheckPoError::WorkingTreeChanged(
+                    entry.conflict.path.to_string(),
+                ))
+            }
+        }
+        rescue.completed_paths.push(entry.conflict.path);
+        rescue.completed_paths.sort();
+        write_recovery_rescue_record(project, &rescue)?;
+    }
+    rescue.state = RecoveryRescueState::Recovered;
+    write_recovery_rescue_record(project, &rescue)
+}
+
+fn target_reconcile_error_is_retryable(error: &CheckPoError) -> bool {
+    match error {
+        CheckPoError::WorkingTreeChanged(_) => true,
+        CheckPoError::Io { source, .. } => matches!(
+            source.kind(),
+            ErrorKind::PermissionDenied
+                | ErrorKind::WouldBlock
+                | ErrorKind::AlreadyExists
+                | ErrorKind::NotFound
+                | ErrorKind::NotADirectory
+                | ErrorKind::DirectoryNotEmpty
+        ),
+        _ => false,
+    }
 }
 
 fn remove_repository_tree_if_exists(repo_root: &Path, directory: &Path) -> Result<()> {
@@ -772,6 +2061,57 @@ fn validate_transaction_payload(
         )));
     }
     Ok(present)
+}
+
+fn validate_transaction_payload_unscoped(root: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(crate::io_error(root, error)),
+    };
+    if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(CheckPoError::Corruption(format!(
+            "transaction payload root is not a regular directory: {}",
+            root.display()
+        )));
+    }
+    for entry in walkdir::WalkDir::new(root).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|error| CheckPoError::Corruption(error.to_string()))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| crate::io_error(entry.path(), error))?;
+        if crate::metadata_is_link_or_reparse(&metadata) {
+            return Err(CheckPoError::Corruption(format!(
+                "transaction payload contains a symlink: {}",
+                entry.path().display()
+            )));
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(CheckPoError::Corruption(format!(
+                "transaction payload contains a non-regular file: {}",
+                entry.path().display()
+            )));
+        }
+        if crate::is_checkpo_atomic_materialization_temporary_file(entry.path()) {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|error| CheckPoError::Corruption(error.to_string()))?
+            .to_str()
+            .ok_or_else(|| {
+                CheckPoError::Corruption(format!(
+                    "transaction payload path is not valid UTF-8: {}",
+                    entry.path().display()
+                ))
+            })?
+            .replace('\\', "/");
+        TrackedUnityFilePath::parse(&relative)?;
+    }
+    Ok(())
 }
 
 fn transaction_needs_rollback(
@@ -1157,16 +2497,23 @@ fn remove_anchored_project_file(
     let root = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
     let (parent, leaf) = root.open_parent_for_mutation(relative, false)?;
     let mut file = parent.open_file(&leaf)?;
-    let actual = file.hash()?.object_id;
-    if &actual != expected_hash {
+    let hashed = file.hash()?;
+    if &hashed.object_id != expected_hash {
         return Err(CheckPoError::ObjectHashMismatch(format!(
             "{} expected {}, got {}",
             path.display(),
             expected_hash,
-            actual
+            hashed.object_id
         )));
     }
-    parent.unlink_file_if_bound(&leaf, file)?;
+    parent.verify_file_binding(&leaf, &file)?;
+    #[cfg(windows)]
+    {
+        file = parent.open_file_without_write_sharing(&leaf, &file)?;
+        file.verify_version(&hashed.version)?;
+    }
+    root.verify_root_binding()?;
+    parent.unlink_file_if_bound_versioned(&leaf, file, hashed.version)?;
     parent.sync_all()?;
     root.verify_root_binding()
 }

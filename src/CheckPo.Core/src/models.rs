@@ -295,6 +295,7 @@ pub struct DiffResult {
 
 pub const OPERATION_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const TRANSACTION_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const STORAGE_GC_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
 
@@ -618,6 +619,38 @@ pub struct TransactionRecoveryResult {
 pub struct TransactionRecoveryFailure {
     pub transaction_id: String,
     pub error: String,
+    pub recovery_conflict_count: usize,
+    pub awaiting_unity: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransactionRecoveryConflict {
+    pub path: TrackedUnityFilePath,
+    pub current_hash: ObjectId,
+    pub size_bytes: u64,
+    pub modified_at_utc: String,
+    pub metadata_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransactionRecoveryConflictPlan {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub transaction_id: String,
+    pub checkpoint_id: SnapshotId,
+    pub conflicts: Vec<TransactionRecoveryConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionRecoveryConflictResult {
+    pub transaction_id: String,
+    pub recovered: bool,
+    pub export_directory: Option<PathBuf>,
+    pub exported_paths: Vec<TrackedUnityFilePath>,
+    pub restored_without_export_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

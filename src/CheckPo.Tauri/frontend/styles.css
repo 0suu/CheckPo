@@ -604,6 +604,34 @@ p {
 
 .pending-banner {
   background: var(--warning-soft);
+  align-items: flex-start;
+}
+
+.pending-banner-copy {
+  flex: 1 1 480px;
+}
+
+.pending-banner .pending-banner-actions {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.recovery-guidance {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
+}
+
+.recovery-guidance p {
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .quarantine-banner {
@@ -1740,7 +1768,8 @@ pre {
   padding: 18px;
 }
 
-.rollback-overlay {
+.rollback-overlay,
+.recovery-conflict-overlay {
   position: fixed;
   inset: 0;
   z-index: 18;
@@ -1808,7 +1837,8 @@ pre {
   box-shadow: var(--shadow);
 }
 
-.rollback-dialog {
+.rollback-dialog,
+.recovery-conflict-dialog {
   display: grid;
   gap: 14px;
   width: min(760px, 100%);
@@ -1824,14 +1854,86 @@ pre {
 .settings-header,
 .advanced-dialog-header,
 .project-registration-header,
-  .project-selection-header,
-.rollback-dialog-header {
+.project-selection-header,
+.rollback-dialog-header,
+.recovery-conflict-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   border-bottom: 1px solid var(--border-soft);
   padding-bottom: 12px;
+}
+
+.recovery-conflict-list {
+  display: grid;
+  max-height: min(42vh, 420px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.recovery-conflict-item,
+.recovery-select-all {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.recovery-select-all {
+  padding: 0 4px;
+}
+
+.recovery-select-all strong {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.recovery-conflict-item {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  cursor: pointer;
+}
+
+.recovery-conflict-item:last-child {
+  border-bottom: 0;
+}
+
+.recovery-conflict-item:hover {
+  background: var(--control-hover);
+}
+
+.recovery-conflict-item-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.recovery-conflict-item-copy strong,
+.recovery-conflict-item-copy small {
+  overflow-wrap: anywhere;
+}
+
+.recovery-conflict-item-copy small,
+.recovery-conflict-size {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.recovery-selection-warning {
+  margin: 0;
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border));
+  border-radius: 8px;
+  background: var(--warning-soft);
+  padding: 9px 11px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.recovery-conflict-actions {
+  justify-content: flex-end;
 }
 
 .settings-section {
@@ -2634,6 +2736,15 @@ input[type="text"] {
     flex-wrap: wrap;
   }
 
+  .pending-banner {
+    flex-wrap: wrap;
+  }
+
+  .pending-banner .pending-banner-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
   .toolbar-actions,
   .tree-tools {
     width: 100%;
@@ -2747,6 +2858,7 @@ input[type="text"] {
   .advanced-dialog,
   .project-selection-dialog,
   .rollback-dialog,
+  .recovery-conflict-dialog,
   .confirm-box,
   .busy-box {
     background: var(--surface);
@@ -2834,7 +2946,8 @@ input[type="text"] {
   }
 
   .confirm-overlay,
-  .rollback-overlay {
+  .rollback-overlay,
+  .recovery-conflict-overlay {
     background: rgba(0, 0, 0, 0.58);
   }
 
@@ -3055,6 +3168,7 @@ input[type="text"],
 .advanced-dialog,
 .project-selection-dialog,
 .rollback-dialog,
+.recovery-conflict-dialog,
 .busy-box {
   background: var(--surface);
 }
@@ -3145,7 +3259,8 @@ input[type="text"],
 }
 
 :root[data-theme="dark"] .confirm-overlay,
-:root[data-theme="dark"] .rollback-overlay {
+:root[data-theme="dark"] .rollback-overlay,
+:root[data-theme="dark"] .recovery-conflict-overlay {
   background: rgba(0, 0, 0, 0.58);
 }
 

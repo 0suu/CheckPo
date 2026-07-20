@@ -53,6 +53,7 @@ const state = {
   pendingTransactions: [],
   unresolvedQuarantines: [],
   failedTransactions: [],
+  recoveryConflictPlan: null,
   confirming: false,
   currentDiff: null,
   diffRefreshFailure: null,
@@ -241,6 +242,7 @@ async function run(title, task, options = {}) {
     renderProgressImmediately({ phase: "complete", completed: 1, total: 1 }, true);
     return result;
   } catch (error) {
+    await syncPendingTransactionsAfterError(error);
     const cancelled = CheckPoFrontendState.isCancellationKind(errorKind(error));
     if (cancelled) {
       const display = displayError(error);
@@ -269,6 +271,7 @@ function setStatus(text) {
     ["rollbackOverlay", "rollbackStatus"],
     ["projectRegistrationOverlay", "projectRegistrationStatus"],
     ["projectSelectionOverlay", "projectSelectionStatus"],
+    ["recoveryConflictOverlay", "recoveryConflictStatus"],
     ["advancedOverlay", "advancedStatus"],
     ["settingsOverlay", "settingsStatus"],
   ].find(([overlayId]) => !$(overlayId)?.hidden);
@@ -290,6 +293,7 @@ function clearVisibleStatus() {
     "projectRegistrationStatus",
     "projectSelectionStatus",
     "rollbackStatus",
+    "recoveryConflictStatus",
   ]) {
     const target = $(id);
     if (!target) continue;
@@ -371,6 +375,7 @@ function showVisibleError(message) {
     "advancedOverlay",
     "projectRegistrationOverlay",
     "projectSelectionOverlay",
+    "recoveryConflictOverlay",
   ].some((id) => !$(id)?.hidden);
   if (modalNeedsForegroundError) {
     $("errorDialogText").textContent = message;
@@ -596,6 +601,15 @@ async function refreshProject(options = {}) {
   return snapshot;
 }
 
+async function syncPendingTransactionsAfterError(error, options = {}) {
+  if (errorKind(error) !== "pendingTransaction" || !state.projectPath) return;
+  try {
+    await refreshProject({ fromAutoRefresh: options.fromAutoRefresh });
+  } catch (refreshError) {
+    console.warn("中断された作業の状態を再読み込みできませんでした", refreshError);
+  }
+}
+
 async function loadDiffForDisplay(projectPath, checkpointId, metadataOnly) {
   const args = { projectPath, checkpointId };
   const diff = await invokeCommand(
@@ -717,6 +731,7 @@ async function refreshLatestDiff(options = {}) {
     }
   } catch (error) {
     if (generation !== state.autoRefreshGeneration || errorKind(error) === "cancelled") return;
+    await syncPendingTransactionsAfterError(error, { fromAutoRefresh: true });
     if (options.silent) {
       const failure = errorText(error);
       state.diffRefreshFailure = failure;
@@ -979,11 +994,10 @@ function renderPending(items) {
     .map((item) => `${shortId(item.transactionId)}:${item.state || t("unknownState")}`)
     .join(" / ");
   const omitted = items.length > 3 ? tf("otherItems", { count: items.length - 3 }) : "";
-  $("pendingTransactionText").textContent =
-    tf("pendingTransactionsMessage", {
-      count: items.length,
-      details: states ? ` (${states}${omitted})` : "",
-    });
+  const details = states ? ` (${states}${omitted})` : "";
+  $("pendingTransactionText").textContent = state.failedTransactions.length > 0
+    ? `${items.length} 件の中断された書き戻しで、自動復旧を安全に続けられませんでした。${details}`
+    : tf("pendingTransactionsMessage", { count: items.length, details });
   renderTransactionQuarantineAction();
   updateControls();
 }
@@ -995,6 +1009,9 @@ function resetProjectScopedSettingsResults() {
   $("tempCleanupSummary").textContent = "未確認";
   $("tempCleanupResult").textContent = "-";
   $("rollbackOverlay").hidden = true;
+  $("recoveryConflictOverlay").hidden = true;
+  $("recoveryConflictList").replaceChildren();
+  $("recoveryExportRoot").value = "";
 }
 
 function resetProjectScopedDom() {
@@ -1008,26 +1025,205 @@ function resetProjectScopedDom() {
 }
 
 function renderTransactionQuarantineAction() {
-  const banner = $("pendingTransactionBanner");
+  const actions = $("pendingTransactionActions");
+  const guidanceElement = $("recoveryGuidance");
+  const reasonElement = $("recoveryFailureReason");
+  const recoverButton = $("recoverTransactionsButton");
   const failed = state.failedTransactions?.[0];
-  let button = $("quarantineTransactionButton");
+  let quarantineButton = $("quarantineTransactionButton");
+  let selectFilesButton = $("selectRecoveryFilesButton");
   if (!failed) {
-    button?.remove();
+    quarantineButton?.remove();
+    selectFilesButton?.remove();
+    guidanceElement.hidden = true;
+    reasonElement.textContent = "";
+    recoverButton.hidden = false;
+    recoverButton.textContent = t("recoverTransactions");
     return;
   }
-  if (!button) {
-    button = document.createElement("button");
-    button.id = "quarantineTransactionButton";
-    button.type = "button";
-    button.className = "button danger-secondary";
-    button.addEventListener("click", quarantineFailedTransaction);
-    banner.append(button);
+
+  const guidance = CheckPoFrontendState.transactionRecoveryGuidance(failed);
+  reasonElement.textContent = guidance.message;
+  guidanceElement.hidden = false;
+  recoverButton.hidden = !guidance.retryable;
+  recoverButton.textContent = failed.awaitingUnity
+    ? "復旧を続ける"
+    : guidance.retryable
+      ? "もう一度復旧"
+      : t("recoverTransactions");
+
+  if (guidance.canSelectFiles) {
+    quarantineButton?.remove();
+    if (!selectFilesButton) {
+      selectFilesButton = document.createElement("button");
+      selectFilesButton.id = "selectRecoveryFilesButton";
+      selectFilesButton.type = "button";
+      selectFilesButton.className = "button primary";
+      selectFilesButton.addEventListener("click", openRecoveryConflictDialog);
+      actions.append(selectFilesButton);
+    }
+    selectFilesButton.dataset.transactionId = failed.transactionId;
+    selectFilesButton.textContent = "保存するファイルを選ぶ";
+    return;
   }
-  button.dataset.transactionId = failed.transactionId;
+
+  selectFilesButton?.remove();
+  if (!guidance.canQuarantine) {
+    quarantineButton?.remove();
+    return;
+  }
+  if (!quarantineButton) {
+    quarantineButton = document.createElement("button");
+    quarantineButton.id = "quarantineTransactionButton";
+    quarantineButton.type = "button";
+    quarantineButton.className = "button danger-secondary";
+    quarantineButton.addEventListener("click", quarantineFailedTransaction);
+    actions.append(quarantineButton);
+  }
+  quarantineButton.dataset.transactionId = failed.transactionId;
   const remaining = state.failedTransactions.length;
-  button.textContent = remaining > 1
-    ? `復旧できない作業を退避（残り ${remaining} 件）`
-    : "復旧できない作業を安全な場所へ退避";
+  quarantineButton.textContent = remaining > 1
+    ? `復旧データを退避（残り ${remaining} 件）`
+    : "復旧データを安全な場所へ退避";
+}
+
+async function openRecoveryConflictDialog(event) {
+  const transactionId = event?.currentTarget?.dataset.transactionId
+    || state.failedTransactions?.[0]?.transactionId;
+  if (!transactionId || state.busy) return;
+  const plan = await run("変更されたファイルを確認中", async () => invokeCommand(
+    "analyze_transaction_recovery_conflicts",
+    { projectPath: getProjectPath(), transactionId },
+  ));
+  if (!plan) return;
+  if (!Array.isArray(plan.conflicts) || plan.conflicts.length === 0) {
+    setStatus("変更されたファイルはありません。もう一度「復旧する」を押してください。");
+    return;
+  }
+  state.recoveryConflictPlan = plan;
+  $("recoveryExportRoot").value = "";
+  clearDialogStatus("recoveryConflictStatus");
+  renderRecoveryConflictPlan(plan);
+  $("recoveryConflictOverlay").hidden = false;
+  updateRecoveryConflictControls();
+}
+
+function renderRecoveryConflictPlan(plan) {
+  const list = $("recoveryConflictList");
+  const groups = CheckPoFrontendState.groupRecoveryConflicts(plan?.conflicts);
+  list.replaceChildren(...groups.map((group) => {
+    const label = document.createElement("label");
+    label.className = "recovery-conflict-item";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = true;
+    checkbox.dataset.recoveryPaths = JSON.stringify(group.paths);
+    checkbox.addEventListener("change", updateRecoveryConflictControls);
+    const copy = document.createElement("span");
+    copy.className = "recovery-conflict-item-copy";
+    const name = document.createElement("strong");
+    name.textContent = group.label;
+    const detail = document.createElement("small");
+    detail.textContent = group.detail;
+    copy.append(name, detail);
+    const size = document.createElement("span");
+    size.className = "recovery-conflict-size";
+    size.textContent = formatBytes(group.sizeBytes);
+    label.append(checkbox, copy, size);
+    return label;
+  }));
+  $("recoverySelectAll").checked = true;
+  $("recoverySelectAll").indeterminate = false;
+}
+
+function selectedRecoveryConflictPaths() {
+  return Array.from($("recoveryConflictList").querySelectorAll("input[type='checkbox']:checked"))
+    .flatMap((input) => {
+      try {
+        const paths = JSON.parse(input.dataset.recoveryPaths || "[]");
+        return Array.isArray(paths) ? paths.map(String) : [];
+      } catch (_) {
+        return [];
+      }
+    });
+}
+
+function updateRecoveryConflictControls() {
+  const checkboxes = Array.from(
+    $("recoveryConflictList").querySelectorAll("input[type='checkbox']"),
+  );
+  const selectedGroups = checkboxes.filter((input) => input.checked).length;
+  const selectedPaths = selectedRecoveryConflictPaths();
+  const totalPaths = state.recoveryConflictPlan?.conflicts?.length ?? 0;
+  $("recoverySelectAll").checked = checkboxes.length > 0 && selectedGroups === checkboxes.length;
+  $("recoverySelectAll").indeterminate = selectedGroups > 0 && selectedGroups < checkboxes.length;
+  $("recoverySelectionSummary").textContent = `${selectedGroups} / ${checkboxes.length} 個を保存`;
+  const notSaved = Math.max(0, totalPaths - selectedPaths.length);
+  $("recoverySelectionWarning").hidden = notSaved === 0;
+  $("recoverySelectionWarning").textContent = notSaved > 0
+    ? `選ばなかった ${notSaved} 個は別フォルダーへ保存せず、復旧前の状態に戻します。`
+    : "";
+  updateControls();
+}
+
+function closeRecoveryConflictDialog() {
+  $("recoveryConflictOverlay").hidden = true;
+  state.recoveryConflictPlan = null;
+  $("recoveryConflictList").replaceChildren();
+  $("recoveryExportRoot").value = "";
+  updateControls();
+}
+
+async function applyRecoveryConflictSelection() {
+  const plan = state.recoveryConflictPlan;
+  const selectedPaths = selectedRecoveryConflictPaths();
+  const exportRoot = $("recoveryExportRoot").value.trim();
+  if (!plan || selectedPaths.length === 0 || !exportRoot || state.busy || state.confirming) return;
+  const notSaved = Math.max(0, (plan.conflicts?.length ?? 0) - selectedPaths.length);
+  if (notSaved > 0) {
+    state.confirming = true;
+    updateControls();
+    let confirmed = false;
+    try {
+      confirmed = await confirmAction(
+        `選ばなかった ${notSaved} 個の現在の内容は、選択したフォルダーには保存しません。復旧前の状態へ戻してよいですか？`,
+        "保存して復旧",
+      );
+    } finally {
+      state.confirming = false;
+      updateControls();
+    }
+    if (!confirmed) return;
+  }
+
+  const result = await run("選んだファイルを保存して復旧中", async () => {
+    const recovered = await invokeCommand("recover_transaction_with_conflict_export", {
+      projectPath: getProjectPath(),
+      transactionId: plan.transactionId,
+      expectedPlanId: plan.planId,
+      selectedPaths,
+      exportRoot,
+      confirmed: true,
+    });
+    state.failedTransactions = state.failedTransactions
+      .filter((item) => item.transactionId !== plan.transactionId);
+    state.recoveryConflictPlan = null;
+    $("recoveryConflictOverlay").hidden = true;
+    setBusyIndeterminate("再読み込み中");
+    await refreshProject();
+    if (state.pendingTransactions.length === 0) {
+      await refreshLatestDiff({ allowBusy: true });
+    }
+    setStatus(
+      `${selectedPaths.length} 個のファイルを保存して復旧しました。保存先: ${recovered.exportDirectory}`,
+    );
+    setResult(recovered);
+    return recovered;
+  });
+  if (result) {
+    $("recoveryConflictList").replaceChildren();
+    $("recoveryExportRoot").value = "";
+  }
 }
 
 function renderUnresolvedQuarantines(items) {
@@ -1061,7 +1257,12 @@ function recoverySummary(result) {
   const recovered = result?.recoveredTransactionCount ?? 0;
   const failed = result?.failedTransactionCount ?? 0;
   if (failed > 0) {
-    const detail = "。復旧できない作業は、安全な場所へ退避できます";
+    const failures = Array.isArray(result?.failedTransactions) ? result.failedTransactions : [];
+    const canSelectFiles = failures.length > 0
+      && failures.every((failure) => Number(failure?.recoveryConflictCount || 0) > 0);
+    const detail = canSelectFiles
+      ? "。保存するファイルと保存先を選んで復旧できます"
+      : "。上の案内を確認してください";
     return tf("recoveryFailed", { recovered, failed, detail });
   }
   return tf("recoverySucceeded", { count: recovered });
@@ -1651,6 +1852,7 @@ function visibleModalOverlay() {
     "errorOverlay",
     "confirmOverlay",
     "rollbackOverlay",
+    "recoveryConflictOverlay",
     "projectRegistrationOverlay",
     "projectSelectionOverlay",
     "advancedOverlay",
@@ -2132,7 +2334,19 @@ function updateControls() {
         );
       return;
     }
-    if (["recoverTransactionsButton", "quarantineTransactionButton"].includes(button.id)) {
+    if (button.id === "applyRecoveryConflictButton") {
+      button.disabled = controlsBlocked
+        || locationMutationBlocked
+        || !state.recoveryConflictPlan
+        || selectedRecoveryConflictPaths().length === 0
+        || !$("recoveryExportRoot").value.trim();
+      return;
+    }
+    if ([
+      "recoverTransactionsButton",
+      "quarantineTransactionButton",
+      "selectRecoveryFilesButton",
+    ].includes(button.id)) {
       button.disabled = controlsBlocked || locationMutationBlocked || !hasProject;
       return;
     }
@@ -2335,7 +2549,7 @@ async function discardPaths(paths) {
       CONFIRM_PATH_RENDER_LIMIT,
     );
     confirmed = await confirmAction(
-      `${preview.total} 件の変更を戻します。\n\n${preview.text}\n\n続行しますか？`,
+      `${preview.total} 件の変更を戻します。\n\n${preview.text}\n\n復元中にUnityが保存した内容も、選んだチェックポイントで上書きします。\n\n続行しますか？`,
       "戻す",
     );
   } finally {
@@ -2413,6 +2627,21 @@ function bindEvents() {
   });
   $("closeAdvancedButton").addEventListener("click", () => $("advancedOverlay").hidden = true);
   $("closeRollbackDialogButton").addEventListener("click", () => $("rollbackOverlay").hidden = true);
+  $("closeRecoveryConflictButton").addEventListener("click", closeRecoveryConflictDialog);
+  $("cancelRecoveryConflictButton").addEventListener("click", closeRecoveryConflictDialog);
+  $("recoverySelectAll").addEventListener("change", (event) => {
+    $("recoveryConflictList").querySelectorAll("input[type='checkbox']").forEach((input) => {
+      input.checked = event.currentTarget.checked;
+    });
+    updateRecoveryConflictControls();
+  });
+  $("pickRecoveryExportRootButton").addEventListener("click", async () => {
+    const path = await pickFolder("復旧ファイルの保存先");
+    if (!path) return;
+    $("recoveryExportRoot").value = path;
+    updateRecoveryConflictControls();
+  });
+  $("applyRecoveryConflictButton").addEventListener("click", applyRecoveryConflictSelection);
   $("dismissStatusButton").addEventListener("click", () => {
     $("statusBanner").hidden = true;
     $("statusBannerText").textContent = "";

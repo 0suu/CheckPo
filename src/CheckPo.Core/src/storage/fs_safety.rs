@@ -404,17 +404,22 @@ pub(crate) fn validate_repository_layout_no_follow(repo_root: &Path) -> Result<(
     ] {
         ensure_regular_directory_no_follow(&repo_root.join(relative))?;
     }
-    let quarantine = repo_root.join("quarantined-journals");
-    match fs::symlink_metadata(&quarantine) {
-        Ok(metadata) if metadata.is_dir() && !metadata_is_link_or_reparse(&metadata) => {}
-        Ok(_) => {
-            return Err(CheckPoError::Corruption(format!(
-                "unsafe transaction quarantine directory: {}",
-                quarantine.display()
-            )))
+    for (relative, label) in [
+        ("quarantined-journals", "transaction quarantine"),
+        ("recovery-rescues", "recovery rescue"),
+    ] {
+        let optional_directory = repo_root.join(relative);
+        match fs::symlink_metadata(&optional_directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata_is_link_or_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(CheckPoError::Corruption(format!(
+                    "unsafe {label} directory: {}",
+                    optional_directory.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&optional_directory, error)),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error(&quarantine, error)),
     }
     Ok(())
 }

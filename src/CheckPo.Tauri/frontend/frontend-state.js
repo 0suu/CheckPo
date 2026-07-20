@@ -19,7 +19,7 @@
     operationBusy: "別の処理が実行中です。完了してから、もう一度実行してください。",
     pendingTransaction: "中断された作業があります。先に復旧してください。",
     unresolvedTransactionQuarantine: "プロジェクトの状態を安全と確認できません。既知のチェックポイントへ全体復元してください。",
-    transactionRecoveryFailed: "自動復旧できない作業があります。内容を安全な場所へ退避できます。",
+    transactionRecoveryFailed: "自動復旧を完了できませんでした。上の案内を確認してください。",
     indexUnavailable: "一覧用データを読み込めませんでした。インデックスの再構築を実行してください。",
     unsupportedFormat: "この保存データは、より新しいCheckPoで作られています。データを変更せず、CheckPoを更新してください。",
     copiedProjectSuspected: "同じプロジェクトのコピーが見つかりました。使用する場所を確認してください。",
@@ -57,6 +57,7 @@
       pendingTransactions: [],
       unresolvedQuarantines: [],
       failedTransactions: [],
+      recoveryConflictPlan: null,
       currentDiff: null,
       diffRefreshFailure: null,
       latestDiffCheckpointId: null,
@@ -357,6 +358,67 @@
       .filter((item) => pendingIds.has(item?.transactionId));
   }
 
+  function transactionRecoveryGuidance(failure) {
+    const rawError = String(failure?.error || "").trim();
+    if (failure?.awaitingUnity === true) {
+      return {
+        retryable: true,
+        canSelectFiles: false,
+        canQuarantine: false,
+        message: "Unityがファイルを更新し続けています。Unityを閉じてから「復旧を続ける」を押してください。",
+      };
+    }
+    if (Number(failure?.recoveryConflictCount || 0) > 0) {
+      return {
+        retryable: false,
+        canSelectFiles: true,
+        canQuarantine: false,
+        message: "復旧中にUnityが変更したファイルがあります。残したいファイルと保存先を選んで復旧できます。",
+      };
+    }
+
+    return {
+      retryable: true,
+      canSelectFiles: false,
+      canQuarantine: true,
+      message: rawError
+        ? `自動復旧を完了できませんでした。詳細: ${rawError}`
+        : "自動復旧を完了できませんでした。詳しい原因を取得できませんでした。",
+    };
+  }
+
+  function groupRecoveryConflicts(conflicts) {
+    const items = (Array.isArray(conflicts) ? conflicts : [])
+      .filter((conflict) => conflict?.path)
+      .map((conflict) => ({ ...conflict, path: String(conflict.path) }))
+      .sort((left, right) => left.path.localeCompare(right.path, "ja"));
+    const byPath = new Map(items.map((item) => [item.path, item]));
+    const consumed = new Set();
+    const groups = [];
+    for (const item of items) {
+      if (consumed.has(item.path)) continue;
+      const isMeta = item.path.endsWith(".meta");
+      const assetPath = isMeta ? item.path.slice(0, -5) : item.path;
+      const meta = !isMeta ? byPath.get(`${item.path}.meta`) : null;
+      const asset = isMeta ? byPath.get(assetPath) : item;
+      if (isMeta && asset) continue;
+      const groupedItems = meta ? [item, meta] : [item];
+      for (const grouped of groupedItems) consumed.add(grouped.path);
+      const name = assetPath.split("/").at(-1) || assetPath;
+      groups.push({
+        id: assetPath,
+        label: isMeta ? `${name}（Unity設定）` : name,
+        detail: meta ? `${item.path} と Unity設定` : item.path,
+        paths: groupedItems.map((grouped) => grouped.path),
+        sizeBytes: groupedItems.reduce(
+          (total, grouped) => total + Math.max(0, Number(grouped.sizeBytes) || 0),
+          0,
+        ),
+      });
+    }
+    return groups;
+  }
+
   function selectChangePaths({
     selectedPaths,
     anchorPath,
@@ -603,6 +665,8 @@
     selectChangePaths,
     samePathInput,
     storageSummaryWithRetainedSize,
+    groupRecoveryConflicts,
+    transactionRecoveryGuidance,
     transactionCleanupPlanHasCandidates,
     restorePlanHasChanges,
     restorePlanCanApply,

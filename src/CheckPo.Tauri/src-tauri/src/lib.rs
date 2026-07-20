@@ -581,6 +581,50 @@ async fn recover_transactions(
 }
 
 #[tauri::command]
+async fn analyze_transaction_recovery_conflicts(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    transaction_id: String,
+) -> AppResult {
+    run_guarded_blocking(state, None, move || {
+        core::analyze_transaction_recovery_conflicts(&project_path, &transaction_id)
+            .map(|result| json!(result))
+            .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn recover_transaction_with_conflict_export(
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    transaction_id: String,
+    expected_plan_id: String,
+    selected_paths: Vec<String>,
+    export_root: String,
+    confirmed: bool,
+) -> AppResult {
+    require_confirmation(
+        confirmed,
+        "transaction conflict recovery requires confirmation.",
+    )?;
+    let selected_paths = core::parse_tracked_paths(&selected_paths).map_err(to_app_error)?;
+    run_guarded_blocking(state, None, move || {
+        core::recover_transaction_with_conflict_export(
+            &project_path,
+            &transaction_id,
+            &expected_plan_id,
+            &selected_paths,
+            std::path::Path::new(&export_root),
+            core::ApplyOptions { yes: confirmed },
+        )
+        .map(|result| json!(result))
+        .map_err(to_app_error)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn quarantine_transaction(
     state: tauri::State<'_, OperationState>,
     project_path: String,
@@ -787,6 +831,8 @@ pub fn run() {
             apply_gc,
             list_transactions,
             recover_transactions,
+            analyze_transaction_recovery_conflicts,
+            recover_transaction_with_conflict_export,
             quarantine_transaction,
             analyze_transaction_cleanup,
             cleanup_journals,

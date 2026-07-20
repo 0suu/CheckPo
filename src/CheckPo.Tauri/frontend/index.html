@@ -87,11 +87,16 @@
           </section>
 
           <section class="pending-banner" id="pendingTransactionBanner" hidden>
-            <div>
+            <div class="pending-banner-copy">
               <strong data-i18n="pendingTransactionTitle">Interrupted rollback detected</strong>
               <span id="pendingTransactionText">Recover the interrupted rollback before changing this project.</span>
+              <section class="recovery-guidance" id="recoveryGuidance" aria-live="polite" hidden>
+                <p id="recoveryFailureReason"></p>
+              </section>
             </div>
-            <button class="button danger-secondary" id="recoverTransactionsButton" type="button" data-i18n="recoverTransactions">Recover</button>
+            <div class="pending-banner-actions" id="pendingTransactionActions">
+              <button class="button danger-secondary" id="recoverTransactionsButton" type="button" data-i18n="recoverTransactions">Recover</button>
+            </div>
           </section>
 
           <section class="error-banner" id="errorBanner" role="alert" aria-live="assertive" hidden>
@@ -392,6 +397,7 @@
         <section class="rollback-zone">
           <div class="danger-band">
             <h2 data-i18n="rollbackTitle">Rollback modifies the current Unity project</h2>
+            <p data-i18n="rollbackAuthoritativeDescription">Changes saved by Unity during restore are overwritten with the selected checkpoint.</p>
             <p id="rollbackSummary" data-i18n="rollbackEmpty">Preview rollback before applying it.</p>
             <p class="dialog-error" id="rollbackError" role="alert" hidden></p>
             <ul id="rollbackWarnings"></ul>
@@ -407,6 +413,47 @@
           </div>
           <div class="operation-list" id="rollbackOperations"></div>
         </section>
+      </section>
+    </div>
+
+    <div class="recovery-conflict-overlay" id="recoveryConflictOverlay" hidden>
+      <section class="recovery-conflict-dialog" role="dialog" aria-modal="true" aria-labelledby="recoveryConflictTitle">
+        <header class="recovery-conflict-header">
+          <div>
+            <p class="eyebrow">中断された作業の復旧</p>
+            <h2 id="recoveryConflictTitle">残したいファイルを選ぶ</h2>
+          </div>
+          <button class="ghost-button" id="closeRecoveryConflictButton" type="button">閉じる</button>
+        </header>
+
+        <p>先にUnityを閉じてください。選んだファイルを別の場所へ保存してから、プロジェクトを復旧前の状態に戻します。</p>
+        <p class="dialog-status" id="recoveryConflictStatus" role="status" aria-live="polite" hidden></p>
+
+        <label class="recovery-select-all">
+          <input id="recoverySelectAll" type="checkbox" checked />
+          <span>すべて選択</span>
+          <strong id="recoverySelectionSummary"></strong>
+        </label>
+        <div class="recovery-conflict-list" id="recoveryConflictList"></div>
+
+        <label class="field">
+          <span>保存先</span>
+          <span class="field-with-button">
+            <input id="recoveryExportRoot" type="text" readonly placeholder="保存先フォルダーを選んでください" />
+            <button class="icon-button square-icon-button field-folder-button" id="pickRecoveryExportRootButton" type="button" aria-label="保存先フォルダーを選ぶ" title="保存先フォルダーを選ぶ">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M3.5 6.5h6l2 2h9v9.5a2 2 0 0 1-2 2h-15a2 2 0 0 1-2-2v-9.5a2 2 0 0 1 2-2Z" />
+                <path d="M3.5 8.5h17" />
+              </svg>
+            </button>
+          </span>
+        </label>
+
+        <p class="recovery-selection-warning" id="recoverySelectionWarning" hidden></p>
+        <div class="dialog-actions recovery-conflict-actions">
+          <button class="button" id="cancelRecoveryConflictButton" type="button">キャンセル</button>
+          <button class="button primary" id="applyRecoveryConflictButton" type="button" disabled>選んだファイルを保存して復旧</button>
+        </div>
       </section>
     </div>
 
