@@ -125,6 +125,9 @@ checkpo storage gc apply <project-path> --expected-plan gc-plan.json --yes [--js
 checkpo storage set-root <project-path> --storage-root <path> --yes [--json]
 checkpo transactions list <project-path> [--json]
 checkpo transactions recover <project-path> [--json]
+checkpo transactions conflicts analyze <project-path> <transaction-id> [--json]
+checkpo transactions conflicts apply <project-path> <transaction-id> --expected-plan <plan.json> --path <relative-path> --export-root <directory> --yes [--json]
+checkpo transactions conflicts apply <project-path> <transaction-id> --expected-plan <plan.json> --without-export --yes [--json]
 checkpo transactions quarantine <project-path> <transaction-id> --yes [--json]
 checkpo maintenance cleanup-journals analyze <project-path> --json > cleanup-plan.json
 checkpo maintenance cleanup-journals apply <project-path> --expected-plan cleanup-plan.json --yes [--json]

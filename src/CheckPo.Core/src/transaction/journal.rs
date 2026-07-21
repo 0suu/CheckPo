@@ -273,6 +273,7 @@ fn transaction_cleanup_plan_for_project(
         validate_transaction_journal_identity(&entry.path(), &journal)?;
         if journal_state_is_terminal(journal.state) {
             candidates.push(transaction_cleanup_candidate(
+                project,
                 &entry.path(),
                 &journal_path,
                 &journal,
@@ -334,7 +335,7 @@ fn apply_transaction_cleanup_plan(
     let dir = journals_dir(&project.repo_root);
     let trash_dir = transaction_cleanup_trash_dir(&project.repo_root);
     let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
-    let mut active_roots = Vec::new();
+    let mut active_roots: Vec<(PathBuf, String)> = Vec::new();
     let mut trash_roots = Vec::new();
     for expected_candidate in &plan.candidates {
         let root = match expected_candidate.location.as_str() {
@@ -358,7 +359,7 @@ fn apply_transaction_cleanup_plan(
             let journal_path = root.join("journal.json");
             let journal = read_transaction_journal(&journal_path)?;
             validate_transaction_journal_identity(&root, &journal)?;
-            transaction_cleanup_candidate(&root, &journal_path, &journal)?
+            transaction_cleanup_candidate(project, &root, &journal_path, &journal)?
         } else {
             cleanup_trash_candidate(&root)?
         };
@@ -368,7 +369,7 @@ fn apply_transaction_cleanup_plan(
             ));
         }
         if expected_candidate.location == CLEANUP_LOCATION_ACTIVE {
-            active_roots.push(root);
+            active_roots.push((root, expected_candidate.transaction_id.clone()));
         } else {
             trash_roots.push(root);
         }
@@ -385,7 +386,32 @@ fn apply_transaction_cleanup_plan(
             CheckPoError::Corruption("transaction cleanup batch escaped repository".into())
         })?;
         ensure_anchored_directory(&anchored_repo, batch_relative)?;
-        for source in &active_roots {
+        for (source, transaction_id) in &active_roots {
+            let rescue_root = project
+                .repo_root
+                .join("recovery-rescues")
+                .join(transaction_id);
+            match fs::symlink_metadata(&rescue_root) {
+                Ok(metadata)
+                    if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) =>
+                {
+                    let rescue_destination = batch_root.join(format!("rescue-{transaction_id}"));
+                    move_repo_directory_anchored(
+                        &anchored_repo,
+                        &project.repo_root,
+                        &rescue_root,
+                        &rescue_destination,
+                    )?;
+                }
+                Ok(_) => {
+                    return Err(CheckPoError::Corruption(format!(
+                        "transaction rescue cleanup target is unsafe: {}",
+                        rescue_root.display()
+                    )))
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(crate::io_error(&rescue_root, error)),
+            }
             let file_name = source.file_name().ok_or_else(|| {
                 CheckPoError::Corruption("transaction cleanup target has no name".into())
             })?;
@@ -473,6 +499,7 @@ fn remove_repo_tree_anchored(
 }
 
 fn transaction_cleanup_candidate(
+    project: &ProjectContext,
     tx_root: &Path,
     journal_path: &Path,
     journal: &TransactionJournal,
@@ -480,7 +507,25 @@ fn transaction_cleanup_candidate(
     let journal_bytes =
         fs::read(journal_path).map_err(|error| crate::io_error(journal_path, error))?;
     let journal_digest = blake3::hash(&journal_bytes).to_hex().to_string();
-    let (file_count, size_bytes, tree_metadata_digest) = transaction_tree_metadata(tx_root)?;
+    let (journal_file_count, journal_size_bytes, journal_tree_digest) =
+        transaction_tree_metadata(tx_root)?;
+    let rescue_root = project
+        .repo_root
+        .join("recovery-rescues")
+        .join(&journal.transaction_id);
+    let (rescue_file_count, rescue_size_bytes, rescue_tree_digest) =
+        optional_transaction_tree_metadata(&rescue_root)?;
+    let file_count = journal_file_count
+        .checked_add(rescue_file_count)
+        .ok_or_else(|| CheckPoError::Corruption("transaction file count overflow".into()))?;
+    let size_bytes = journal_size_bytes
+        .checked_add(rescue_size_bytes)
+        .ok_or_else(|| CheckPoError::Corruption("transaction payload size overflow".into()))?;
+    let mut tree_hasher = blake3::Hasher::new();
+    tree_hasher.update(b"checkpo-transaction-cleanup-bundle-v1\0");
+    tree_hasher.update(journal_tree_digest.as_bytes());
+    tree_hasher.update(rescue_tree_digest.as_bytes());
+    let tree_metadata_digest = tree_hasher.finalize().to_hex().to_string();
     let state = match journal.state {
         JournalState::CommittedTarget => "committedTarget",
         JournalState::RolledBack => "rolledBack",
@@ -502,6 +547,22 @@ fn transaction_cleanup_candidate(
         size_bytes,
         tree_metadata_digest,
     })
+}
+
+fn optional_transaction_tree_metadata(root: &Path) -> Result<(usize, u64, String)> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            Ok((0, 0, blake3::hash(b"missing").to_hex().to_string()))
+        }
+        Err(error) => Err(crate::io_error(root, error)),
+        Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {
+            transaction_tree_metadata(root)
+        }
+        Ok(_) => Err(CheckPoError::Corruption(format!(
+            "transaction rescue payload is unsafe: {}",
+            root.display()
+        ))),
+    }
 }
 
 fn cleanup_trash_candidate(root: &Path) -> Result<TransactionCleanupCandidate> {

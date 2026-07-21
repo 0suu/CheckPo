@@ -957,6 +957,8 @@ fn project_snapshot(project_path: String) -> AppResult {
                 "logicalSizeBytes": storage.logical_size_bytes,
                 "storedSizeBytes": Value::Null,
                 "uniqueBlobCount": storage.unique_blob_count,
+                "recoveryRescueFileCount": Value::Null,
+                "recoveryRescueBytes": Value::Null,
             })),
             Err(core::CheckPoError::IndexUnavailable(detail)) => {
                 checkpoint_index = core::CheckpointIndexStatus {

@@ -28,6 +28,7 @@ pub(super) enum TransactionFaultPoint {
     StagedPayloadCleanupBefore,
     StagedPayloadCleanupAfter,
     OperationsAppliedBeforeCommit,
+    TargetVerificationCompleteBeforeCommit,
 }
 
 pub(super) type TransactionFaultHook<'a> = Option<&'a dyn Fn(TransactionFaultPoint) -> Result<()>>;
@@ -110,6 +111,7 @@ fn apply_plan_authoritative(
     cancellation: Option<&CancellationToken>,
     resolve_quarantines_for: Option<&SnapshotId>,
 ) -> Result<ApplyResult> {
+    super::unity_guard::ensure_unity_editor_is_closed(project)?;
     let result_plan = plan.clone();
     match apply_plan_once(
         project,
@@ -123,7 +125,7 @@ fn apply_plan_authoritative(
     ) {
         Ok(result) => Ok(result),
         Err(apply_error) => {
-            let Some((transaction_id, journal_path)) =
+            let Some((transaction_id, journal_path, effective_plan)) =
                 super::recovery::resume_complete_to_target_after_apply_error(
                     project,
                     &result_plan.checkpoint_id,
@@ -151,8 +153,10 @@ fn apply_plan_authoritative(
             }
             report_operation_progress(progress, "complete", 1, 1, None);
             Ok(ApplyResult {
-                checkpoint_id: result_plan.checkpoint_id.clone(),
-                plan: result_plan,
+                checkpoint_id: effective_plan.checkpoint_id.clone(),
+                plan: effective_plan,
+                confirmed_plan: Some(result_plan),
+                initial_apply_error: Some(apply_error.to_string()),
                 applied: true,
                 transaction_id: Some(transaction_id),
                 journal_path: Some(journal_path),
@@ -201,6 +205,8 @@ fn apply_plan_once(
         return Ok(ApplyResult {
             checkpoint_id: plan.checkpoint_id.clone(),
             plan,
+            confirmed_plan: None,
+            initial_apply_error: None,
             applied: false,
             transaction_id: None,
             journal_path: None,
@@ -607,22 +613,22 @@ fn apply_plan_once(
         journal.state = JournalState::VerifyingTarget;
         journal.updated_at_utc = crate::now_utc_string();
         write_journal(&journal_path, &journal)?;
-        for pass in 0..2 {
-            let remaining = super::plan::build_plan(
-                project,
-                journal.checkpoint_id.clone(),
-                journal.kind,
-                journal.selected_paths.as_deref(),
-            )?;
-            if !remaining.warnings.is_empty() || remaining.has_changes {
-                return Err(CheckPoError::WorkingTreeChanged(
-                    "Unity project changed while the checkpoint was being applied".to_string(),
-                ));
-            }
-            if pass == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
+        super::unity_guard::verify_target_is_stable(
+            project,
+            &journal.checkpoint_id,
+            journal.kind,
+            journal.selected_paths.as_deref(),
+        )?;
+        inject_transaction_fault(
+            fault_hook,
+            TransactionFaultPoint::TargetVerificationCompleteBeforeCommit,
+        )?;
+        super::unity_guard::verify_target_once(
+            project,
+            &journal.checkpoint_id,
+            journal.kind,
+            journal.selected_paths.as_deref(),
+        )?;
     }
     journal.state = match intent {
         TransactionIntent::CompleteToTarget => JournalState::CommittedTarget,
@@ -647,6 +653,8 @@ fn apply_plan_once(
     Ok(ApplyResult {
         checkpoint_id: plan.checkpoint_id.clone(),
         plan,
+        confirmed_plan: None,
+        initial_apply_error: None,
         applied: true,
         transaction_id: Some(transaction_id),
         journal_path: Some(journal_path),

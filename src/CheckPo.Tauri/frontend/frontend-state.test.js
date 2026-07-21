@@ -766,8 +766,13 @@ test("recovery conflict UI selects files and a destination before applying", () 
   assert.match(indexHtml, /id="recoveryExportRoot"[^>]*readonly/);
   assert.match(indexHtml, /id="pickRecoveryExportRootButton"/);
   assert.match(indexHtml, /id="applyRecoveryConflictButton"[^>]*disabled/);
+  assert.match(indexHtml, /id="applyRecoveryConflictWithoutExportButton"[^>]*disabled/);
+  assert.match(indexHtml, /CheckPo内部へ一時保護/);
   assert.match(appJs, /"analyze_transaction_recovery_conflicts"/);
   assert.match(appJs, /"recover_transaction_with_conflict_export"/);
+  assert.match(appJs, /withoutExport \? \[\] : selectedRecoveryConflictPaths\(\)/);
+  assert.match(appJs, /withoutExport \? "" : \$\("recoveryExportRoot"\)/);
+  assert.match(appJs, /applyRecoveryConflictSelection\(\{ withoutExport: true \}\)/);
   assert.match(appJs, /selectedPaths,/);
   assert.match(appJs, /exportRoot,/);
   assert.match(dialogsJs, /\.recovery-conflict-overlay/);

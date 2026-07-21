@@ -5,6 +5,7 @@ mod project_file_ops;
 mod recovery;
 #[cfg(test)]
 mod tests;
+mod unity_guard;
 
 use crate::{
     load_project_snapshot, report_operation_progress, ApplyOptions, ApplyResult, CancellationToken,

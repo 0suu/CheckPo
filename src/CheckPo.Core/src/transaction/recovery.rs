@@ -9,7 +9,6 @@ const RECOVERY_EXPORT_MANIFEST_FILE: &str = "CheckPo-Recovery.json";
 const RECOVERY_EXPORT_COMPLETE_FILE: &str = "保存が完了しました.txt";
 const TARGET_RECONCILE_MAX_ROUNDS: usize = 5;
 const TARGET_RECONCILE_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(15);
-const TARGET_VERIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -250,7 +249,8 @@ pub(super) fn resume_complete_to_target_after_apply_error(
     project: &ProjectContext,
     checkpoint_id: &SnapshotId,
     kind: OperationPlanKind,
-) -> Result<Option<(String, PathBuf)>> {
+) -> Result<Option<(String, PathBuf, OperationPlan)>> {
+    super::unity_guard::ensure_unity_editor_is_closed(project)?;
     let matching = pending_transactions_for_project(project)?
         .into_iter()
         .find_map(|pending| {
@@ -269,7 +269,9 @@ pub(super) fn resume_complete_to_target_after_apply_error(
         .iter()
         .any(|candidate| candidate == &transaction_id)
     {
-        return Ok(Some((transaction_id, journal_path)));
+        let journal = read_transaction_journal(&journal_path)?;
+        let effective_plan = operation_plan_from_journal(&journal);
+        return Ok(Some((transaction_id, journal_path, effective_plan)));
     }
     let detail = recovered
         .failed_transactions
@@ -280,6 +282,19 @@ pub(super) fn resume_complete_to_target_after_apply_error(
     Err(CheckPoError::WorkingTreeChanged(format!(
         "Unity is still updating the project. Close Unity and continue recovery: {detail}"
     )))
+}
+
+fn operation_plan_from_journal(journal: &TransactionJournal) -> OperationPlan {
+    OperationPlan::new(
+        journal.checkpoint_id.clone(),
+        journal.kind,
+        journal.selected_paths.clone(),
+        journal.operations.clone(),
+    )
+    .with_directory_changes(
+        journal.directories_to_remove.clone(),
+        journal.directories_to_create.clone(),
+    )
 }
 
 pub fn analyze_transaction_recovery_conflicts(
@@ -312,6 +327,7 @@ pub fn recover_transaction_with_conflict_export(
     validate_recovery_conflict_plan_id(expected_plan_id)?;
     let project = crate::load_project(project_path)?;
     crate::ensure_project_location_allows_mutation(&project)?;
+    super::unity_guard::ensure_unity_editor_is_closed(&project)?;
     let _lock =
         crate::acquire_project_repository_lock(&project, "transaction-recovery-conflict-apply")?;
     let plan = analyze_transaction_recovery_conflicts_locked(&project, transaction_id)?;
@@ -771,6 +787,49 @@ fn copy_recovery_conflict_to_export(
     Ok(())
 }
 
+fn ensure_recovery_rescue_capacity(
+    project: &ProjectContext,
+    plan: &TransactionRecoveryConflictPlan,
+) -> Result<()> {
+    let root = project
+        .repo_root
+        .join(recovery_rescue_files_relative_for_transaction(
+            &plan.transaction_id,
+        ));
+    let mut required_bytes = 0_u64;
+    let mut seen = BTreeSet::new();
+    for conflict in plan
+        .conflicts
+        .iter()
+        .filter(|conflict| !conflict.metadata_only)
+    {
+        if !seen.insert(conflict.current_hash.clone()) {
+            continue;
+        }
+        let path = root.join(conflict.current_hash.as_str());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(CheckPoError::Corruption(format!(
+                    "recovery rescue object is unsafe: {}",
+                    path.display()
+                )))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                required_bytes =
+                    required_bytes
+                        .checked_add(conflict.size_bytes)
+                        .ok_or_else(|| {
+                            CheckPoError::Corruption("recovery rescue size overflow".to_string())
+                        })?;
+            }
+            Err(error) => return Err(crate::io_error(&path, error)),
+        }
+    }
+    super::apply::ensure_available_space("checkpoint storage", &project.repo_root, required_bytes)
+}
+
 fn prepare_recovery_conflict_rescue(
     project: &ProjectContext,
     journal: &TransactionJournal,
@@ -784,10 +843,12 @@ fn prepare_recovery_conflict_rescue(
             "recovery transaction changed while preparing rescue data".to_string(),
         ));
     }
+    ensure_recovery_rescue_capacity(project, plan)?;
     let rescue_files_root = project
         .repo_root
-        .join(recovery_rescue_plan_relative(plan))
-        .join("files");
+        .join(recovery_rescue_files_relative_for_transaction(
+            &plan.transaction_id,
+        ));
     let before_paths = journal_before_paths(&journal.operations);
     for conflict in &plan.conflicts {
         verify_recovery_conflict_is_current(project, conflict, &before_paths)?;
@@ -875,13 +936,6 @@ fn verify_recovery_conflict_is_current(
     Ok(())
 }
 
-fn recovery_rescue_plan_relative(plan: &TransactionRecoveryConflictPlan) -> PathBuf {
-    Path::new("recovery-rescues")
-        .join(&plan.transaction_id)
-        .join("records")
-        .join(&plan.plan_id)
-}
-
 fn recovery_rescue_record_relative(record: &RecoveryRescueRecord) -> PathBuf {
     Path::new("recovery-rescues")
         .join(&record.transaction_id)
@@ -890,11 +944,13 @@ fn recovery_rescue_record_relative(record: &RecoveryRescueRecord) -> PathBuf {
 }
 
 fn recovery_rescue_files_relative(record: &RecoveryRescueRecord) -> PathBuf {
+    recovery_rescue_files_relative_for_transaction(&record.transaction_id)
+}
+
+fn recovery_rescue_files_relative_for_transaction(transaction_id: &str) -> PathBuf {
     Path::new("recovery-rescues")
-        .join(&record.transaction_id)
-        .join("records")
-        .join(&record.plan_id)
-        .join("files")
+        .join(transaction_id)
+        .join("objects")
 }
 
 fn recovery_rescue_active_relative(transaction_id: &str) -> PathBuf {
@@ -1168,15 +1224,29 @@ pub fn quarantine_transaction(
                 .to_string(),
         );
     }
-    let preserved_bytes = match dir_size(&tx_root) {
+    let rescue_root = project
+        .repo_root
+        .join("recovery-rescues")
+        .join(transaction_id);
+    let transaction_bytes = match dir_size(&tx_root) {
         Ok(size) => size,
         Err(error) => {
             warnings.push(format!(
-                "Preserved byte count could not be calculated: {error}"
+                "Preserved transaction byte count could not be calculated: {error}"
             ));
             0
         }
     };
+    let rescue_bytes = match optional_regular_directory_size(&rescue_root) {
+        Ok(size) => size,
+        Err(error) => {
+            warnings.push(format!(
+                "Preserved recovery rescue byte count could not be calculated: {error}"
+            ));
+            0
+        }
+    };
+    let preserved_bytes = transaction_bytes.saturating_add(rescue_bytes);
 
     let quarantine_root = project.repo_root.join("quarantined-journals");
     crate::create_dir_all_no_follow(&project.repo_root, &quarantine_root)?;
@@ -1202,6 +1272,13 @@ pub fn quarantine_transaction(
     {
         let _ = remove_repo_file_if_exists_anchored(&project.repo_root, &record_path);
         return Err(error);
+    }
+    if let Err(error) =
+        move_recovery_rescue_into_quarantine(&project, transaction_id, &quarantine_path)
+    {
+        warnings.push(format!(
+            "Recovery rescue data remains in CheckPo storage because it could not be bundled into the quarantine: {error}"
+        ));
     }
 
     crate::diagnostics::log_warning(
@@ -1568,6 +1645,7 @@ fn recover_complete_to_target(
     tx_root: &Path,
     mut journal: TransactionJournal,
 ) -> Result<()> {
+    super::unity_guard::ensure_unity_editor_is_closed(project)?;
     if journal.operations.is_empty() {
         return Err(CheckPoError::Corruption(
             "complete-to-target journal contains no original operations".to_string(),
@@ -1626,29 +1704,30 @@ fn recover_complete_to_target(
             journal.state = JournalState::VerifyingTarget;
             journal.updated_at_utc = crate::now_utc_string();
             write_journal(&pending.journal_path, &journal)?;
-            std::thread::sleep(TARGET_VERIFY_DEBOUNCE);
-            let verified = super::plan::build_plan(
+            match super::unity_guard::verify_target_is_stable(
                 project,
-                journal.checkpoint_id.clone(),
+                &journal.checkpoint_id,
                 journal.kind,
                 journal.selected_paths.as_deref(),
-            )?;
-            if verified.warnings.is_empty() && !verified.has_changes {
-                remove_repository_tree_if_exists(&project.repo_root, &tx_root.join("staged"))?;
-                remove_repository_tree_if_exists(
-                    &project.repo_root,
-                    &tx_root.join("forward-staged"),
-                )?;
-                journal.state = JournalState::CommittedTarget;
-                journal.updated_at_utc = crate::now_utc_string();
-                write_journal(&pending.journal_path, &journal)?;
-                invalidate_operation_fingerprints(project, &journal.operations)?;
-                return Ok(());
+            ) {
+                Ok(()) => {
+                    remove_repository_tree_if_exists(&project.repo_root, &tx_root.join("staged"))?;
+                    remove_repository_tree_if_exists(
+                        &project.repo_root,
+                        &tx_root.join("forward-staged"),
+                    )?;
+                    journal.state = JournalState::CommittedTarget;
+                    journal.updated_at_utc = crate::now_utc_string();
+                    write_journal(&pending.journal_path, &journal)?;
+                    invalidate_operation_fingerprints(project, &journal.operations)?;
+                    return Ok(());
+                }
+                Err(error) if target_reconcile_error_is_retryable(&error) => {
+                    last_retryable_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
-            last_retryable_error = Some(CheckPoError::WorkingTreeChanged(
-                "Unity changed the project during target verification".to_string(),
-            ));
-            continue;
         }
 
         validate_journal_operations(project, &journal.checkpoint_id, &plan.operations)?;
@@ -1739,16 +1818,11 @@ fn apply_target_reconcile_round(
     stage_sync_batch.flush()?;
     anchored_repo.verify_root_binding()?;
 
-    let target_paths = journal
-        .operations
-        .iter()
-        .filter(|operation| operation.after_hash.is_some())
-        .map(|operation| operation.path.clone())
-        .collect::<BTreeSet<_>>();
+    let recovery_scope_paths = journal_before_paths(&journal.operations);
     let mut conflicts = Vec::new();
     for operation in &journal.operations {
         let Some(current) =
-            current_file_state_for_recovery(project, &operation.path, &target_paths)?
+            current_file_state_for_recovery(project, &operation.path, &recovery_scope_paths)?
         else {
             continue;
         };
@@ -1778,7 +1852,8 @@ fn apply_target_reconcile_round(
     let mut project_sync_batch = crate::storage::AnchoredParentSyncBatch::new();
     let mut staged_sync_batch = crate::storage::AnchoredParentSyncBatch::new();
     for operation in target_operations {
-        let current = current_file_state_for_recovery(project, &operation.path, &target_paths)?;
+        let current =
+            current_file_state_for_recovery(project, &operation.path, &recovery_scope_paths)?;
         let matches_target = current.as_ref().is_some_and(|state| {
             operation.after_hash.as_ref() == Some(&state.hash)
                 && operation.after_size_bytes == Some(state.size_bytes)
@@ -2689,6 +2764,16 @@ fn quarantine_unknown_transaction_locked(
         let _ = remove_repo_file_if_exists_anchored(&project.repo_root, &record_path);
         return Err(error);
     }
+    if let Err(error) =
+        move_recovery_rescue_into_quarantine(project, transaction_id, &quarantine_path)
+    {
+        crate::diagnostics::log_warning(
+            "transaction-recovery",
+            &format!(
+                "transaction {transaction_id} was quarantined, but its recovery rescue data remains in CheckPo storage: {error}"
+            ),
+        );
+    }
     crate::diagnostics::log_warning(
         "transaction-recovery",
         &format!(
@@ -2697,6 +2782,47 @@ fn quarantine_unknown_transaction_locked(
         ),
     );
     Ok(quarantine_path)
+}
+
+fn optional_regular_directory_size(path: &Path) -> Result<u64> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(crate::io_error(path, error)),
+        Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {
+            dir_size(path)
+        }
+        Ok(_) => Err(CheckPoError::Corruption(format!(
+            "recovery rescue directory is unsafe: {}",
+            path.display()
+        ))),
+    }
+}
+
+fn move_recovery_rescue_into_quarantine(
+    project: &ProjectContext,
+    transaction_id: &str,
+    quarantine_path: &Path,
+) -> Result<()> {
+    let rescue_root = project
+        .repo_root
+        .join("recovery-rescues")
+        .join(transaction_id);
+    match fs::symlink_metadata(&rescue_root) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(crate::io_error(&rescue_root, error)),
+        Ok(metadata) if metadata.is_dir() && !crate::metadata_is_link_or_reparse(&metadata) => {}
+        Ok(_) => {
+            return Err(CheckPoError::Corruption(format!(
+                "recovery rescue directory is unsafe: {}",
+                rescue_root.display()
+            )))
+        }
+    }
+    move_repo_directory_anchored(
+        &project.repo_root,
+        &rescue_root,
+        &quarantine_path.join("recovery-rescue"),
+    )
 }
 
 fn move_repo_directory_anchored(repo_root: &Path, source: &Path, destination: &Path) -> Result<()> {

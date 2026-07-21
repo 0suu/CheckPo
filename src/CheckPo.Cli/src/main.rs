@@ -1,5 +1,5 @@
 use checkpo_core as core;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -192,6 +192,44 @@ enum TransactionsCommand {
         #[arg(long)]
         yes: bool,
     },
+    Conflicts {
+        #[command(subcommand)]
+        command: TransactionConflictsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TransactionConflictsCommand {
+    Analyze {
+        project_path: PathBuf,
+        transaction_id: String,
+    },
+    Apply(TransactionConflictApplyArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("recovery_mode")
+        .required(true)
+        .args(["paths", "without_export"])
+))]
+struct TransactionConflictApplyArgs {
+    project_path: PathBuf,
+    transaction_id: String,
+    #[arg(long)]
+    expected_plan: PathBuf,
+    #[arg(
+        long = "path",
+        requires = "export_root",
+        conflicts_with = "without_export"
+    )]
+    paths: Vec<String>,
+    #[arg(long, conflicts_with = "without_export")]
+    export_root: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["paths", "export_root"])]
+    without_export: bool,
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -670,7 +708,19 @@ fn run() -> Result<u8, String> {
                 let ok = result.failed_transaction_count == 0;
                 print_or_json(cli.json, &result, || {
                     println!("Recovered: {}", result.recovered_transaction_count);
+                    for transaction_id in &result.recovered_transaction_ids {
+                        println!("  recovered {transaction_id}");
+                    }
                     println!("Failed: {}", result.failed_transaction_count);
+                    for failure in &result.failed_transactions {
+                        println!("  failed {}", failure.transaction_id);
+                        println!("    awaiting Unity close: {}", failure.awaiting_unity);
+                        println!(
+                            "    recovery conflicts: {}",
+                            failure.recovery_conflict_count
+                        );
+                        println!("    error: {}", failure.error);
+                    }
                 })?;
                 return Ok(if ok { 0 } else { 1 });
             }
@@ -697,6 +747,76 @@ fn run() -> Result<u8, String> {
                     }
                 })?;
             }
+            TransactionsCommand::Conflicts { command } => match command {
+                TransactionConflictsCommand::Analyze {
+                    project_path,
+                    transaction_id,
+                } => {
+                    let plan =
+                        core::analyze_transaction_recovery_conflicts(project_path, &transaction_id)
+                            .map_err(to_message)?;
+                    print_or_json(cli.json, &plan, || {
+                        println!("Transaction: {}", plan.transaction_id);
+                        println!("Checkpoint: {}", plan.checkpoint_id);
+                        println!("Plan ID: {}", plan.plan_id);
+                        println!("Conflicts: {}", plan.conflicts.len());
+                        for conflict in &plan.conflicts {
+                            println!(
+                                "  {}  {} bytes  metadata-only={}  {}",
+                                conflict.path,
+                                conflict.size_bytes,
+                                conflict.metadata_only,
+                                conflict.current_hash
+                            );
+                        }
+                    })?;
+                }
+                TransactionConflictsCommand::Apply(args) => {
+                    if !args.yes {
+                        return Err(
+                            "transaction conflict recovery apply requires --yes.".to_string()
+                        );
+                    }
+                    let plan = read_recovery_conflict_plan(&args.expected_plan)?;
+                    if plan.transaction_id != args.transaction_id {
+                        return Err(format!(
+                            "expected plan transaction {} does not match requested transaction {}",
+                            plan.transaction_id, args.transaction_id
+                        ));
+                    }
+                    let selected_paths = if args.without_export {
+                        Vec::new()
+                    } else {
+                        core::parse_tracked_paths(&args.paths).map_err(to_message)?
+                    };
+                    let export_root = args.export_root.unwrap_or_default();
+                    let result = core::recover_transaction_with_conflict_export(
+                        args.project_path,
+                        &args.transaction_id,
+                        &plan.plan_id,
+                        &selected_paths,
+                        &export_root,
+                        core::ApplyOptions { yes: args.yes },
+                    )
+                    .map_err(to_message)?;
+                    print_or_json(cli.json, &result, || {
+                        println!("Recovered transaction: {}", result.transaction_id);
+                        if let Some(export_directory) = &result.export_directory {
+                            println!("Export directory: {}", export_directory.display());
+                        } else {
+                            println!("Export directory: none");
+                        }
+                        println!("Exported paths: {}", result.exported_paths.len());
+                        for path in &result.exported_paths {
+                            println!("  exported {path}");
+                        }
+                        println!(
+                            "Restored without external export: {}",
+                            result.restored_without_export_count
+                        );
+                    })?;
+                }
+            },
         },
         Command::Maintenance { command } => match command {
             MaintenanceCommand::CleanupJournals { command } => match command {
@@ -849,6 +969,32 @@ fn read_storage_gc_plan(path: &PathBuf) -> Result<core::StorageGcPlan, String> {
         ));
     }
     validate_maintenance_plan_id(&plan.plan_id)?;
+    Ok(plan)
+}
+
+fn read_recovery_conflict_plan(
+    path: &PathBuf,
+) -> Result<core::TransactionRecoveryConflictPlan, String> {
+    let plan = read_json_file::<core::TransactionRecoveryConflictPlan>(path)?;
+    if plan.schema_version != core::TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported transaction recovery conflict plan schema version {}; expected {}",
+            plan.schema_version,
+            core::TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION
+        ));
+    }
+    validate_maintenance_plan_id(&plan.plan_id)?;
+    if plan.transaction_id.len() != 32
+        || !plan
+            .transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(
+            "transaction recovery plan transactionId must be a 32 character lowercase hexadecimal value"
+                .to_string(),
+        );
+    }
     Ok(plan)
 }
 
@@ -1119,6 +1265,117 @@ mod tests {
         assert!(validate_maintenance_plan_id(&"A".repeat(64)).is_err());
         assert!(validate_maintenance_plan_id(&"a".repeat(63)).is_err());
         assert!(validate_maintenance_plan_id(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn transaction_conflict_analyze_parses_transaction_id() {
+        let cli = Cli::try_parse_from([
+            "checkpo",
+            "transactions",
+            "conflicts",
+            "analyze",
+            "project",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .unwrap();
+
+        let Command::Transactions {
+            command:
+                TransactionsCommand::Conflicts {
+                    command: TransactionConflictsCommand::Analyze { transaction_id, .. },
+                },
+        } = cli.command
+        else {
+            panic!("expected transaction conflicts analyze command");
+        };
+        assert_eq!(transaction_id, "0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn transaction_conflict_apply_supports_export_or_explicit_no_export() {
+        let exported = Cli::try_parse_from([
+            "checkpo",
+            "transactions",
+            "conflicts",
+            "apply",
+            "project",
+            "0123456789abcdef0123456789abcdef",
+            "--expected-plan",
+            "conflict-plan.json",
+            "--path",
+            "Assets/Foo.prefab",
+            "--export-root",
+            "exported",
+            "--yes",
+        ])
+        .unwrap();
+        let Command::Transactions {
+            command:
+                TransactionsCommand::Conflicts {
+                    command: TransactionConflictsCommand::Apply(exported),
+                },
+        } = exported.command
+        else {
+            panic!("expected transaction conflicts apply command");
+        };
+        assert_eq!(exported.paths, vec!["Assets/Foo.prefab"]);
+        assert_eq!(exported.export_root, Some(PathBuf::from("exported")));
+        assert!(!exported.without_export);
+        assert!(exported.yes);
+
+        let no_export = Cli::try_parse_from([
+            "checkpo",
+            "transactions",
+            "conflicts",
+            "apply",
+            "project",
+            "0123456789abcdef0123456789abcdef",
+            "--expected-plan",
+            "conflict-plan.json",
+            "--without-export",
+            "--yes",
+        ])
+        .unwrap();
+        let Command::Transactions {
+            command:
+                TransactionsCommand::Conflicts {
+                    command: TransactionConflictsCommand::Apply(no_export),
+                },
+        } = no_export.command
+        else {
+            panic!("expected transaction conflicts apply command");
+        };
+        assert!(no_export.paths.is_empty());
+        assert!(no_export.export_root.is_none());
+        assert!(no_export.without_export);
+
+        assert!(Cli::try_parse_from([
+            "checkpo",
+            "transactions",
+            "conflicts",
+            "apply",
+            "project",
+            "0123456789abcdef0123456789abcdef",
+            "--expected-plan",
+            "conflict-plan.json",
+            "--yes",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "checkpo",
+            "transactions",
+            "conflicts",
+            "apply",
+            "project",
+            "0123456789abcdef0123456789abcdef",
+            "--expected-plan",
+            "conflict-plan.json",
+            "--path",
+            "Assets/Foo.prefab",
+            "--without-export",
+            "--yes",
+        ])
+        .is_err());
     }
 
     #[test]

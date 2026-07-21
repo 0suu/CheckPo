@@ -461,6 +461,10 @@ pub struct ApplyOptions {
 pub struct ApplyResult {
     pub checkpoint_id: SnapshotId,
     pub plan: OperationPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_plan: Option<OperationPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_apply_error: Option<String>,
     pub applied: bool,
     pub transaction_id: Option<String>,
     pub journal_path: Option<PathBuf>,
@@ -491,6 +495,10 @@ pub struct StorageSummary {
     pub unique_blob_count: usize,
     pub logical_size_bytes: u64,
     pub stored_size_bytes: u64,
+    #[serde(default)]
+    pub recovery_rescue_file_count: usize,
+    #[serde(default)]
+    pub recovery_rescue_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

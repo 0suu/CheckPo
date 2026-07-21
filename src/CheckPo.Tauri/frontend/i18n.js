@@ -84,7 +84,7 @@ const messages = {
     openOrStartProject: "このプロジェクトを使う",
     rollback: "この状態に戻す",
     rollbackTitle: "今の Unity プロジェクトを、選んだチェックポイントの状態に戻します",
-    rollbackAuthoritativeDescription: "復元中にUnityが保存した変更も、選んだチェックポイントの内容で上書きします。上書き前の内容はCheckPo内に安全コピーします。",
+    rollbackAuthoritativeDescription: "復元前にUnityを閉じてください。CheckPoは対象状態が安定していることを複数回確認し、競合内容を内部へ一時保護してから選んだチェックポイントへ揃えます。",
     rollbackEmpty: "先に「このチェックポイントに戻す」を押してください。",
     rollbackConfirm: "現在の変更と、復元中に発生した変更も上書きすることを理解しました。",
     applyRollback: "戻す",

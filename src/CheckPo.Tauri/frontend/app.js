@@ -933,6 +933,13 @@ function renderStorage() {
     : formatBytes(state.storage.storedSizeBytes);
   $("uniqueBlobs").textContent = String(state.storage?.uniqueBlobCount ?? "-");
   $("packCount").textContent = "-";
+  if ($("recoveryRescueSize")) {
+    const rescueBytes = state.storage?.recoveryRescueBytes;
+    const rescueFiles = state.storage?.recoveryRescueFileCount;
+    $("recoveryRescueSize").textContent = rescueBytes == null
+      ? "-"
+      : `${formatBytes(rescueBytes)} / ${rescueFiles ?? 0} files`;
+  }
 }
 
 function invalidateStoredSize() {
@@ -1161,7 +1168,7 @@ function updateRecoveryConflictControls() {
   const notSaved = Math.max(0, totalPaths - selectedPaths.length);
   $("recoverySelectionWarning").hidden = notSaved === 0;
   $("recoverySelectionWarning").textContent = notSaved > 0
-    ? `選ばなかった ${notSaved} 個は別フォルダーへ保存せず、復旧前の状態に戻します。`
+    ? `選ばなかった ${notSaved} 個は外部フォルダーへ保存しません。CheckPo内部には一時保護されますが、「復旧用データの片付け」で削除されます。`
     : "";
   updateControls();
 }
@@ -1174,20 +1181,32 @@ function closeRecoveryConflictDialog() {
   updateControls();
 }
 
-async function applyRecoveryConflictSelection() {
+async function applyRecoveryConflictSelection({ withoutExport = false } = {}) {
   const plan = state.recoveryConflictPlan;
-  const selectedPaths = selectedRecoveryConflictPaths();
-  const exportRoot = $("recoveryExportRoot").value.trim();
-  if (!plan || selectedPaths.length === 0 || !exportRoot || state.busy || state.confirming) return;
-  const notSaved = Math.max(0, (plan.conflicts?.length ?? 0) - selectedPaths.length);
+  const selectedPaths = withoutExport ? [] : selectedRecoveryConflictPaths();
+  const exportRoot = withoutExport ? "" : $("recoveryExportRoot").value.trim();
+  if (
+    !plan
+    || (!withoutExport && (selectedPaths.length === 0 || !exportRoot))
+    || state.busy
+    || state.confirming
+  ) return;
+
+  const conflictCount = plan.conflicts?.length ?? 0;
+  const notSaved = withoutExport
+    ? conflictCount
+    : Math.max(0, conflictCount - selectedPaths.length);
   if (notSaved > 0) {
     state.confirming = true;
     updateControls();
     let confirmed = false;
     try {
+      const message = withoutExport
+        ? `競合した ${notSaved} 個を外部フォルダーへ保存せず、復旧前の状態へ戻します。CheckPo内部の一時保護データも、後で「復旧用データの片付け」を実行すると削除されます。続行しますか？`
+        : `選ばなかった ${notSaved} 個の現在の内容は、選択したフォルダーには保存しません。CheckPo内部には一時保護してから復旧前の状態へ戻します。続行しますか？`;
       confirmed = await confirmAction(
-        `選ばなかった ${notSaved} 個の現在の内容は、選択したフォルダーには保存しません。復旧前の状態へ戻してよいですか？`,
-        "保存して復旧",
+        message,
+        withoutExport ? "外部保存せず復旧" : "保存して復旧",
       );
     } finally {
       state.confirming = false;
@@ -1196,7 +1215,10 @@ async function applyRecoveryConflictSelection() {
     if (!confirmed) return;
   }
 
-  const result = await run("選んだファイルを保存して復旧中", async () => {
+  const activity = withoutExport
+    ? "外部保存せず復旧中"
+    : "選んだファイルを保存して復旧中";
+  const result = await run(activity, async () => {
     const recovered = await invokeCommand("recover_transaction_with_conflict_export", {
       projectPath: getProjectPath(),
       transactionId: plan.transactionId,
@@ -1214,9 +1236,15 @@ async function applyRecoveryConflictSelection() {
     if (state.pendingTransactions.length === 0) {
       await refreshLatestDiff({ allowBusy: true });
     }
-    setStatus(
-      `${selectedPaths.length} 個のファイルを保存して復旧しました。保存先: ${recovered.exportDirectory}`,
-    );
+    if (withoutExport) {
+      setStatus(
+        `${recovered.restoredWithoutExportCount ?? conflictCount} 個を外部保存せず復旧しました。CheckPo内部の一時保護データは「復旧用データの片付け」まで保持されます。`,
+      );
+    } else {
+      setStatus(
+        `${selectedPaths.length} 個のファイルを保存して復旧しました。保存先: ${recovered.exportDirectory}`,
+      );
+    }
     setResult(recovered);
     return recovered;
   });
@@ -2342,6 +2370,12 @@ function updateControls() {
         || !$("recoveryExportRoot").value.trim();
       return;
     }
+    if (button.id === "applyRecoveryConflictWithoutExportButton") {
+      button.disabled = controlsBlocked
+        || locationMutationBlocked
+        || !state.recoveryConflictPlan;
+      return;
+    }
     if ([
       "recoverTransactionsButton",
       "quarantineTransactionButton",
@@ -2642,6 +2676,9 @@ function bindEvents() {
     updateRecoveryConflictControls();
   });
   $("applyRecoveryConflictButton").addEventListener("click", applyRecoveryConflictSelection);
+  $("applyRecoveryConflictWithoutExportButton").addEventListener("click", () => {
+    applyRecoveryConflictSelection({ withoutExport: true });
+  });
   $("dismissStatusButton").addEventListener("click", () => {
     $("statusBanner").hidden = true;
     $("statusBannerText").textContent = "";

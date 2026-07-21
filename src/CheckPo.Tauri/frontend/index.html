@@ -146,6 +146,7 @@
 
           <footer class="status-bar">
             <span data-i18n-title="referencedStorageDescription">📌 <strong id="checkpointCount">0</strong> CP · <span data-i18n="referencedStorage">使用中の保存データ</span> <strong id="storedSize">-</strong></span>
+            <span>🛟 復旧保護データ <strong id="recoveryRescueSize">-</strong></span>
             <span class="status-path">📂 <strong id="projectStatusPath">-</strong></span>
             <span class="auto-refresh-status" id="autoRefreshStatus" hidden>
               <span class="activity-dot" aria-hidden="true"></span>
@@ -397,7 +398,7 @@
         <section class="rollback-zone">
           <div class="danger-band">
             <h2 data-i18n="rollbackTitle">Rollback modifies the current Unity project</h2>
-            <p data-i18n="rollbackAuthoritativeDescription">Changes saved by Unity during restore are overwritten with the selected checkpoint.</p>
+            <p data-i18n="rollbackAuthoritativeDescription">Close Unity before restoring. CheckPo verifies the target is stable and temporarily protects conflicting content before applying the selected checkpoint.</p>
             <p id="rollbackSummary" data-i18n="rollbackEmpty">Preview rollback before applying it.</p>
             <p class="dialog-error" id="rollbackError" role="alert" hidden></p>
             <ul id="rollbackWarnings"></ul>
@@ -426,7 +427,7 @@
           <button class="ghost-button" id="closeRecoveryConflictButton" type="button">閉じる</button>
         </header>
 
-        <p>先にUnityを閉じてください。選んだファイルを別の場所へ保存してから、プロジェクトを復旧前の状態に戻します。</p>
+        <p>先にUnityを閉じてください。選んだファイルは別の場所へ保存できます。すべての競合内容は復旧前にCheckPo内部へ一時保護されますが、「復旧用データの片付け」で削除されます。</p>
         <p class="dialog-status" id="recoveryConflictStatus" role="status" aria-live="polite" hidden></p>
 
         <label class="recovery-select-all">
@@ -452,6 +453,7 @@
         <p class="recovery-selection-warning" id="recoverySelectionWarning" hidden></p>
         <div class="dialog-actions recovery-conflict-actions">
           <button class="button" id="cancelRecoveryConflictButton" type="button">キャンセル</button>
+          <button class="button danger-secondary" id="applyRecoveryConflictWithoutExportButton" type="button" disabled>外部保存せず復旧</button>
           <button class="button primary" id="applyRecoveryConflictButton" type="button" disabled>選んだファイルを保存して復旧</button>
         </div>
       </section>
