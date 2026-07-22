@@ -1104,7 +1104,7 @@ async function openRecoveryConflictDialog(event) {
   ));
   if (!plan) return;
   if (!Array.isArray(plan.conflicts) || plan.conflicts.length === 0) {
-    setStatus("変更されたファイルはありません。もう一度「復旧する」を押してください。");
+    setStatus(t("recoveryConflictNoChanges"));
     return;
   }
   state.recoveryConflictPlan = plan;
@@ -1164,11 +1164,14 @@ function updateRecoveryConflictControls() {
   const totalPaths = state.recoveryConflictPlan?.conflicts?.length ?? 0;
   $("recoverySelectAll").checked = checkboxes.length > 0 && selectedGroups === checkboxes.length;
   $("recoverySelectAll").indeterminate = selectedGroups > 0 && selectedGroups < checkboxes.length;
-  $("recoverySelectionSummary").textContent = `${selectedGroups} / ${checkboxes.length} 個を保存`;
+  $("recoverySelectionSummary").textContent = tf("recoveryConflictSelectionSummary", {
+    selected: selectedGroups,
+    total: checkboxes.length,
+  });
   const notSaved = Math.max(0, totalPaths - selectedPaths.length);
   $("recoverySelectionWarning").hidden = notSaved === 0;
   $("recoverySelectionWarning").textContent = notSaved > 0
-    ? `選ばなかった ${notSaved} 個は外部フォルダーへ保存しません。CheckPo内部には一時保護されますが、「復旧用データの片付け」で削除されます。`
+    ? tf("recoveryConflictNotSavedWarning", { count: notSaved })
     : "";
   updateControls();
 }
@@ -1202,11 +1205,13 @@ async function applyRecoveryConflictSelection({ withoutExport = false } = {}) {
     let confirmed = false;
     try {
       const message = withoutExport
-        ? `競合した ${notSaved} 個を外部フォルダーへ保存せず、復旧前の状態へ戻します。CheckPo内部の一時保護データも、後で「復旧用データの片付け」を実行すると削除されます。続行しますか？`
-        : `選ばなかった ${notSaved} 個の現在の内容は、選択したフォルダーには保存しません。CheckPo内部には一時保護してから復旧前の状態へ戻します。続行しますか？`;
+        ? tf("recoveryConflictConfirmWithoutExport", { count: notSaved })
+        : tf("recoveryConflictConfirmPartialExport", { count: notSaved });
       confirmed = await confirmAction(
         message,
-        withoutExport ? "外部保存せず復旧" : "保存して復旧",
+        t(withoutExport
+          ? "recoveryConflictApplyWithoutExport"
+          : "recoveryConflictApplyWithExport"),
       );
     } finally {
       state.confirming = false;
@@ -1216,8 +1221,8 @@ async function applyRecoveryConflictSelection({ withoutExport = false } = {}) {
   }
 
   const activity = withoutExport
-    ? "外部保存せず復旧中"
-    : "選んだファイルを保存して復旧中";
+    ? t("recoveryConflictApplyingWithoutExport")
+    : t("recoveryConflictApplyingWithExport");
   const result = await run(activity, async () => {
     const recovered = await invokeCommand("recover_transaction_with_conflict_export", {
       projectPath: getProjectPath(),
@@ -1231,18 +1236,23 @@ async function applyRecoveryConflictSelection({ withoutExport = false } = {}) {
       .filter((item) => item.transactionId !== plan.transactionId);
     state.recoveryConflictPlan = null;
     $("recoveryConflictOverlay").hidden = true;
-    setBusyIndeterminate("再読み込み中");
+    setBusyIndeterminate(t("recoveryConflictRefreshing"));
     await refreshProject();
     if (state.pendingTransactions.length === 0) {
       await refreshLatestDiff({ allowBusy: true });
     }
     if (withoutExport) {
       setStatus(
-        `${recovered.restoredWithoutExportCount ?? conflictCount} 個を外部保存せず復旧しました。CheckPo内部の一時保護データは「復旧用データの片付け」まで保持されます。`,
+        tf("recoveryConflictRecoveredWithoutExport", {
+          count: recovered.restoredWithoutExportCount ?? conflictCount,
+        }),
       );
     } else {
       setStatus(
-        `${selectedPaths.length} 個のファイルを保存して復旧しました。保存先: ${recovered.exportDirectory}`,
+        tf("recoveryConflictRecoveredWithExport", {
+          count: selectedPaths.length,
+          path: recovered.exportDirectory,
+        }),
       );
     }
     setResult(recovered);
@@ -1289,7 +1299,7 @@ function recoverySummary(result) {
     const canSelectFiles = failures.length > 0
       && failures.every((failure) => Number(failure?.recoveryConflictCount || 0) > 0);
     const detail = canSelectFiles
-      ? "。保存するファイルと保存先を選んで復旧できます"
+      ? t("recoveryConflictSelectionGuidance")
       : "。上の案内を確認してください";
     return tf("recoveryFailed", { recovered, failed, detail });
   }
@@ -2670,7 +2680,7 @@ function bindEvents() {
     updateRecoveryConflictControls();
   });
   $("pickRecoveryExportRootButton").addEventListener("click", async () => {
-    const path = await pickFolder("復旧ファイルの保存先");
+    const path = await pickFolder(t("recoveryConflictPickExportRoot"));
     if (!path) return;
     $("recoveryExportRoot").value = path;
     updateRecoveryConflictControls();

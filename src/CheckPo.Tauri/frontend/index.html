@@ -421,27 +421,27 @@
       <section class="recovery-conflict-dialog" role="dialog" aria-modal="true" aria-labelledby="recoveryConflictTitle">
         <header class="recovery-conflict-header">
           <div>
-            <p class="eyebrow">中断された作業の復旧</p>
-            <h2 id="recoveryConflictTitle">残したいファイルを選ぶ</h2>
+            <p class="eyebrow" data-i18n="recoveryConflictEyebrow">中断された作業の復旧</p>
+            <h2 id="recoveryConflictTitle" data-i18n="recoveryConflictTitle">残したいファイルを選ぶ</h2>
           </div>
-          <button class="ghost-button" id="closeRecoveryConflictButton" type="button">閉じる</button>
+          <button class="ghost-button" id="closeRecoveryConflictButton" type="button" data-i18n="close">閉じる</button>
         </header>
 
-        <p>先にUnityを閉じてください。選んだファイルは別の場所へ保存できます。すべての競合内容は復旧前にCheckPo内部へ一時保護されますが、「復旧用データの片付け」で削除されます。</p>
+        <p data-i18n="recoveryConflictDescription">先にUnityを閉じてください。選んだファイルは別の場所へ保存できます。すべての競合内容は復旧前にCheckPo内部へ一時保護されますが、「復旧用データの片付け」で削除されます。</p>
         <p class="dialog-status" id="recoveryConflictStatus" role="status" aria-live="polite" hidden></p>
 
         <label class="recovery-select-all">
           <input id="recoverySelectAll" type="checkbox" checked />
-          <span>すべて選択</span>
+          <span data-i18n="recoveryConflictSelectAll">すべて選択</span>
           <strong id="recoverySelectionSummary"></strong>
         </label>
         <div class="recovery-conflict-list" id="recoveryConflictList"></div>
 
         <label class="field">
-          <span>保存先</span>
+          <span data-i18n="recoveryConflictExportRoot">保存先</span>
           <span class="field-with-button">
-            <input id="recoveryExportRoot" type="text" readonly placeholder="保存先フォルダーを選んでください" />
-            <button class="icon-button square-icon-button field-folder-button" id="pickRecoveryExportRootButton" type="button" aria-label="保存先フォルダーを選ぶ" title="保存先フォルダーを選ぶ">
+            <input id="recoveryExportRoot" type="text" readonly data-i18n-placeholder="recoveryConflictExportRootPlaceholder" placeholder="保存先フォルダーを選んでください" />
+            <button class="icon-button square-icon-button field-folder-button" id="pickRecoveryExportRootButton" type="button" data-i18n-aria-label="recoveryConflictPickExportRoot" data-i18n-title="recoveryConflictPickExportRoot" aria-label="保存先フォルダーを選ぶ" title="保存先フォルダーを選ぶ">
               <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                 <path d="M3.5 6.5h6l2 2h9v9.5a2 2 0 0 1-2 2h-15a2 2 0 0 1-2-2v-9.5a2 2 0 0 1 2-2Z" />
                 <path d="M3.5 8.5h17" />
@@ -452,9 +452,9 @@
 
         <p class="recovery-selection-warning" id="recoverySelectionWarning" hidden></p>
         <div class="dialog-actions recovery-conflict-actions">
-          <button class="button" id="cancelRecoveryConflictButton" type="button">キャンセル</button>
-          <button class="button danger-secondary" id="applyRecoveryConflictWithoutExportButton" type="button" disabled>外部保存せず復旧</button>
-          <button class="button primary" id="applyRecoveryConflictButton" type="button" disabled>選んだファイルを保存して復旧</button>
+          <button class="button" id="cancelRecoveryConflictButton" type="button" data-i18n="recoveryConflictCancel">キャンセル</button>
+          <button class="button danger-secondary" id="applyRecoveryConflictWithoutExportButton" type="button" disabled data-i18n="recoveryConflictApplyWithoutExport">外部保存せず復旧</button>
+          <button class="button primary" id="applyRecoveryConflictButton" type="button" disabled data-i18n="recoveryConflictApplyWithExport">選んだファイルを保存して復旧</button>
         </div>
       </section>
     </div>

@@ -1719,7 +1719,17 @@ fn recover_complete_to_target(
                     journal.state = JournalState::CommittedTarget;
                     journal.updated_at_utc = crate::now_utc_string();
                     write_journal(&pending.journal_path, &journal)?;
-                    invalidate_operation_fingerprints(project, &journal.operations)?;
+                    if let Err(error) =
+                        invalidate_operation_fingerprints(project, &journal.operations)
+                    {
+                        crate::diagnostics::log_warning(
+                            "transaction-recovery",
+                            &format!(
+                                "transaction {} reached its target state, but fingerprint cache invalidation failed; the cache will be rebuilt when needed: {error}",
+                                pending.transaction_id
+                            ),
+                        );
+                    }
                     return Ok(());
                 }
                 Err(error) if target_reconcile_error_is_retryable(&error) => {

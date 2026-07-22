@@ -760,6 +760,7 @@ test("pending transaction errors resync the project so the recovery action becom
 test("recovery conflict UI selects files and a destination before applying", () => {
   const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
   const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  const i18nJs = fs.readFileSync(path.join(__dirname, "i18n.js"), "utf8");
   const dialogsJs = fs.readFileSync(path.join(__dirname, "dialogs.js"), "utf8");
 
   assert.match(indexHtml, /id="recoveryConflictList"/);
@@ -767,7 +768,13 @@ test("recovery conflict UI selects files and a destination before applying", () 
   assert.match(indexHtml, /id="pickRecoveryExportRootButton"/);
   assert.match(indexHtml, /id="applyRecoveryConflictButton"[^>]*disabled/);
   assert.match(indexHtml, /id="applyRecoveryConflictWithoutExportButton"[^>]*disabled/);
-  assert.match(indexHtml, /CheckPo内部へ一時保護/);
+  assert.match(indexHtml, /data-i18n="recoveryConflictDescription"/);
+  assert.match(indexHtml, /data-i18n-placeholder="recoveryConflictExportRootPlaceholder"/);
+  assert.match(indexHtml, /data-i18n-aria-label="recoveryConflictPickExportRoot"/);
+  assert.match(i18nJs, /recoveryConflictDescription: "先にUnityを閉じてください。/);
+  assert.match(i18nJs, /recoveryConflictNotSavedWarning:/);
+  assert.match(appJs, /tf\("recoveryConflictSelectionSummary"/);
+  assert.match(appJs, /t\("recoveryConflictPickExportRoot"\)/);
   assert.match(appJs, /"analyze_transaction_recovery_conflicts"/);
   assert.match(appJs, /"recover_transaction_with_conflict_export"/);
   assert.match(appJs, /withoutExport \? \[\] : selectedRecoveryConflictPaths\(\)/);
