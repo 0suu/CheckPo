@@ -2076,7 +2076,9 @@ function renderProjectHistory() {
     button.setAttribute("aria-selected", String(project.path === state.projectPath));
     button.innerHTML = "<strong></strong><span></span>";
     button.querySelector("strong").textContent = project.name || basename(project.path);
-    button.querySelector("span").textContent = project.path;
+    const pathLabel = button.querySelector("span");
+    pathLabel.textContent = project.path;
+    pathLabel.title = project.path;
     button.addEventListener("click", async () => {
       $("projectSelectionOverlay").hidden = true;
       await run("読み込み中", async () => {
