@@ -295,6 +295,7 @@ pub struct DiffResult {
 
 pub const OPERATION_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const TRANSACTION_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const STORAGE_GC_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
 
@@ -460,6 +461,10 @@ pub struct ApplyOptions {
 pub struct ApplyResult {
     pub checkpoint_id: SnapshotId,
     pub plan: OperationPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_plan: Option<OperationPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_apply_error: Option<String>,
     pub applied: bool,
     pub transaction_id: Option<String>,
     pub journal_path: Option<PathBuf>,
@@ -490,6 +495,10 @@ pub struct StorageSummary {
     pub unique_blob_count: usize,
     pub logical_size_bytes: u64,
     pub stored_size_bytes: u64,
+    #[serde(default)]
+    pub recovery_rescue_file_count: usize,
+    #[serde(default)]
+    pub recovery_rescue_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -618,6 +627,38 @@ pub struct TransactionRecoveryResult {
 pub struct TransactionRecoveryFailure {
     pub transaction_id: String,
     pub error: String,
+    pub recovery_conflict_count: usize,
+    pub awaiting_unity: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransactionRecoveryConflict {
+    pub path: TrackedUnityFilePath,
+    pub current_hash: ObjectId,
+    pub size_bytes: u64,
+    pub modified_at_utc: String,
+    pub metadata_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransactionRecoveryConflictPlan {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub transaction_id: String,
+    pub checkpoint_id: SnapshotId,
+    pub conflicts: Vec<TransactionRecoveryConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionRecoveryConflictResult {
+    pub transaction_id: String,
+    pub recovered: bool,
+    pub export_directory: Option<PathBuf>,
+    pub exported_paths: Vec<TrackedUnityFilePath>,
+    pub restored_without_export_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

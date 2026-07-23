@@ -28,6 +28,7 @@ pub(super) enum TransactionFaultPoint {
     StagedPayloadCleanupBefore,
     StagedPayloadCleanupAfter,
     OperationsAppliedBeforeCommit,
+    TargetVerificationCompleteBeforeCommit,
 }
 
 pub(super) type TransactionFaultHook<'a> = Option<&'a dyn Fn(TransactionFaultPoint) -> Result<()>>;
@@ -39,9 +40,10 @@ pub fn apply_plan(
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ApplyResult> {
-    apply_plan_inner(project, plan, options, progress, cancellation, None)
+    apply_plan_authoritative(project, plan, options, progress, cancellation, None)
 }
 
+#[cfg(test)]
 pub(super) fn apply_plan_inner(
     project: &ProjectContext,
     plan: OperationPlan,
@@ -50,7 +52,7 @@ pub(super) fn apply_plan_inner(
     cancellation: Option<&CancellationToken>,
     fault_hook: TransactionFaultHook<'_>,
 ) -> Result<ApplyResult> {
-    apply_plan_inner_with_quarantine_resolution(
+    apply_plan_once(
         project,
         plan,
         options,
@@ -58,6 +60,28 @@ pub(super) fn apply_plan_inner(
         cancellation,
         fault_hook,
         None,
+        TransactionIntent::RollbackToBefore,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn apply_plan_inner_authoritative(
+    project: &ProjectContext,
+    plan: OperationPlan,
+    options: ApplyOptions,
+    progress: Option<&dyn Fn(OperationProgress)>,
+    cancellation: Option<&CancellationToken>,
+    fault_hook: TransactionFaultHook<'_>,
+) -> Result<ApplyResult> {
+    apply_plan_once(
+        project,
+        plan,
+        options,
+        progress,
+        cancellation,
+        fault_hook,
+        None,
+        TransactionIntent::CompleteToTarget,
     )
 }
 
@@ -69,18 +93,83 @@ pub(crate) fn apply_restore_plan_and_resolve_quarantines(
     cancellation: Option<&CancellationToken>,
     checkpoint_id: &SnapshotId,
 ) -> Result<ApplyResult> {
-    apply_plan_inner_with_quarantine_resolution(
+    apply_plan_authoritative(
+        project,
+        plan,
+        options,
+        progress,
+        cancellation,
+        Some(checkpoint_id),
+    )
+}
+
+fn apply_plan_authoritative(
+    project: &ProjectContext,
+    plan: OperationPlan,
+    options: ApplyOptions,
+    progress: Option<&dyn Fn(OperationProgress)>,
+    cancellation: Option<&CancellationToken>,
+    resolve_quarantines_for: Option<&SnapshotId>,
+) -> Result<ApplyResult> {
+    super::unity_guard::ensure_unity_editor_is_closed(project)?;
+    let result_plan = plan.clone();
+    match apply_plan_once(
         project,
         plan,
         options,
         progress,
         cancellation,
         None,
-        Some(checkpoint_id),
-    )
+        resolve_quarantines_for,
+        TransactionIntent::CompleteToTarget,
+    ) {
+        Ok(result) => Ok(result),
+        Err(apply_error) => {
+            let Some((transaction_id, journal_path, effective_plan)) =
+                super::recovery::resume_complete_to_target_after_apply_error(
+                    project,
+                    &result_plan.checkpoint_id,
+                    result_plan.kind,
+                )?
+            else {
+                return Err(apply_error);
+            };
+            let mut warnings = Vec::new();
+            if let Some(checkpoint_id) = resolve_quarantines_for {
+                let _lock = crate::acquire_project_repository_lock(
+                    project,
+                    "restore-quarantine-resolution-after-target-resume",
+                )?;
+                if let Err(error) =
+                    super::recovery::resolve_unverified_transaction_quarantines_unlocked(
+                        project,
+                        checkpoint_id,
+                    )
+                {
+                    warnings.push(format!(
+                        "restore reached its target, but transaction quarantine resolution remains pending: {error}"
+                    ));
+                }
+            }
+            report_operation_progress(progress, "complete", 1, 1, None);
+            Ok(ApplyResult {
+                checkpoint_id: effective_plan.checkpoint_id.clone(),
+                plan: effective_plan,
+                confirmed_plan: Some(result_plan),
+                initial_apply_error: Some(apply_error.to_string()),
+                applied: true,
+                transaction_id: Some(transaction_id),
+                journal_path: Some(journal_path),
+                warnings,
+            })
+        }
+    }
 }
 
-fn apply_plan_inner_with_quarantine_resolution(
+// Intent and quarantine resolution are separate durable safety decisions and
+// stay explicit at this internal transaction boundary.
+#[allow(clippy::too_many_arguments)]
+fn apply_plan_once(
     project: &ProjectContext,
     plan: OperationPlan,
     options: ApplyOptions,
@@ -88,6 +177,7 @@ fn apply_plan_inner_with_quarantine_resolution(
     cancellation: Option<&CancellationToken>,
     fault_hook: TransactionFaultHook<'_>,
     resolve_quarantines_for: Option<&SnapshotId>,
+    intent: TransactionIntent,
 ) -> Result<ApplyResult> {
     if !options.yes {
         return Err(crate::user_error("apply requires --yes."));
@@ -115,6 +205,8 @@ fn apply_plan_inner_with_quarantine_resolution(
         return Ok(ApplyResult {
             checkpoint_id: plan.checkpoint_id.clone(),
             plan,
+            confirmed_plan: None,
+            initial_apply_error: None,
             applied: false,
             transaction_id: None,
             journal_path: None,
@@ -135,8 +227,10 @@ fn apply_plan_inner_with_quarantine_resolution(
         schema_version: TRANSACTION_JOURNAL_SCHEMA_VERSION,
         transaction_id: transaction_id.clone(),
         state: JournalState::Created,
+        intent,
         checkpoint_id: plan.checkpoint_id.clone(),
         kind: plan.kind,
+        selected_paths: plan.selected_paths.clone(),
         operations: plan.operations.clone(),
         directories_to_remove: plan.directories_to_remove.clone(),
         directories_to_create: plan.directories_to_create.clone(),
@@ -227,14 +321,22 @@ fn apply_plan_inner_with_quarantine_resolution(
         journal.state = JournalState::Staged;
         journal.updated_at_utc = crate::now_utc_string();
         write_journal(&journal_path, &journal)?;
-        recheck_preconditions(project, &plan)?;
+        if intent == TransactionIntent::RollbackToBefore {
+            recheck_preconditions(project, &plan)?;
+        }
         invalidate_operation_fingerprints(project, &plan.operations)?;
-        journal.state = JournalState::Applying;
+        journal.state = match intent {
+            TransactionIntent::CompleteToTarget => JournalState::ApplyingTarget,
+            TransactionIntent::RollbackToBefore => JournalState::Applying,
+        };
         journal.updated_at_utc = crate::now_utc_string();
         write_journal(&journal_path, &journal)
     })();
     if let Err(error) = prepare_result {
-        journal.state = JournalState::Recovered;
+        journal.state = match intent {
+            TransactionIntent::CompleteToTarget => JournalState::RolledBack,
+            TransactionIntent::RollbackToBefore => JournalState::Recovered,
+        };
         journal.updated_at_utc = crate::now_utc_string();
         if let Err(abort_error) = write_journal(&journal_path, &journal) {
             return Err(CheckPoError::Unexpected(format!(
@@ -507,7 +609,31 @@ fn apply_plan_inner_with_quarantine_resolution(
         fault_hook,
         TransactionFaultPoint::OperationsAppliedBeforeCommit,
     )?;
-    journal.state = JournalState::Committed;
+    if intent == TransactionIntent::CompleteToTarget {
+        journal.state = JournalState::VerifyingTarget;
+        journal.updated_at_utc = crate::now_utc_string();
+        write_journal(&journal_path, &journal)?;
+        super::unity_guard::verify_target_is_stable(
+            project,
+            &journal.checkpoint_id,
+            journal.kind,
+            journal.selected_paths.as_deref(),
+        )?;
+        inject_transaction_fault(
+            fault_hook,
+            TransactionFaultPoint::TargetVerificationCompleteBeforeCommit,
+        )?;
+        super::unity_guard::verify_target_once(
+            project,
+            &journal.checkpoint_id,
+            journal.kind,
+            journal.selected_paths.as_deref(),
+        )?;
+    }
+    journal.state = match intent {
+        TransactionIntent::CompleteToTarget => JournalState::CommittedTarget,
+        TransactionIntent::RollbackToBefore => JournalState::Committed,
+    };
     journal.updated_at_utc = crate::now_utc_string();
     write_journal(&journal_path, &journal)?;
     let mut warnings = Vec::new();
@@ -527,6 +653,8 @@ fn apply_plan_inner_with_quarantine_resolution(
     Ok(ApplyResult {
         checkpoint_id: plan.checkpoint_id.clone(),
         plan,
+        confirmed_plan: None,
+        initial_apply_error: None,
         applied: true,
         transaction_id: Some(transaction_id),
         journal_path: Some(journal_path),

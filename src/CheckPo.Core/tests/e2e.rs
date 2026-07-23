@@ -1061,11 +1061,13 @@ fn recovery_rejects_symlink_parent_without_touching_outside_project() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "symlinktx",
             "state": "applying",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "discard",
+            "selectedPaths": null,
             "operations": plan.operations,
             "directoriesToRemove": plan.directories_to_remove,
             "directoriesToCreate": plan.directories_to_create,
@@ -1118,11 +1120,13 @@ fn recovery_rejects_symlink_backup_without_touching_project_file() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "symlinkbackuptx",
             "state": "applying",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "discard",
+            "selectedPaths": null,
             "operations": plan.operations,
             "directoriesToRemove": plan.directories_to_remove,
             "directoriesToCreate": plan.directories_to_create,
@@ -3325,11 +3329,13 @@ fn pending_transaction_blocks_new_mutating_operation_and_cleanup_removes_committ
     fs::write(
         pending.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "pendingtx",
             "state": "staged",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
+            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3347,11 +3353,13 @@ fn pending_transaction_blocks_new_mutating_operation_and_cleanup_removes_committ
     fs::write(
         pending.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "pendingtx",
             "state": "committed",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
+            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3391,11 +3399,13 @@ fn cleanup_removes_completed_journals_even_when_payload_is_not_empty() {
         fs::write(
             journal.join("journal.json"),
             serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "transactionId": transaction_id,
                 "state": state,
+                "intent": "rollbackToBefore",
                 "checkpointId": checkpoint,
                 "kind": "discard",
+                "selectedPaths": null,
                 "operations": [],
                 "directoriesToRemove": [],
                 "directoriesToCreate": [],
@@ -3446,11 +3456,13 @@ fn cleanup_expected_plan_rejects_payload_changes_without_deleting_any_candidate(
     fs::write(
         tx_root.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": transaction_id,
             "state": "committed",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
+            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3713,11 +3725,13 @@ fn recovery_removes_completed_restore_operation() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "restoretx",
             "state": "applying",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
+            "selectedPaths": null,
             "operations": plan.operations,
             "directoriesToRemove": plan.directories_to_remove,
             "directoriesToCreate": plan.directories_to_create,
@@ -3784,14 +3798,14 @@ fn future_journal_with_unknown_state_is_never_treated_as_unreadable_or_deleted()
     fs::create_dir_all(tx.join("staged")).unwrap();
     fs::write(
         tx.join("journal.json"),
-        br#"{"schemaVersion":4,"state":"pausedByNewClient"}"#,
+        br#"{"schemaVersion":5,"state":"pausedByNewClient"}"#,
     )
     .unwrap();
 
     let pending = core::pending_transactions(&project).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].transaction_id, transaction_id);
-    assert_eq!(pending[0].state, "unsupportedSchema:4");
+    assert_eq!(pending[0].state, "unsupportedSchema:5");
 
     let recovery = core::recover_transactions(&project).unwrap();
     assert_eq!(recovery.recovered_transaction_count, 0);
@@ -3804,7 +3818,7 @@ fn future_journal_with_unknown_state_is_never_treated_as_unreadable_or_deleted()
     let cleanup = cleanup_journals_for_test(&project, true).unwrap_err();
     assert!(matches!(
         cleanup,
-        core::CheckPoError::UnsupportedFormat { found: 4, .. }
+        core::CheckPoError::UnsupportedFormat { found: 5, .. }
     ));
     assert!(tx.exists());
     assert_eq!(
@@ -3840,11 +3854,13 @@ fn recovery_rejects_journal_transaction_id_mismatch_without_touching_project() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "differentid",
             "state": "applying",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
+            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3879,11 +3895,13 @@ fn recovery_does_not_restore_untracked_backup_path() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "badtx",
             "state": "applying",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
+            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -5088,11 +5106,13 @@ fn copied_project_blocks_mutating_operations_until_decided() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "transactionId": "copiedtx",
             "state": "created",
+            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
+            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],

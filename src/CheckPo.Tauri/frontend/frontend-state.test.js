@@ -16,6 +16,7 @@ const {
   flattenChangeTreeRows,
   filterCheckpoints,
   gcPlanPresentation,
+  groupRecoveryConflicts,
   isCancellationKind,
   latestDiffState,
   latestDiffCountText,
@@ -37,6 +38,7 @@ const {
   samePathInput,
   selectChangePaths,
   storageSummaryWithRetainedSize,
+  transactionRecoveryGuidance,
   transactionCleanupPlanHasCandidates,
   virtualTreeWindowRange,
   visibleProgressPhase,
@@ -374,7 +376,73 @@ test("structured recovery details are preserved for the detailed result view", (
   );
 
   assert.deepEqual(display.detail, failures);
-  assert.match(display.message, /安全な場所へ退避/);
+  assert.match(display.message, /上の案内/);
+});
+
+test("verified file conflicts offer file selection instead of another retry", () => {
+  const guidance = transactionRecoveryGuidance({
+    error: "working tree changed: Assets/Avatar/Body.psd.meta",
+    recoveryConflictCount: 1,
+  });
+
+  assert.equal(guidance.retryable, false);
+  assert.equal(guidance.canSelectFiles, true);
+  assert.match(guidance.message, /残したいファイルと保存先/);
+});
+
+test("an unclassified working tree change does not offer misleading file selection", () => {
+  const guidance = transactionRecoveryGuidance({
+    error: "working tree changed: Assets",
+    recoveryConflictCount: 0,
+  });
+
+  assert.equal(guidance.canSelectFiles, false);
+});
+
+test("target recovery waiting on Unity offers only continue recovery", () => {
+  const guidance = transactionRecoveryGuidance({
+    error: "working tree changed",
+    recoveryConflictCount: 0,
+    awaitingUnity: true,
+  });
+
+  assert.equal(guidance.retryable, true);
+  assert.equal(guidance.canSelectFiles, false);
+  assert.equal(guidance.canQuarantine, false);
+  assert.match(guidance.message, /Unityを閉じて/);
+});
+
+test("other recovery failures offer one retry before quarantine and full restore", () => {
+  const guidance = transactionRecoveryGuidance({ error: "access denied" });
+
+  assert.equal(guidance.retryable, true);
+  assert.equal(guidance.canSelectFiles, false);
+  assert.match(guidance.message, /access denied/);
+});
+
+test("recovery conflict groups keep an asset and its Unity metadata together", () => {
+  const groups = groupRecoveryConflicts([
+    { path: "Assets/Avatar/Body.psd.meta", sizeBytes: 100 },
+    { path: "Assets/Avatar/Body.psd", sizeBytes: 900 },
+    { path: "Assets/Avatar/Only.mat.meta", sizeBytes: 50 },
+  ]);
+
+  assert.deepEqual(groups, [
+    {
+      id: "Assets/Avatar/Body.psd",
+      label: "Body.psd",
+      detail: "Assets/Avatar/Body.psd と Unity設定",
+      paths: ["Assets/Avatar/Body.psd", "Assets/Avatar/Body.psd.meta"],
+      sizeBytes: 1000,
+    },
+    {
+      id: "Assets/Avatar/Only.mat",
+      label: "Only.mat（Unity設定）",
+      detail: "Assets/Avatar/Only.mat.meta",
+      paths: ["Assets/Avatar/Only.mat.meta"],
+      sizeBytes: 50,
+    },
+  ]);
 });
 
 test("only failures that are still pending remain available for quarantine", () => {
@@ -669,6 +737,52 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
   assert.match(dialogsJs, /\[role='dialog'\]\[tabindex\]/);
   assert.equal(tauriConfig.app.windows[0].minWidth, 480);
   assert.equal(tauriConfig.app.windows[0].minHeight, 560);
+});
+
+test("pending transaction errors resync the project so the recovery action becomes visible", () => {
+  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const helper = appJs.match(
+    /async function syncPendingTransactionsAfterError[\s\S]*?\n}\n/,
+  )?.[0] || "";
+
+  assert.match(helper, /errorKind\(error\) !== "pendingTransaction"/);
+  assert.match(helper, /await refreshProject/);
+  assert.match(
+    appJs,
+    /} catch \(error\) {\n    await syncPendingTransactionsAfterError\(error\);\n    const cancelled/,
+  );
+  assert.match(
+    appJs,
+    /await syncPendingTransactionsAfterError\(error, { fromAutoRefresh: true }\);/,
+  );
+});
+
+test("recovery conflict UI selects files and a destination before applying", () => {
+  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  const i18nJs = fs.readFileSync(path.join(__dirname, "i18n.js"), "utf8");
+  const dialogsJs = fs.readFileSync(path.join(__dirname, "dialogs.js"), "utf8");
+
+  assert.match(indexHtml, /id="recoveryConflictList"/);
+  assert.match(indexHtml, /id="recoveryExportRoot"[^>]*readonly/);
+  assert.match(indexHtml, /id="pickRecoveryExportRootButton"/);
+  assert.match(indexHtml, /id="applyRecoveryConflictButton"[^>]*disabled/);
+  assert.match(indexHtml, /id="applyRecoveryConflictWithoutExportButton"[^>]*disabled/);
+  assert.match(indexHtml, /data-i18n="recoveryConflictDescription"/);
+  assert.match(indexHtml, /data-i18n-placeholder="recoveryConflictExportRootPlaceholder"/);
+  assert.match(indexHtml, /data-i18n-aria-label="recoveryConflictPickExportRoot"/);
+  assert.match(i18nJs, /recoveryConflictDescription: "先にUnityを閉じてください。/);
+  assert.match(i18nJs, /recoveryConflictNotSavedWarning:/);
+  assert.match(appJs, /tf\("recoveryConflictSelectionSummary"/);
+  assert.match(appJs, /t\("recoveryConflictPickExportRoot"\)/);
+  assert.match(appJs, /"analyze_transaction_recovery_conflicts"/);
+  assert.match(appJs, /"recover_transaction_with_conflict_export"/);
+  assert.match(appJs, /withoutExport \? \[\] : selectedRecoveryConflictPaths\(\)/);
+  assert.match(appJs, /withoutExport \? "" : \$\("recoveryExportRoot"\)/);
+  assert.match(appJs, /applyRecoveryConflictSelection\(\{ withoutExport: true \}\)/);
+  assert.match(appJs, /selectedPaths,/);
+  assert.match(appJs, /exportRoot,/);
+  assert.match(dialogsJs, /\.recovery-conflict-overlay/);
 });
 
 test("GUI uses user-facing maintenance and storage reconnect wording", () => {

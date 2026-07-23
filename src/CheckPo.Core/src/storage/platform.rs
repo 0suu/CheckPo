@@ -1,6 +1,11 @@
 use super::*;
 
 #[cfg(unix)]
+fn statvfs_value_to_u64<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
+#[cfg(unix)]
 pub(crate) fn available_space_bytes(path: &Path) -> Result<u64> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -18,8 +23,8 @@ pub(crate) fn available_space_bytes(path: &Path) -> Result<u64> {
         return Err(io_error(path, std::io::Error::last_os_error()));
     }
     let stat = unsafe { stat.assume_init() };
-    let available_blocks = u64::from(stat.f_bavail);
-    let block_size = stat.f_frsize;
+    let available_blocks = statvfs_value_to_u64(stat.f_bavail);
+    let block_size = statvfs_value_to_u64(stat.f_frsize);
     Ok(available_blocks.saturating_mul(block_size))
 }
 

@@ -4,6 +4,7 @@ const MODAL_OVERLAY_SELECTOR = [
   ".project-registration-overlay",
   ".project-selection-overlay",
   ".rollback-overlay",
+  ".recovery-conflict-overlay",
   ".confirm-overlay",
   ".error-overlay",
   ".busy-overlay",
@@ -15,6 +16,7 @@ const MODAL_CLOSE_BUTTON_IDS = Object.freeze({
   projectRegistrationOverlay: "closeProjectRegistrationButton",
   projectSelectionOverlay: "closeProjectSelectionButton",
   rollbackOverlay: "closeRollbackDialogButton",
+  recoveryConflictOverlay: "closeRecoveryConflictButton",
   errorOverlay: "dismissErrorDialogButton",
 });
 

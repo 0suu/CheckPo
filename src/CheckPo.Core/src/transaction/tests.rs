@@ -1838,6 +1838,797 @@ fn recovery_after_fault_after_restore_file_rolls_replace_back_to_before_hash() {
 }
 
 #[test]
+fn authoritative_recovery_overwrites_a_unity_write_after_apply_started() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "checkpoint").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Target", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&file, "working").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    apply_plan_inner_authoritative(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "unity-during-restore").unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint");
+    let rescue_root = context.repo_root.join("recovery-rescues");
+    assert!(walkdir::WalkDir::new(rescue_root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .any(|entry| fs::read(entry.path()).ok().as_deref() == Some(b"unity-during-restore")));
+}
+
+#[test]
+fn authoritative_full_restore_removes_a_new_file_created_after_confirmation() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "checkpoint").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Target", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&file, "working").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    apply_plan_inner_authoritative(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    let created_during_restore = project.join("Assets/Avatar/Generated.asset");
+    fs::write(&created_during_restore, "unity-created").unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint");
+    assert!(!created_during_restore.exists());
+}
+
+#[test]
+fn authoritative_apply_rechecks_after_the_final_stability_window() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "checkpoint").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Target", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&file, "working").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    let error = apply_plan_inner_authoritative(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::TargetVerificationCompleteBeforeCommit {
+                fs::write(&file, "late-unity-write").unwrap();
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CheckPoError::WorkingTreeChanged(_)));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "late-unity-write");
+    let recovered = crate::recover_transactions(&project).unwrap();
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint");
+}
+
+#[test]
+fn authoritative_recovery_replaces_a_blocking_file_with_the_target_directory_tree() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let target = project.join("Assets/Topology");
+    fs::create_dir_all(target.join("Nested")).unwrap();
+    fs::write(target.join("Nested/Target.asset"), "checkpoint").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Target", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::remove_dir_all(&target).unwrap();
+    fs::write(&target, "blocking-file").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+
+    apply_plan_inner_authoritative(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+    assert_eq!(
+        recovered.recovered_transaction_count, 1,
+        "failures: {:?}",
+        recovered.failed_transactions
+    );
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert!(target.is_dir());
+    assert_eq!(
+        fs::read_to_string(target.join("Nested/Target.asset")).unwrap(),
+        "checkpoint"
+    );
+}
+
+#[test]
+fn authoritative_selected_discard_leaves_unselected_unity_changes_untouched() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let selected = project.join("Assets/Avatar/Selected.prefab");
+    let unselected = project.join("Assets/Avatar/Unselected.prefab");
+    fs::write(&selected, "selected-checkpoint").unwrap();
+    fs::write(&unselected, "unselected-checkpoint").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Target", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&selected, "selected-working").unwrap();
+    fs::write(&unselected, "unselected-working").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_discard_files(
+        &project,
+        &["Assets/Avatar/Selected.prefab".to_string()],
+        Some(checkpoint.as_str()),
+    )
+    .unwrap();
+
+    apply_plan_inner_authoritative(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ApplyingJournalWritten {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&selected, "selected-unity-during").unwrap();
+    fs::write(&unselected, "unselected-unity-during").unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert_eq!(
+        fs::read_to_string(&selected).unwrap(),
+        "selected-checkpoint"
+    );
+    assert_eq!(
+        fs::read_to_string(&unselected).unwrap(),
+        "unselected-unity-during"
+    );
+}
+
+#[test]
+fn recovery_conflict_selection_exports_current_file_before_restoring_before_state() {
+    let (_guard, temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "unity-concurrent-change").unwrap();
+
+    let automatic_recovery = crate::recover_transactions(&project).unwrap();
+    assert_eq!(automatic_recovery.failed_transaction_count, 1);
+    assert_eq!(
+        automatic_recovery.failed_transactions[0].recovery_conflict_count,
+        1
+    );
+
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    assert_eq!(conflict_plan.conflicts.len(), 1);
+    assert_eq!(
+        conflict_plan.conflicts[0].path.as_str(),
+        "Assets/Avatar/Foo.prefab"
+    );
+    let export_root = temp.path().join("recovery-export");
+    fs::create_dir(&export_root).unwrap();
+    let selected = vec![TrackedUnityFilePath::parse("Assets/Avatar/Foo.prefab").unwrap()];
+
+    let result = crate::recover_transaction_with_conflict_export(
+        &project,
+        &transaction_id,
+        &conflict_plan.plan_id,
+        &selected,
+        &export_root,
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert!(result.recovered);
+    assert_eq!(result.exported_paths, selected);
+    let export_directory = result.export_directory.unwrap();
+    let exported = export_directory.join("Assets/Avatar/Foo.prefab");
+    assert_eq!(
+        fs::read_to_string(exported).unwrap(),
+        "unity-concurrent-change"
+    );
+    assert!(export_directory.join("CheckPo-Recovery.json").is_file());
+    assert!(export_directory.join("保存が完了しました.txt").is_file());
+    assert_eq!(fs::read_dir(&export_root).unwrap().count(), 1);
+    assert!(fs::read_dir(&export_root).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("incomplete")));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+    assert!(crate::pending_transactions(&project).unwrap().is_empty());
+}
+
+#[test]
+fn recovery_conflict_apply_rejects_a_file_changed_after_analysis() {
+    let (_guard, temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "first-concurrent-change").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    fs::write(&file, "second-concurrent-change").unwrap();
+    let export_root = temp.path().join("recovery-export");
+    fs::create_dir(&export_root).unwrap();
+    let selected = vec![TrackedUnityFilePath::parse("Assets/Avatar/Foo.prefab").unwrap()];
+
+    let error = crate::recover_transaction_with_conflict_export(
+        &project,
+        &transaction_id,
+        &conflict_plan.plan_id,
+        &selected,
+        &export_root,
+        ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CheckPoError::WorkingTreeChanged(_)));
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "second-concurrent-change"
+    );
+    assert_eq!(fs::read_dir(&export_root).unwrap().count(), 0);
+    assert_eq!(crate::pending_transactions(&project).unwrap().len(), 1);
+}
+
+#[test]
+fn recovery_conflict_unselected_file_is_preserved_until_journal_cleanup() {
+    let (_guard, _temp, project, view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "unselected-current-change").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    let current_hash = conflict_plan.conflicts[0].current_hash.clone();
+
+    let result = crate::recover_transaction_with_conflict_export(
+        &project,
+        &transaction_id,
+        &conflict_plan.plan_id,
+        &[],
+        Path::new(""),
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert!(result.export_directory.is_none());
+    assert_eq!(result.restored_without_export_count, 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+    let preserved = view
+        .storage_root_path
+        .join("repos")
+        .join(view.project_id)
+        .join("recovery-rescues")
+        .join(&transaction_id)
+        .join("objects")
+        .join(current_hash.as_str());
+    assert_eq!(
+        fs::read_to_string(&preserved).unwrap(),
+        "unselected-current-change"
+    );
+    let storage_before_cleanup = crate::storage_summary(&project).unwrap();
+    assert!(storage_before_cleanup.recovery_rescue_file_count >= 3);
+    assert!(
+        storage_before_cleanup.recovery_rescue_bytes >= "unselected-current-change".len() as u64
+    );
+    let cleanup_plan = crate::analyze_transaction_cleanup(&project).unwrap();
+    assert_eq!(cleanup_plan.candidates.len(), 1);
+    assert!(cleanup_plan.total_bytes >= "unselected-current-change".len() as u64);
+    crate::cleanup_journals_with_expected_plan(&project, &cleanup_plan, ApplyOptions { yes: true })
+        .unwrap();
+    assert!(!preserved.exists());
+    assert!(!context
+        .repo_root
+        .join("recovery-rescues")
+        .join(&transaction_id)
+        .exists());
+    let storage_after_cleanup = crate::storage_summary(&project).unwrap();
+    assert_eq!(storage_after_cleanup.recovery_rescue_file_count, 0);
+    assert_eq!(storage_after_cleanup.recovery_rescue_bytes, 0);
+}
+
+#[test]
+fn recovery_rescue_deduplicates_identical_content_within_a_transaction() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let first = project.join("Assets/Avatar/First.prefab");
+    let second = project.join("Assets/Avatar/Second.prefab");
+    fs::write(&first, "first-before").unwrap();
+    fs::write(&second, "second-before").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Initial", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&first, "first-working").unwrap();
+    fs::write(&second, "second-working").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_discard_files(
+        &project,
+        &[
+            "Assets/Avatar/First.prefab".to_string(),
+            "Assets/Avatar/Second.prefab".to_string(),
+        ],
+        Some(checkpoint.as_str()),
+    )
+    .unwrap();
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&first, "identical-current").unwrap();
+    fs::write(&second, "identical-current").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    assert_eq!(conflict_plan.conflicts.len(), 2);
+    assert_eq!(
+        conflict_plan.conflicts[0].current_hash,
+        conflict_plan.conflicts[1].current_hash
+    );
+
+    super::recovery::prepare_recovery_conflict_rescue_for_test(&context, &conflict_plan).unwrap();
+    let objects = context
+        .repo_root
+        .join("recovery-rescues")
+        .join(&transaction_id)
+        .join("objects");
+    assert_eq!(fs::read_dir(objects).unwrap().count(), 1);
+    let storage = crate::storage_summary(&project).unwrap();
+    assert!(storage.recovery_rescue_file_count >= 3);
+    assert!(storage.recovery_rescue_bytes >= "identical-current".len() as u64);
+}
+
+#[test]
+fn recovery_conflict_resume_rejects_a_damaged_rescue_copy_before_project_mutation() {
+    let (_guard, _temp, project, view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "current-must-survive").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    let current_hash = conflict_plan.conflicts[0].current_hash.clone();
+    super::recovery::prepare_recovery_conflict_rescue_for_test(&context, &conflict_plan).unwrap();
+    let rescue_copy = view
+        .storage_root_path
+        .join("repos")
+        .join(view.project_id)
+        .join("recovery-rescues")
+        .join(&transaction_id)
+        .join("objects")
+        .join(current_hash.as_str());
+    fs::write(rescue_copy, "damaged").unwrap();
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+
+    assert_eq!(recovered.recovered_transaction_count, 0);
+    assert_eq!(recovered.failed_transaction_count, 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "current-must-survive");
+    assert_eq!(crate::pending_transactions(&project).unwrap().len(), 1);
+}
+
+#[test]
+fn recovery_conflict_resolution_resumes_after_a_crash_between_file_removals() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let first = project.join("Assets/Avatar/First.prefab");
+    let second = project.join("Assets/Avatar/Second.prefab");
+    fs::write(&first, "first-before").unwrap();
+    fs::write(&second, "second-before").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Initial", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&first, "first-working").unwrap();
+    fs::write(&second, "second-working").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_discard_files(
+        &project,
+        &[
+            "Assets/Avatar/First.prefab".to_string(),
+            "Assets/Avatar/Second.prefab".to_string(),
+        ],
+        Some(checkpoint.as_str()),
+    )
+    .unwrap();
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&first, "first-concurrent").unwrap();
+    fs::write(&second, "second-concurrent").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    assert_eq!(conflict_plan.conflicts.len(), 2);
+
+    super::recovery::prepare_recovery_conflict_rescue_and_remove_first_for_test(
+        &context,
+        &conflict_plan,
+    )
+    .unwrap();
+    assert_eq!(
+        usize::from(first.exists()) + usize::from(second.exists()),
+        1
+    );
+
+    let recovered = crate::recover_transactions(&project).unwrap();
+    assert_eq!(recovered.recovered_transaction_count, 1);
+    assert_eq!(recovered.failed_transaction_count, 0);
+    assert_eq!(fs::read_to_string(&first).unwrap(), "first-working");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second-working");
+    assert!(crate::pending_transactions(&project).unwrap().is_empty());
+}
+
+#[test]
+fn recovery_conflict_resolution_handles_restore_operation() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "checkpoint-content").unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Initial", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::remove_file(&file).unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_restore(&project, checkpoint.as_str()).unwrap();
+    assert_eq!(plan.restore_count, 1);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "concurrent-content").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    assert_eq!(conflict_plan.conflicts.len(), 1);
+
+    crate::recover_transaction_with_conflict_export(
+        &project,
+        &transaction_id,
+        &conflict_plan.plan_id,
+        &[],
+        Path::new(""),
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert!(!file.exists());
+}
+
+#[test]
+fn recovery_conflict_resolution_handles_delete_operation() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    let checkpoint =
+        crate::create_checkpoint(&project, "Initial", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    fs::write(&file, "working-content").unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_discard_files(
+        &project,
+        &["Assets/Avatar/Foo.prefab".to_string()],
+        Some(checkpoint.as_str()),
+    )
+    .unwrap();
+    assert_eq!(plan.delete_count, 1);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::BackupSourceCleanupAfter {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "concurrent-content").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    assert_eq!(conflict_plan.conflicts.len(), 1);
+
+    crate::recover_transaction_with_conflict_export(
+        &project,
+        &transaction_id,
+        &conflict_plan.plan_id,
+        &[],
+        Path::new(""),
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read_to_string(&file).unwrap(), "working-content");
+}
+
+#[test]
+fn recovery_conflict_resolution_handles_metadata_operation() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "same-content").unwrap();
+    let checkpoint_mtime = FileTime::from_unix_time(1_700_000_000, 123_000_000);
+    filetime::set_file_mtime(&file, checkpoint_mtime).unwrap();
+    let checkpoint =
+        crate::create_checkpoint(&project, "Initial", CreateCheckpointOptions::default())
+            .unwrap()
+            .checkpoint_id;
+    let working_mtime = FileTime::from_unix_time(1_710_000_000, 456_000_000);
+    filetime::set_file_mtime(&file, working_mtime).unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_discard_files(
+        &project,
+        &["Assets/Avatar/Foo.prefab".to_string()],
+        Some(checkpoint.as_str()),
+    )
+    .unwrap();
+    assert_eq!(plan.metadata_count, 1);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectMetadataUpdated {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    let concurrent_mtime = FileTime::from_unix_time(1_720_000_000, 789_000_000);
+    filetime::set_file_mtime(&file, concurrent_mtime).unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    assert_eq!(conflict_plan.conflicts.len(), 1);
+    assert!(conflict_plan.conflicts[0].metadata_only);
+
+    crate::recover_transaction_with_conflict_export(
+        &project,
+        &transaction_id,
+        &conflict_plan.plan_id,
+        &[],
+        Path::new(""),
+        ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(
+        FileTime::from_last_modification_time(&fs::metadata(&file).unwrap()),
+        working_mtime
+    );
+}
+
+#[test]
+fn recovery_conflict_export_rejects_a_location_inside_the_unity_project() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+
+    apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    fs::write(&file, "current-change").unwrap();
+    let transaction_id = crate::pending_transactions(&project).unwrap()[0]
+        .transaction_id
+        .clone();
+    let conflict_plan =
+        crate::analyze_transaction_recovery_conflicts(&project, &transaction_id).unwrap();
+    let selected = vec![TrackedUnityFilePath::parse("Assets/Avatar/Foo.prefab").unwrap()];
+
+    let error = crate::recover_transaction_with_conflict_export(
+        &project,
+        &transaction_id,
+        &conflict_plan.plan_id,
+        &selected,
+        &project.join("Assets"),
+        ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CheckPoError::User(_)));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "current-change");
+    assert_eq!(crate::pending_transactions(&project).unwrap().len(), 1);
+}
+
+#[test]
 fn recovery_after_fault_before_committed_journal_rolls_completed_apply_back() {
     let (_guard, _temp, project, _view) = setup_project();
     let file = project.join("Assets/Avatar/Foo.prefab");
@@ -1865,6 +2656,134 @@ fn recovery_after_fault_before_committed_journal_rolls_completed_apply_back() {
     assert_eq!(recovered.recovered_transaction_count, 1);
     assert_eq!(recovered.failed_transaction_count, 0);
     assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+}
+
+#[test]
+#[ignore = "manual recovery-conflict demo generator; run through samples/recovery-conflict-demo/prepare.ps1"]
+fn prepare_manual_recovery_conflict_demo() {
+    let project = PathBuf::from(
+        std::env::var_os("CHECKPO_RECOVERY_DEMO_PROJECT")
+            .expect("CHECKPO_RECOVERY_DEMO_PROJECT must be set by prepare.ps1"),
+    );
+    assert!(project.is_absolute(), "demo project path must be absolute");
+    assert!(
+        !project.exists(),
+        "demo generator refuses to overwrite an existing path: {}",
+        project.display()
+    );
+    let demo_root = project.parent().expect("demo project needs a parent");
+    let storage_root = demo_root.join("CheckPoStorage");
+    fs::create_dir_all(project.join("Assets/RecoveryConflictDemo")).unwrap();
+    fs::create_dir_all(project.join("Packages")).unwrap();
+    fs::create_dir_all(project.join("ProjectSettings")).unwrap();
+    fs::write(
+        project.join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3.22f1\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("Packages/manifest.json"),
+        "{\"dependencies\":{}}\n",
+    )
+    .unwrap();
+
+    let prefab = project.join("Assets/RecoveryConflictDemo/DemoAvatar.prefab");
+    let meta = project.join("Assets/RecoveryConflictDemo/DemoAvatar.prefab.meta");
+    fs::write(&prefab, demo_prefab("checkpoint-version")).unwrap();
+    fs::write(&meta, demo_prefab_meta("checkpoint-version")).unwrap();
+
+    // The custom storage root keeps the sample payload beside the Unity
+    // project, while normal CheckPo registration still makes it selectable in
+    // the desktop app on this machine.
+    let view = crate::init_project_with_storage_root(&project, &storage_root).unwrap();
+    let checkpoint = crate::create_checkpoint(
+        &project,
+        "復旧デモの正常状態",
+        CreateCheckpointOptions::default(),
+    )
+    .unwrap()
+    .checkpoint_id;
+
+    fs::write(&prefab, demo_prefab("working-version-before-crash")).unwrap();
+    fs::write(&meta, demo_prefab_meta("working-version-before-crash")).unwrap();
+    let context = crate::load_project(&project).unwrap();
+    let plan = crate::preview_discard_files(
+        &project,
+        &["Assets/RecoveryConflictDemo/DemoAvatar.prefab".to_string()],
+        Some(checkpoint.as_str()),
+    )
+    .unwrap();
+    assert_eq!(plan.replace_count, 2);
+
+    let error = apply_plan_inner_authoritative(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        None,
+        None,
+        Some(&|point| {
+            if point == TransactionFaultPoint::ProjectFileRestored {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+    assert!(matches!(error, CheckPoError::Unexpected(_)));
+
+    // Simulate Unity saving both files after CheckPo was interrupted. The
+    // target-authoritative recovery must preserve these versions internally
+    // and finish the selected checkpoint without a file-selection dialog.
+    fs::write(&prefab, demo_prefab("unity-save-after-crash")).unwrap();
+    fs::write(&meta, demo_prefab_meta("unity-save-after-crash")).unwrap();
+    let pending = crate::pending_transactions(&project).unwrap();
+    assert_eq!(pending.len(), 1);
+    fs::write(
+        project.join("使い方.txt"),
+        "CheckPoでこのUnityProjectフォルダーを選択してください。\r\n\
+         1. 上部の「復旧する」を押します。\r\n\
+         2. DemoAvatar.prefabとmetaがチェックポイント版へ戻ることを確認します。\r\n\
+         Unityが中断後に保存した版はCheckPoの内部へ安全コピーされます。\r\n",
+    )
+    .unwrap();
+
+    println!("CHECKPO_DEMO_PROJECT={}", project.display());
+    println!("CHECKPO_DEMO_STORAGE={}", view.storage_root_path.display());
+    println!("CHECKPO_DEMO_PENDING={}", pending.len());
+}
+
+fn demo_prefab(state: &str) -> String {
+    format!(
+        "%YAML 1.1\n\
+         %TAG !u! tag:unity3d.com,2011:\n\
+         --- !u!1 &1\n\
+         GameObject:\n\
+           m_ObjectHideFlags: 0\n\
+           m_CorrespondingSourceObject: {{fileID: 0}}\n\
+           m_PrefabInstance: {{fileID: 0}}\n\
+           m_PrefabAsset: {{fileID: 0}}\n\
+           serializedVersion: 6\n\
+           m_Component: []\n\
+           m_Layer: 0\n\
+           m_Name: RecoveryDemo_{state}\n\
+           m_TagString: Untagged\n\
+           m_Icon: {{fileID: 0}}\n\
+           m_NavMeshLayer: 0\n\
+           m_StaticEditorFlags: 0\n\
+           m_IsActive: 1\n"
+    )
+}
+
+fn demo_prefab_meta(state: &str) -> String {
+    format!(
+        "fileFormatVersion: 2\n\
+         guid: 0123456789abcdef0123456789abcdef\n\
+         PrefabImporter:\n\
+           externalObjects: {{}}\n\
+           userData: {state}\n\
+           assetBundleName:\n\
+           assetBundleVariant:\n"
+    )
 }
 
 #[cfg(unix)]

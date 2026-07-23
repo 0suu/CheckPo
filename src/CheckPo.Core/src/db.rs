@@ -294,11 +294,22 @@ fn query_storage_summary(
     project: &ProjectContext,
 ) -> Result<StorageSummary> {
     let indexed = query_storage_index_summary(conn, db_path, project)?;
+    let (recovery_rescue_file_count, recovery_rescue_bytes) =
+        repository_tree_file_summary(&project.repo_root.join("recovery-rescues"))?;
+    let stored_size_bytes = repository_content_stored_bytes(&project.repo_root)?
+        .checked_add(recovery_rescue_bytes)
+        .ok_or_else(|| {
+            crate::CheckPoError::Corruption(
+                "repository stored size exceeds the supported range".to_string(),
+            )
+        })?;
     Ok(StorageSummary {
         checkpoint_count: indexed.checkpoint_count,
         unique_blob_count: indexed.unique_blob_count,
         logical_size_bytes: indexed.logical_size_bytes,
-        stored_size_bytes: repository_content_stored_bytes(&project.repo_root)?,
+        stored_size_bytes,
+        recovery_rescue_file_count,
+        recovery_rescue_bytes,
     })
 }
 
@@ -377,6 +388,50 @@ fn repository_content_stored_bytes(repo_root: &Path) -> Result<u64> {
         }
     }
     Ok(total)
+}
+
+fn repository_tree_file_summary(root: &Path) -> Result<(usize, u64)> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(crate::io_error(root, error)),
+    };
+    if crate::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(crate::CheckPoError::Corruption(format!(
+            "repository auxiliary directory is unsafe: {}",
+            root.display()
+        )));
+    }
+    let mut file_count = 0_usize;
+    let mut total_bytes = 0_u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(false).min_depth(1) {
+        let entry = entry.map_err(|error| crate::CheckPoError::Io {
+            path: error
+                .path()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.to_path_buf()),
+            source: error
+                .into_io_error()
+                .unwrap_or_else(|| std::io::Error::other("repository walk failed")),
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| crate::io_error(entry.path(), error))?;
+        if crate::metadata_is_link_or_reparse(&metadata) {
+            return Err(crate::CheckPoError::Corruption(format!(
+                "repository auxiliary entry is a link or reparse point: {}",
+                entry.path().display()
+            )));
+        }
+        if metadata.is_file() {
+            file_count = file_count.checked_add(1).ok_or_else(|| {
+                crate::CheckPoError::Corruption("repository file count overflow".to_string())
+            })?;
+            total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                crate::CheckPoError::Corruption("repository stored size overflow".to_string())
+            })?;
+        }
+    }
+    Ok((file_count, total_bytes))
 }
 
 pub fn load_file_fingerprints(
