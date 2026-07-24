@@ -1061,13 +1061,11 @@ fn recovery_rejects_symlink_parent_without_touching_outside_project() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "symlinktx",
             "state": "applying",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "discard",
-            "selectedPaths": null,
             "operations": plan.operations,
             "directoriesToRemove": plan.directories_to_remove,
             "directoriesToCreate": plan.directories_to_create,
@@ -1120,13 +1118,11 @@ fn recovery_rejects_symlink_backup_without_touching_project_file() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "symlinkbackuptx",
             "state": "applying",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "discard",
-            "selectedPaths": null,
             "operations": plan.operations,
             "directoriesToRemove": plan.directories_to_remove,
             "directoriesToCreate": plan.directories_to_create,
@@ -3083,6 +3079,82 @@ fn discard_expands_unity_asset_selection_to_its_meta_file() {
 }
 
 #[test]
+fn discard_keeps_a_new_companion_created_after_preview() {
+    let (_guard, _temp, project, _data) = setup();
+    let asset = project.join("Assets/Avatar/Foo.prefab");
+    let meta = project.join("Assets/Avatar/Foo.prefab.meta");
+    fs::write(&asset, "checkpoint").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default())
+        .unwrap()
+        .checkpoint_id;
+    fs::write(&asset, "working").unwrap();
+    let requested = vec!["Assets/Avatar/Foo.prefab".to_string()];
+    let plan =
+        core::preview_discard_files(&project, &requested, Some(checkpoint.as_str())).unwrap();
+    assert_eq!(
+        plan.selected_paths
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>(),
+        ["Assets/Avatar/Foo.prefab"]
+    );
+    fs::write(&meta, "guid: unity-created-after-preview").unwrap();
+
+    let result = core::apply_discard_files_plan(
+        &project,
+        &requested,
+        Some(checkpoint.as_str()),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert!(result.applied);
+    assert_eq!(fs::read_to_string(&asset).unwrap(), "checkpoint");
+    assert_eq!(
+        fs::read_to_string(&meta).unwrap(),
+        "guid: unity-created-after-preview"
+    );
+    let diff = core::diff_checkpoint(&project, checkpoint.as_str()).unwrap();
+    assert_eq!(diff.added, vec!["Assets/Avatar/Foo.prefab.meta"]);
+}
+
+#[test]
+fn discard_apply_rejects_a_request_outside_the_frozen_preview_scope() {
+    let (_guard, _temp, project, _data) = setup();
+    let first = project.join("Assets/Avatar/First.prefab");
+    let second = project.join("Assets/Avatar/Second.prefab");
+    fs::write(&first, "first-checkpoint").unwrap();
+    fs::write(&second, "second-checkpoint").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default())
+        .unwrap()
+        .checkpoint_id;
+    fs::write(&first, "first-working").unwrap();
+    fs::write(&second, "second-working").unwrap();
+    let previewed = vec!["Assets/Avatar/First.prefab".to_string()];
+    let plan =
+        core::preview_discard_files(&project, &previewed, Some(checkpoint.as_str())).unwrap();
+    let different_request = vec!["Assets/Avatar/Second.prefab".to_string()];
+
+    let error = core::apply_discard_files_plan(
+        &project,
+        &different_request,
+        Some(checkpoint.as_str()),
+        plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, core::CheckPoError::WorkingTreeChanged(_)));
+    assert_eq!(fs::read_to_string(&first).unwrap(), "first-working");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second-working");
+}
+
+#[test]
 fn discard_rejects_directory_meta_without_changing_the_directory() {
     let (_guard, _temp, project, _data) = setup();
     init_project_for_test(&project).unwrap();
@@ -3275,22 +3347,73 @@ fn restore_apply_uses_preview_plan_and_does_not_delete_later_added_file() {
     assert_eq!(plan.delete_count, 0);
 
     fs::write(project.join("Assets/Avatar/New.prefab"), "new").unwrap();
-    let error = core::apply_restore_plan(
+    let result = core::apply_restore_plan(
         &project,
         checkpoint.as_str(),
         plan,
         core::ApplyOptions { yes: true },
     )
-    .unwrap_err();
-    assert!(matches!(error, core::CheckPoError::WorkingTreeChanged(_)));
+    .unwrap();
+    assert!(result.applied);
     assert_eq!(
         fs::read_to_string(project.join("Assets/Avatar/Foo.prefab")).unwrap(),
-        "two"
+        "one"
     );
     assert_eq!(
         fs::read_to_string(project.join("Assets/Avatar/New.prefab")).unwrap(),
         "new"
     );
+    let diff = core::diff_checkpoint(&project, checkpoint.as_str()).unwrap();
+    assert_eq!(diff.added, vec!["Assets/Avatar/New.prefab"]);
+}
+
+#[test]
+fn restore_and_discard_apply_while_unity_markers_are_live() {
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "checkpoint").unwrap();
+    init_project_for_test(&project).unwrap();
+    let checkpoint = core::create_checkpoint(&project, "Initial", Default::default())
+        .unwrap()
+        .checkpoint_id;
+    fs::create_dir_all(project.join("Library")).unwrap();
+    fs::create_dir_all(project.join("Temp")).unwrap();
+    fs::write(
+        project.join("Library/EditorInstance.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "process_id": std::process::id()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(project.join("Temp/UnityLockfile"), "live").unwrap();
+
+    fs::write(&file, "restore-working").unwrap();
+    let restore_plan = core::preview_restore(&project, checkpoint.as_str()).unwrap();
+    let restored = core::apply_restore_plan(
+        &project,
+        checkpoint.as_str(),
+        restore_plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert!(restored.applied);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint");
+
+    fs::write(&file, "discard-working").unwrap();
+    let selected = ["Assets/Avatar/Foo.prefab".to_string()];
+    let discard_plan =
+        core::preview_discard_files(&project, &selected, Some(checkpoint.as_str())).unwrap();
+    let discarded = core::apply_discard_files_plan(
+        &project,
+        &selected,
+        Some(checkpoint.as_str()),
+        discard_plan,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert!(discarded.applied);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "checkpoint");
 }
 
 #[test]
@@ -3329,13 +3452,11 @@ fn pending_transaction_blocks_new_mutating_operation_and_cleanup_removes_committ
     fs::write(
         pending.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "pendingtx",
             "state": "staged",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
-            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3353,13 +3474,11 @@ fn pending_transaction_blocks_new_mutating_operation_and_cleanup_removes_committ
     fs::write(
         pending.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "pendingtx",
             "state": "committed",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
-            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3379,7 +3498,7 @@ fn pending_transaction_blocks_new_mutating_operation_and_cleanup_removes_committ
 }
 
 #[test]
-fn cleanup_removes_completed_journals_even_when_payload_is_not_empty() {
+fn schema_3_completed_journals_do_not_block_and_cleanup_removes_their_payload() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
     let view = init_project_for_test(&project).unwrap();
@@ -3399,13 +3518,11 @@ fn cleanup_removes_completed_journals_even_when_payload_is_not_empty() {
         fs::write(
             journal.join("journal.json"),
             serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 4,
+                "schemaVersion": 3,
                 "transactionId": transaction_id,
                 "state": state,
-                "intent": "rollbackToBefore",
                 "checkpointId": checkpoint,
                 "kind": "discard",
-                "selectedPaths": null,
                 "operations": [],
                 "directoriesToRemove": [],
                 "directoriesToCreate": [],
@@ -3417,6 +3534,7 @@ fn cleanup_removes_completed_journals_even_when_payload_is_not_empty() {
         .unwrap();
     }
 
+    assert!(core::pending_transactions(&project).unwrap().is_empty());
     let plan = core::analyze_transaction_cleanup(&project).unwrap();
     assert_eq!(plan.directory_count, 2);
     assert_eq!(plan.candidates.len(), 2);
@@ -3456,13 +3574,11 @@ fn cleanup_expected_plan_rejects_payload_changes_without_deleting_any_candidate(
     fs::write(
         tx_root.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": transaction_id,
             "state": "committed",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
-            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3725,13 +3841,11 @@ fn recovery_removes_completed_restore_operation() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "restoretx",
             "state": "applying",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
-            "selectedPaths": null,
             "operations": plan.operations,
             "directoriesToRemove": plan.directories_to_remove,
             "directoriesToCreate": plan.directories_to_create,
@@ -3798,14 +3912,14 @@ fn future_journal_with_unknown_state_is_never_treated_as_unreadable_or_deleted()
     fs::create_dir_all(tx.join("staged")).unwrap();
     fs::write(
         tx.join("journal.json"),
-        br#"{"schemaVersion":5,"state":"pausedByNewClient"}"#,
+        br#"{"schemaVersion":4,"state":"pausedByNewClient"}"#,
     )
     .unwrap();
 
     let pending = core::pending_transactions(&project).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].transaction_id, transaction_id);
-    assert_eq!(pending[0].state, "unsupportedSchema:5");
+    assert_eq!(pending[0].state, "unsupportedSchema:4");
 
     let recovery = core::recover_transactions(&project).unwrap();
     assert_eq!(recovery.recovered_transaction_count, 0);
@@ -3818,7 +3932,7 @@ fn future_journal_with_unknown_state_is_never_treated_as_unreadable_or_deleted()
     let cleanup = cleanup_journals_for_test(&project, true).unwrap_err();
     assert!(matches!(
         cleanup,
-        core::CheckPoError::UnsupportedFormat { found: 5, .. }
+        core::CheckPoError::UnsupportedFormat { found: 4, .. }
     ));
     assert!(tx.exists());
     assert_eq!(
@@ -3854,13 +3968,11 @@ fn recovery_rejects_journal_transaction_id_mismatch_without_touching_project() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "differentid",
             "state": "applying",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
-            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -3895,13 +4007,11 @@ fn recovery_does_not_restore_untracked_backup_path() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "badtx",
             "state": "applying",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
-            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],
@@ -5106,13 +5216,11 @@ fn copied_project_blocks_mutating_operations_until_decided() {
     fs::write(
         tx.join("journal.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 4,
+            "schemaVersion": 3,
             "transactionId": "copiedtx",
             "state": "created",
-            "intent": "rollbackToBefore",
             "checkpointId": checkpoint,
             "kind": "restore",
-            "selectedPaths": null,
             "operations": [],
             "directoriesToRemove": [],
             "directoriesToCreate": [],

@@ -293,7 +293,7 @@ pub struct DiffResult {
     pub warnings: Vec<String>,
 }
 
-pub const OPERATION_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const OPERATION_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const TRANSACTION_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const TRANSACTION_RECOVERY_CONFLICT_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const STORAGE_GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -303,6 +303,7 @@ pub const TEMP_FILE_CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OperationPlan {
     pub schema_version: u32,
+    pub authorization: String,
     pub checkpoint_id: SnapshotId,
     pub kind: OperationPlanKind,
     pub selected_paths: Option<Vec<TrackedUnityFilePath>>,
@@ -366,6 +367,7 @@ impl OperationPlan {
             .fold(0_u64, u64::saturating_add);
         Self {
             schema_version: OPERATION_PLAN_SCHEMA_VERSION,
+            authorization: String::new(),
             checkpoint_id,
             kind,
             selected_paths,
@@ -461,10 +463,6 @@ pub struct ApplyOptions {
 pub struct ApplyResult {
     pub checkpoint_id: SnapshotId,
     pub plan: OperationPlan,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub confirmed_plan: Option<OperationPlan>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_apply_error: Option<String>,
     pub applied: bool,
     pub transaction_id: Option<String>,
     pub journal_path: Option<PathBuf>,
@@ -628,7 +626,6 @@ pub struct TransactionRecoveryFailure {
     pub transaction_id: String,
     pub error: String,
     pub recovery_conflict_count: usize,
-    pub awaiting_unity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

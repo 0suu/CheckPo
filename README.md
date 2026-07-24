@@ -93,13 +93,16 @@ checkpointはscan時点の内容を保存します。scan後にworking treeが�
 
 どちらも transaction journal を通します。
 
-- apply 前に preview 時点の hash / 存在状態を再確認する。
+- preview plan 全体をリポジトリ固有鍵で認証し、apply 前に認証・対象path・preview時点のhash / 存在状態を再確認する。preview後の計画JSON改変は拒否する。
+- Unity Editor の起動状態では restore / discard を禁止しない。preview で確定した対象への書き戻しと永続化が完了して transaction を `Committed` にした時点で操作完了とする。
+- `Committed` 後に Unity が対象pathへ保存・再公開した内容は新しい working tree の差分として扱い、再scan・再適用・checkpointへの強制収束はしない。preview後に追加された対象外pathも削除しない。OS上ですでに開かれ、CheckPoの置換でpathから切り離された旧file handleへの書き込みは新しいpathへの保存ではないため検出できない。この制約はGit等のpath置換と同じであり、CheckPoは「旧handleへの書き込みまで新差分として再公開する」ことは保証しない。
 - Restore / Replace 用 object は `staged/` に展開し、hash / size を検証する。
 - Replace / Delete 対象の現在ファイルは削除せず `backup/` に退避する。Windowsはheld handleのrename、Unixはheld sourceからclone/copy・hash・backup file fsync・readback・backup parent barrierを完了し、元pathがハッシュ時と同じfile version / identityのままの場合だけidentity-bound unlinkする。大量小fileは64fileごと、32parent directoryごとにbarrierを置き、検査後の同一inode書き込みや同名差し替えを誤って削除しない。
 - Restore / Replace 後は snapshot の `modifiedAtUtc` を file mtime に復元する。
 - pending transaction がある場合、新しい mutating operation は拒否する。
 - Restore / Replace の staging は bounded parallel でcopy・hash・file fsyncまで行い、全workerとparent directory barrierの完了後だけ `Staged` へ進む。working treeを書き換えるbackup / applyは直列のままにする。
-- 自動復旧できない transaction は、明示確認後に全体を `quarantined-journals/` へ移動できる。Unity プロジェクト内のファイルはこの隔離操作では変更せず、backup / staged も削除しない。隔離時に処理前状態を確認できなかった場合は、再起動後も警告を表示し、既知のcheckpointへの全体restoreが完了するまで新規checkpoint作成・削除・discardなどの変更操作を停止する。
+- `Committed` 前に中断した transaction は処理前状態へrollbackする。Unityなどが同じ対象をさらに変更していて安全にrollbackできない場合は、競合内容を保護してユーザーの復旧操作を待つ。
+- 自動復旧できない transaction は、明示確認後に全体を `quarantined-journals/` へ移動できる。Unity プロジェクト内のファイルはこの隔離操作では変更せず、backup / staged も削除しない。隔離時に処理前状態を確認できなかった場合は、再起動後も警告を表示し、既知のcheckpointへの全体restoreでcheckpoint全体との一致を確認できるまで新規checkpoint作成・削除・discardなどの変更操作を停止する。restore後にUnityが別の差分を保存して一致確認できなかった場合、restore自体は成功のまま警告を返し、隔離だけを未解決で残す。
 
 ## CLI
 

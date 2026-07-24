@@ -92,15 +92,10 @@ pub fn apply_discard_plan_with_progress_and_cancellation(
             "discard checkpoint changed after preview".to_string(),
         ));
     }
-    let selected = {
+    {
         let _lock =
             crate::acquire_project_repository_shared_lock(&project, "discard-apply-validation")?;
-        crate::transaction::normalize_discard_selection(&project, &snapshot_id, paths)?
-    };
-    if plan.selected_paths.as_deref() != Some(selected.as_slice()) {
-        return Err(CheckPoError::WorkingTreeChanged(
-            "discard path set changed after preview".to_string(),
-        ));
+        crate::transaction::validate_discard_request_scope(&project, paths, &plan)?;
     }
     crate::apply_plan(&project, plan, options, progress, cancellation)
 }

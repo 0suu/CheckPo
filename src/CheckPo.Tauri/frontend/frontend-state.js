@@ -12,7 +12,7 @@
     snapshotNotFound: "チェックポイントが見つかりません。再読み込みして選び直してください。",
     objectMissing: "チェックポイントの保存データが不足しています。破損チェックを実行してください。",
     objectHashMismatch: "チェックポイントの保存データが一致しません。破損チェックを実行してください。",
-    workingTreeChanged: "処理中にUnity側のファイルが変わりました。保存が落ち着いてから、もう一度実行してください。",
+    workingTreeChanged: "確認後に対象ファイルが変わりました。差分を再読み込みして、もう一度実行してください。",
     repositoryLocked: "別のCheckPo処理が実行中です。完了してから、もう一度実行してください。",
     storageRootConflict: "指定した場所と登録済みの保存先が一致しません。手動移動済みの保存データへ再接続してください。",
     storageRootUnavailable: "登録済みの保存データを読み込めません。手動移動済みの保存データがある場所を選んで再接続してください。",
@@ -360,14 +360,6 @@
 
   function transactionRecoveryGuidance(failure) {
     const rawError = String(failure?.error || "").trim();
-    if (failure?.awaitingUnity === true) {
-      return {
-        retryable: true,
-        canSelectFiles: false,
-        canQuarantine: false,
-        message: "Unityがファイルを更新し続けています。Unityを閉じてから「復旧を続ける」を押してください。",
-      };
-    }
     if (Number(failure?.recoveryConflictCount || 0) > 0) {
       return {
         retryable: false,

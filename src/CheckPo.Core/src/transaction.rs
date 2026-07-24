@@ -5,7 +5,6 @@ mod project_file_ops;
 mod recovery;
 #[cfg(test)]
 mod tests;
-mod unity_guard;
 
 use crate::{
     load_project_snapshot, report_operation_progress, ApplyOptions, ApplyResult, CancellationToken,
@@ -29,7 +28,7 @@ pub use apply::apply_plan;
 pub(crate) use apply::apply_restore_plan_and_resolve_quarantines;
 #[cfg(test)]
 use apply::{
-    apply_plan_inner, apply_plan_inner_authoritative, ensure_available_space,
+    apply_plan_for_user_inner, apply_plan_inner, classify_apply_error, ensure_available_space,
     estimated_project_required_bytes, estimated_repository_required_bytes, TransactionFaultPoint,
     TRANSACTION_BACKUP_FILE_BATCH_SIZE,
 };
@@ -39,11 +38,11 @@ pub use journal::{
 };
 use journal::{
     dir_size, journals_dir, read_transaction_journal, validate_transaction_journal_identity,
-    write_journal, JournalState, TransactionIntent, TransactionJournal, JOURNAL_STATE_UNREADABLE,
+    write_journal, JournalState, TransactionJournal, JOURNAL_STATE_UNREADABLE,
     TRANSACTION_JOURNAL_SCHEMA_VERSION,
 };
 pub use plan::build_plan_with_progress_and_cancellation;
-pub(crate) use plan::normalize_discard_selection;
+pub(crate) use plan::validate_discard_request_scope;
 use plan::{
     validate_expected_plan, validate_journal_directory_topology, validate_journal_operations,
 };

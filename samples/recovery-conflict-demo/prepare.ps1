@@ -35,5 +35,6 @@ Write-Host $projectPath -ForegroundColor Cyan
 Write-Host ""
 Write-Host "選択後の操作:"
 Write-Host "  1. 『復旧する』を押す"
-Write-Host "  2. DemoAvatar.prefabとmetaがチェックポイント版へ戻ることを確認する"
-Write-Host "  ※ Unityが中断後に保存した版はCheckPo内へ安全コピーされます"
+Write-Host "  2. 残したい競合ファイルを選び、保存先を指定する"
+Write-Host "  3. DemoAvatar.prefabとmetaがtransaction開始前の版へ戻ることを確認する"
+Write-Host "  ※ 選択したUnity保存版は指定先へコピーされます"

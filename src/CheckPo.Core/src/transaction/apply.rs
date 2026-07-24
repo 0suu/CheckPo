@@ -28,10 +28,14 @@ pub(super) enum TransactionFaultPoint {
     StagedPayloadCleanupBefore,
     StagedPayloadCleanupAfter,
     OperationsAppliedBeforeCommit,
-    TargetVerificationCompleteBeforeCommit,
 }
 
 pub(super) type TransactionFaultHook<'a> = Option<&'a dyn Fn(TransactionFaultPoint) -> Result<()>>;
+
+struct ApplyPlanAttempt<'a> {
+    resolve_quarantines_for: Option<&'a SnapshotId>,
+    transaction_id: String,
+}
 
 pub fn apply_plan(
     project: &ProjectContext,
@@ -40,7 +44,7 @@ pub fn apply_plan(
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ApplyResult> {
-    apply_plan_authoritative(project, plan, options, progress, cancellation, None)
+    apply_plan_for_user(project, plan, options, progress, cancellation, None)
 }
 
 #[cfg(test)]
@@ -52,6 +56,7 @@ pub(super) fn apply_plan_inner(
     cancellation: Option<&CancellationToken>,
     fault_hook: TransactionFaultHook<'_>,
 ) -> Result<ApplyResult> {
+    let transaction_id = Uuid::new_v4().simple().to_string();
     apply_plan_once(
         project,
         plan,
@@ -59,30 +64,21 @@ pub(super) fn apply_plan_inner(
         progress,
         cancellation,
         fault_hook,
-        None,
-        TransactionIntent::RollbackToBefore,
+        ApplyPlanAttempt {
+            resolve_quarantines_for: None,
+            transaction_id,
+        },
     )
 }
 
 #[cfg(test)]
-pub(super) fn apply_plan_inner_authoritative(
+pub(super) fn apply_plan_for_user_inner(
     project: &ProjectContext,
     plan: OperationPlan,
     options: ApplyOptions,
-    progress: Option<&dyn Fn(OperationProgress)>,
-    cancellation: Option<&CancellationToken>,
     fault_hook: TransactionFaultHook<'_>,
 ) -> Result<ApplyResult> {
-    apply_plan_once(
-        project,
-        plan,
-        options,
-        progress,
-        cancellation,
-        fault_hook,
-        None,
-        TransactionIntent::CompleteToTarget,
-    )
+    apply_plan_for_user_with_fault(project, plan, options, None, None, None, fault_hook)
 }
 
 pub(crate) fn apply_restore_plan_and_resolve_quarantines(
@@ -93,7 +89,7 @@ pub(crate) fn apply_restore_plan_and_resolve_quarantines(
     cancellation: Option<&CancellationToken>,
     checkpoint_id: &SnapshotId,
 ) -> Result<ApplyResult> {
-    apply_plan_authoritative(
+    apply_plan_for_user(
         project,
         plan,
         options,
@@ -103,7 +99,7 @@ pub(crate) fn apply_restore_plan_and_resolve_quarantines(
     )
 }
 
-fn apply_plan_authoritative(
+fn apply_plan_for_user(
     project: &ProjectContext,
     plan: OperationPlan,
     options: ApplyOptions,
@@ -111,64 +107,72 @@ fn apply_plan_authoritative(
     cancellation: Option<&CancellationToken>,
     resolve_quarantines_for: Option<&SnapshotId>,
 ) -> Result<ApplyResult> {
-    super::unity_guard::ensure_unity_editor_is_closed(project)?;
-    let result_plan = plan.clone();
+    apply_plan_for_user_with_fault(
+        project,
+        plan,
+        options,
+        progress,
+        cancellation,
+        resolve_quarantines_for,
+        None,
+    )
+}
+
+fn apply_plan_for_user_with_fault(
+    project: &ProjectContext,
+    plan: OperationPlan,
+    options: ApplyOptions,
+    progress: Option<&dyn Fn(OperationProgress)>,
+    cancellation: Option<&CancellationToken>,
+    resolve_quarantines_for: Option<&SnapshotId>,
+    fault_hook: TransactionFaultHook<'_>,
+) -> Result<ApplyResult> {
+    let transaction_id = Uuid::new_v4().simple().to_string();
     match apply_plan_once(
         project,
         plan,
         options,
         progress,
         cancellation,
-        None,
-        resolve_quarantines_for,
-        TransactionIntent::CompleteToTarget,
+        fault_hook,
+        ApplyPlanAttempt {
+            resolve_quarantines_for,
+            transaction_id: transaction_id.clone(),
+        },
     ) {
         Ok(result) => Ok(result),
-        Err(apply_error) => {
-            let Some((transaction_id, journal_path, effective_plan)) =
-                super::recovery::resume_complete_to_target_after_apply_error(
-                    project,
-                    &result_plan.checkpoint_id,
-                    result_plan.kind,
-                )?
-            else {
-                return Err(apply_error);
-            };
-            let mut warnings = Vec::new();
-            if let Some(checkpoint_id) = resolve_quarantines_for {
-                let _lock = crate::acquire_project_repository_lock(
-                    project,
-                    "restore-quarantine-resolution-after-target-resume",
-                )?;
-                if let Err(error) =
-                    super::recovery::resolve_unverified_transaction_quarantines_unlocked(
-                        project,
-                        checkpoint_id,
-                    )
-                {
-                    warnings.push(format!(
-                        "restore reached its target, but transaction quarantine resolution remains pending: {error}"
-                    ));
-                }
-            }
-            report_operation_progress(progress, "complete", 1, 1, None);
-            Ok(ApplyResult {
-                checkpoint_id: effective_plan.checkpoint_id.clone(),
-                plan: effective_plan,
-                confirmed_plan: Some(result_plan),
-                initial_apply_error: Some(apply_error.to_string()),
-                applied: true,
-                transaction_id: Some(transaction_id),
-                journal_path: Some(journal_path),
-                warnings,
-            })
-        }
+        Err(error) => Err(classify_apply_error(project, error, &transaction_id)),
     }
 }
 
-// Intent and quarantine resolution are separate durable safety decisions and
-// stay explicit at this internal transaction boundary.
-#[allow(clippy::too_many_arguments)]
+pub(super) fn classify_apply_error(
+    project: &ProjectContext,
+    error: CheckPoError,
+    transaction_id: &str,
+) -> CheckPoError {
+    if matches!(error, CheckPoError::PendingTransaction(_)) {
+        return error;
+    }
+    let pending = (|| {
+        let _lock =
+            crate::acquire_project_repository_shared_lock(project, "transaction-apply-error")?;
+        pending_transactions_for_project(project)
+    })();
+    let Ok(pending) = pending else {
+        return error;
+    };
+    let Some(transaction) = pending
+        .iter()
+        .find(|pending| pending.transaction_id == transaction_id)
+    else {
+        return error;
+    };
+    CheckPoError::PendingTransaction(format!(
+        "transaction {} requires recovery after apply failed: {error}",
+        transaction.transaction_id
+    ))
+}
+
 fn apply_plan_once(
     project: &ProjectContext,
     plan: OperationPlan,
@@ -176,9 +180,12 @@ fn apply_plan_once(
     progress: Option<&dyn Fn(OperationProgress)>,
     cancellation: Option<&CancellationToken>,
     fault_hook: TransactionFaultHook<'_>,
-    resolve_quarantines_for: Option<&SnapshotId>,
-    intent: TransactionIntent,
+    attempt: ApplyPlanAttempt<'_>,
 ) -> Result<ApplyResult> {
+    let ApplyPlanAttempt {
+        resolve_quarantines_for,
+        transaction_id,
+    } = attempt;
     if !options.yes {
         return Err(crate::user_error("apply requires --yes."));
     }
@@ -196,26 +203,37 @@ fn apply_plan_once(
     }
     validate_expected_plan(project, &plan)?;
     if !plan.has_changes {
+        let mut warnings = Vec::new();
         if let Some(checkpoint_id) = resolve_quarantines_for {
-            super::recovery::resolve_unverified_transaction_quarantines_unlocked(
-                project,
-                checkpoint_id,
-            )?;
+            if let Some(verification) =
+                verify_quarantine_resolution_target_if_needed(project, checkpoint_id)
+            {
+                match verification {
+                    Ok(()) => {
+                        if let Err(error) =
+                            super::recovery::resolve_unverified_transaction_quarantines_unlocked(
+                                project,
+                                checkpoint_id,
+                            )
+                        {
+                            record_quarantine_resolution_warning(&mut warnings, &error);
+                        }
+                    }
+                    Err(error) => record_quarantine_resolution_warning(&mut warnings, &error),
+                }
+            }
         }
         return Ok(ApplyResult {
             checkpoint_id: plan.checkpoint_id.clone(),
             plan,
-            confirmed_plan: None,
-            initial_apply_error: None,
             applied: false,
             transaction_id: None,
             journal_path: None,
-            warnings: Vec::new(),
+            warnings,
         });
     }
     ensure_capacity_for_plan(project, &plan)?;
     crate::ensure_not_cancelled(cancellation)?;
-    let transaction_id = Uuid::new_v4().simple().to_string();
     let journal_root = journals_dir(&project.repo_root).join(&transaction_id);
     let staged_root = journal_root.join("staged");
     let backup_root = journal_root.join("backup");
@@ -227,10 +245,8 @@ fn apply_plan_once(
         schema_version: TRANSACTION_JOURNAL_SCHEMA_VERSION,
         transaction_id: transaction_id.clone(),
         state: JournalState::Created,
-        intent,
         checkpoint_id: plan.checkpoint_id.clone(),
         kind: plan.kind,
-        selected_paths: plan.selected_paths.clone(),
         operations: plan.operations.clone(),
         directories_to_remove: plan.directories_to_remove.clone(),
         directories_to_create: plan.directories_to_create.clone(),
@@ -321,22 +337,14 @@ fn apply_plan_once(
         journal.state = JournalState::Staged;
         journal.updated_at_utc = crate::now_utc_string();
         write_journal(&journal_path, &journal)?;
-        if intent == TransactionIntent::RollbackToBefore {
-            recheck_preconditions(project, &plan)?;
-        }
+        recheck_preconditions(project, &plan)?;
         invalidate_operation_fingerprints(project, &plan.operations)?;
-        journal.state = match intent {
-            TransactionIntent::CompleteToTarget => JournalState::ApplyingTarget,
-            TransactionIntent::RollbackToBefore => JournalState::Applying,
-        };
+        journal.state = JournalState::Applying;
         journal.updated_at_utc = crate::now_utc_string();
         write_journal(&journal_path, &journal)
     })();
     if let Err(error) = prepare_result {
-        journal.state = match intent {
-            TransactionIntent::CompleteToTarget => JournalState::RolledBack,
-            TransactionIntent::RollbackToBefore => JournalState::Recovered,
-        };
+        journal.state = JournalState::Recovered;
         journal.updated_at_utc = crate::now_utc_string();
         if let Err(abort_error) = write_journal(&journal_path, &journal) {
             return Err(CheckPoError::Unexpected(format!(
@@ -382,12 +390,12 @@ fn apply_plan_once(
             );
             if let Some(deferred) = backup_project_file_deferred(
                 project,
+                plan.kind,
                 &anchored_project,
                 &anchored_repo,
                 operation,
                 &backup_path,
                 &mut backup_destination_sync_batch,
-                &mut backup_source_sync_batch,
             )? {
                 deferred_backup_sources.push(deferred);
             }
@@ -414,6 +422,8 @@ fn apply_plan_once(
         inject_transaction_fault(fault_hook, TransactionFaultPoint::BackupSourceCleanupBefore)?;
         for deferred in deferred_backup_sources {
             remove_deferred_backup_source(
+                project,
+                plan.kind,
                 &anchored_project,
                 deferred,
                 &mut backup_source_sync_batch,
@@ -481,11 +491,14 @@ fn apply_plan_once(
             FileOperationType::Restore => {
                 let staged = staged_path(&staged_root, &operation.path);
                 let staged_source_remains = restore_new_staged_file_to_project_deferred(
-                    project,
+                    StagedFilePublishContext {
+                        project,
+                        plan_kind: plan.kind,
+                        transaction_id: &transaction_id,
+                    },
                     operation,
                     &staged,
                     &destination,
-                    &transaction_id,
                     &mut staged_cleanup_sync_batch,
                     &mut project_restore_sync_batch,
                 )?;
@@ -510,11 +523,14 @@ fn apply_plan_once(
             FileOperationType::Replace => {
                 let staged = staged_path(&staged_root, &operation.path);
                 let staged_source_remains = restore_new_staged_file_to_project_deferred(
-                    project,
+                    StagedFilePublishContext {
+                        project,
+                        plan_kind: plan.kind,
+                        transaction_id: &transaction_id,
+                    },
                     operation,
                     &staged,
                     &destination,
-                    &transaction_id,
                     &mut staged_cleanup_sync_batch,
                     &mut project_restore_sync_batch,
                 )?;
@@ -569,35 +585,39 @@ fn apply_plan_once(
             fault_hook,
             TransactionFaultPoint::ProjectRestoreDirectoryBarrierAfter,
         )?;
-        inject_transaction_fault(
-            fault_hook,
-            TransactionFaultPoint::StagedPayloadCleanupBefore,
-        )?;
-        let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
-        for (staged, expected_hash, expected_size, expected_mtime) in staged_sources_to_remove {
-            let relative = staged.strip_prefix(&project.repo_root).map_err(|_| {
-                CheckPoError::Corruption(format!(
-                    "staged cleanup path is outside repository {}: {}",
-                    project.repo_root.display(),
-                    staged.display()
-                ))
-            })?;
-            let (parent, leaf) = anchored_repo.open_parent_for_mutation(relative, false)?;
-            let mut file = parent.open_file(&leaf)?;
-            let hashed = file.hash()?;
-            if hashed.object_id != expected_hash || hashed.metadata.len() != expected_size {
-                return Err(CheckPoError::ObjectHashMismatch(format!(
-                    "staged cleanup source changed: {}",
-                    staged.display()
-                )));
-            }
-            verify_file_mtime(&hashed.metadata, &staged, expected_mtime.as_deref())?;
-            parent.unlink_file_if_bound(&leaf, file)?;
-            staged_cleanup_sync_batch.record(parent)?;
-        }
+        // A same-volume publication is a cross-directory rename. Its source
+        // parent barrier is part of publishing the project destination
+        // durably, even though the source lives in private transaction data.
         staged_cleanup_sync_batch.flush()?;
-        anchored_repo.verify_root_binding()?;
-        inject_transaction_fault(fault_hook, TransactionFaultPoint::StagedPayloadCleanupAfter)?;
+    }
+    inject_transaction_fault(
+        fault_hook,
+        TransactionFaultPoint::OperationsAppliedBeforeCommit,
+    )?;
+    let quarantine_resolution_verification = resolve_quarantines_for.and_then(|checkpoint_id| {
+        verify_quarantine_resolution_target_if_needed(project, checkpoint_id)
+    });
+    // This durable terminal journal is the linearization point. We do not
+    // rescan the working tree after CheckPo has published its own writes:
+    // later Unity saves are ordinary new working-tree changes.
+    journal.state = JournalState::Committed;
+    journal.updated_at_utc = crate::now_utc_string();
+    write_journal(&journal_path, &journal)?;
+    let mut warnings = Vec::new();
+    if !staged_sources_to_remove.is_empty() {
+        if let Err(error) = cleanup_cross_volume_staged_sources_after_commit(
+            project,
+            staged_sources_to_remove,
+            fault_hook,
+        ) {
+            let warning = format!(
+                "restore was committed, but private staged payload cleanup remains pending: {error}"
+            );
+            crate::diagnostics::log_warning("transaction-staged-cleanup", &warning);
+            warnings.push(warning);
+        }
+    }
+    if has_restore_operations {
         tracing::info!(
             transaction_id,
             restore_rename_count,
@@ -605,61 +625,93 @@ fn apply_plan_once(
             "restore publication strategies completed"
         );
     }
-    inject_transaction_fault(
-        fault_hook,
-        TransactionFaultPoint::OperationsAppliedBeforeCommit,
-    )?;
-    if intent == TransactionIntent::CompleteToTarget {
-        journal.state = JournalState::VerifyingTarget;
-        journal.updated_at_utc = crate::now_utc_string();
-        write_journal(&journal_path, &journal)?;
-        super::unity_guard::verify_target_is_stable(
-            project,
-            &journal.checkpoint_id,
-            journal.kind,
-            journal.selected_paths.as_deref(),
-        )?;
-        inject_transaction_fault(
-            fault_hook,
-            TransactionFaultPoint::TargetVerificationCompleteBeforeCommit,
-        )?;
-        super::unity_guard::verify_target_once(
-            project,
-            &journal.checkpoint_id,
-            journal.kind,
-            journal.selected_paths.as_deref(),
-        )?;
-    }
-    journal.state = match intent {
-        TransactionIntent::CompleteToTarget => JournalState::CommittedTarget,
-        TransactionIntent::RollbackToBefore => JournalState::Committed,
-    };
-    journal.updated_at_utc = crate::now_utc_string();
-    write_journal(&journal_path, &journal)?;
-    let mut warnings = Vec::new();
-    if let Some(checkpoint_id) = resolve_quarantines_for {
-        if let Err(error) = super::recovery::resolve_unverified_transaction_quarantines_unlocked(
-            project,
-            checkpoint_id,
-        ) {
-            let warning = format!(
-                "restore was committed, but transaction quarantine resolution failed and remains pending: {error}"
-            );
-            crate::diagnostics::log_warning("restore-quarantine-resolution", &warning);
-            warnings.push(warning);
+    if let (Some(checkpoint_id), Some(verification)) =
+        (resolve_quarantines_for, quarantine_resolution_verification)
+    {
+        match verification {
+            Ok(()) => {
+                if let Err(error) =
+                    super::recovery::resolve_unverified_transaction_quarantines_unlocked(
+                        project,
+                        checkpoint_id,
+                    )
+                {
+                    record_quarantine_resolution_warning(&mut warnings, &error);
+                }
+            }
+            Err(error) => {
+                record_quarantine_resolution_warning(&mut warnings, &error);
+            }
         }
     }
     report_operation_progress(progress, "complete", 1, 1, None);
     Ok(ApplyResult {
         checkpoint_id: plan.checkpoint_id.clone(),
         plan,
-        confirmed_plan: None,
-        initial_apply_error: None,
         applied: true,
         transaction_id: Some(transaction_id),
         journal_path: Some(journal_path),
         warnings,
     })
+}
+
+fn verify_quarantine_resolution_target_if_needed(
+    project: &ProjectContext,
+    checkpoint_id: &SnapshotId,
+) -> Option<Result<()>> {
+    match crate::unresolved_transaction_quarantines_for_project(project) {
+        Ok(unresolved) if unresolved.is_empty() => None,
+        Ok(_) => Some(super::plan::verify_full_restore_target(
+            project,
+            checkpoint_id,
+        )),
+        Err(error) => Some(Err(error)),
+    }
+}
+
+fn record_quarantine_resolution_warning(warnings: &mut Vec<String>, error: &CheckPoError) {
+    let warning = format!(
+        "restore completed, but transaction quarantine resolution remains pending because the full checkpoint target could not be verified: {error}"
+    );
+    crate::diagnostics::log_warning("restore-quarantine-resolution", &warning);
+    warnings.push(warning);
+}
+
+fn cleanup_cross_volume_staged_sources_after_commit(
+    project: &ProjectContext,
+    staged_sources: Vec<(PathBuf, ObjectId, u64, Option<String>)>,
+    fault_hook: TransactionFaultHook<'_>,
+) -> Result<()> {
+    inject_transaction_fault(
+        fault_hook,
+        TransactionFaultPoint::StagedPayloadCleanupBefore,
+    )?;
+    let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
+    let mut sync_batch = crate::storage::AnchoredParentSyncBatch::new();
+    for (staged, expected_hash, expected_size, expected_mtime) in staged_sources {
+        let relative = staged.strip_prefix(&project.repo_root).map_err(|_| {
+            CheckPoError::Corruption(format!(
+                "staged cleanup path is outside repository {}: {}",
+                project.repo_root.display(),
+                staged.display()
+            ))
+        })?;
+        let (parent, leaf) = anchored_repo.open_parent_for_mutation(relative, false)?;
+        let mut file = parent.open_file(&leaf)?;
+        let hashed = file.hash()?;
+        if hashed.object_id != expected_hash || hashed.metadata.len() != expected_size {
+            return Err(CheckPoError::ObjectHashMismatch(format!(
+                "staged cleanup source changed: {}",
+                staged.display()
+            )));
+        }
+        verify_file_mtime(&hashed.metadata, &staged, expected_mtime.as_deref())?;
+        parent.unlink_file_if_bound(&leaf, file)?;
+        sync_batch.record(parent)?;
+    }
+    sync_batch.flush()?;
+    anchored_repo.verify_root_binding()?;
+    inject_transaction_fault(fault_hook, TransactionFaultPoint::StagedPayloadCleanupAfter)
 }
 
 fn stage_operation(

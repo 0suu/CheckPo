@@ -398,7 +398,7 @@
         <section class="rollback-zone">
           <div class="danger-band">
             <h2 data-i18n="rollbackTitle">Rollback modifies the current Unity project</h2>
-            <p data-i18n="rollbackAuthoritativeDescription">Close Unity before restoring. CheckPo verifies the target is stable and temporarily protects conflicting content before applying the selected checkpoint.</p>
+            <p data-i18n="rollbackApplyDescription">You can restore while Unity is running. CheckPo writes only the targets fixed by the preview; later Unity saves appear as new changes.</p>
             <p id="rollbackSummary" data-i18n="rollbackEmpty">Preview rollback before applying it.</p>
             <p class="dialog-error" id="rollbackError" role="alert" hidden></p>
             <ul id="rollbackWarnings"></ul>
@@ -406,7 +406,7 @@
           <div class="rollback-confirm">
             <label class="checkbox-row">
               <input id="rollbackConfirm" type="checkbox" />
-              <span data-i18n="rollbackConfirm">I understand this will modify the current Unity project.</span>
+              <span data-i18n="rollbackConfirm">I understand the previewed targets will be overwritten with the selected checkpoint.</span>
             </label>
             <button class="button danger" id="applyRollbackButton" type="button" data-command="apply_rollback" disabled>
               <span data-i18n="applyRollback">Apply rollback</span>
@@ -427,7 +427,7 @@
           <button class="ghost-button" id="closeRecoveryConflictButton" type="button" data-i18n="close">閉じる</button>
         </header>
 
-        <p data-i18n="recoveryConflictDescription">先にUnityを閉じてください。選んだファイルは別の場所へ保存できます。すべての競合内容は復旧前にCheckPo内部へ一時保護されますが、「復旧用データの片付け」で削除されます。</p>
+        <p data-i18n="recoveryConflictDescription">選んだファイルは別の場所へ保存できます。すべての競合内容は復旧前にCheckPo内部へ一時保護されますが、「復旧用データの片付け」で削除されます。</p>
         <p class="dialog-status" id="recoveryConflictStatus" role="status" aria-live="polite" hidden></p>
 
         <label class="recovery-select-all">

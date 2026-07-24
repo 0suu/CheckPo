@@ -399,19 +399,6 @@ test("an unclassified working tree change does not offer misleading file selecti
   assert.equal(guidance.canSelectFiles, false);
 });
 
-test("target recovery waiting on Unity offers only continue recovery", () => {
-  const guidance = transactionRecoveryGuidance({
-    error: "working tree changed",
-    recoveryConflictCount: 0,
-    awaitingUnity: true,
-  });
-
-  assert.equal(guidance.retryable, true);
-  assert.equal(guidance.canSelectFiles, false);
-  assert.equal(guidance.canQuarantine, false);
-  assert.match(guidance.message, /Unityを閉じて/);
-});
-
 test("other recovery failures offer one retry before quarantine and full restore", () => {
   const guidance = transactionRecoveryGuidance({ error: "access denied" });
 
@@ -742,19 +729,44 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
 test("pending transaction errors resync the project so the recovery action becomes visible", () => {
   const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
   const helper = appJs.match(
-    /async function syncPendingTransactionsAfterError[\s\S]*?\n}\n/,
+    /async function syncPendingTransactionsAfterError[\s\S]*?\r?\n}\r?\n/,
   )?.[0] || "";
 
   assert.match(helper, /errorKind\(error\) !== "pendingTransaction"/);
   assert.match(helper, /await refreshProject/);
   assert.match(
     appJs,
-    /} catch \(error\) {\n    await syncPendingTransactionsAfterError\(error\);\n    const cancelled/,
+    /} catch \(error\) {\r?\n    await syncPendingTransactionsAfterError\(error\);\r?\n    const cancelled/,
   );
   assert.match(
     appJs,
     /await syncPendingTransactionsAfterError\(error, { fromAutoRefresh: true }\);/,
   );
+});
+
+test("journal cleanup invalidates and refreshes the rescue-size footer", () => {
+  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const cleanupPath = appJs.match(
+    /const result = await invokeCommand\("cleanup_journals"[\s\S]*?\r?\n    }\);/,
+  )?.[0] || "";
+
+  assert.match(cleanupPath, /invalidateStoredSize\(\)/);
+  assert.match(cleanupPath, /scheduleStorageSizeRefresh\(\{ force: true \}\)/);
+  assert.match(appJs, /state\.storage\.recoveryRescueBytes = null/);
+  assert.match(appJs, /state\.storage\.recoveryRescueFileCount = null/);
+});
+
+test("restore and discard refresh the rescue-size footer after creating journals", () => {
+  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const discardApplyPath = appJs.match(
+    /const result = await invokeCommand\("apply_discard_files"[\s\S]*?await refreshProject\(\);/,
+  )?.[0] || "";
+  const restoreApplyPath = appJs.match(
+    /const result = await invokeCommand\("apply_restore"[\s\S]*?await refreshProject\(\);/,
+  )?.[0] || "";
+
+  assert.match(discardApplyPath, /invalidateStoredSize\(\)[\s\S]*?await refreshProject\(\)/);
+  assert.match(restoreApplyPath, /invalidateStoredSize\(\)[\s\S]*?await refreshProject\(\)/);
 });
 
 test("recovery conflict UI selects files and a destination before applying", () => {
@@ -771,7 +783,10 @@ test("recovery conflict UI selects files and a destination before applying", () 
   assert.match(indexHtml, /data-i18n="recoveryConflictDescription"/);
   assert.match(indexHtml, /data-i18n-placeholder="recoveryConflictExportRootPlaceholder"/);
   assert.match(indexHtml, /data-i18n-aria-label="recoveryConflictPickExportRoot"/);
-  assert.match(i18nJs, /recoveryConflictDescription: "先にUnityを閉じてください。/);
+  assert.match(i18nJs, /recoveryConflictDescription: "選んだファイルは別の場所へ保存できます。/);
+  assert.match(i18nJs, /書き戻しが完了した時点で復元は完了します。/);
+  assert.match(appJs, /Unityを起動したまま実行できます。/);
+  assert.match(appJs, /書き戻し完了後にUnityが対象パスへ保存した内容は、新しい変更として扱われます。/);
   assert.match(i18nJs, /recoveryConflictNotSavedWarning:/);
   assert.match(appJs, /tf\("recoveryConflictSelectionSummary"/);
   assert.match(appJs, /t\("recoveryConflictPickExportRoot"\)/);
