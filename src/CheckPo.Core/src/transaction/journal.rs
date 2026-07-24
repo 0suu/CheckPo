@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) const JOURNAL_STATE_UNREADABLE: &str = "unreadable";
 pub(super) const JOURNAL_STATE_UNSUPPORTED_SCHEMA: &str = "unsupportedSchema";
-pub(super) const TRANSACTION_JOURNAL_SCHEMA_VERSION: u32 = 4;
+pub(super) const TRANSACTION_JOURNAL_SCHEMA_VERSION: u32 = 3;
 const MAX_TRANSACTION_JOURNAL_BYTES: u64 = 512 * 1024 * 1024;
 const CLEANUP_LOCATION_ACTIVE: &str = "active";
 const CLEANUP_LOCATION_TRASH: &str = "cleanupTrash";
@@ -19,10 +19,8 @@ pub(super) struct TransactionJournal {
     pub(super) schema_version: u32,
     pub(super) transaction_id: String,
     pub(super) state: JournalState,
-    pub(super) intent: TransactionIntent,
     pub(super) checkpoint_id: SnapshotId,
     pub(super) kind: OperationPlanKind,
-    pub(super) selected_paths: Option<Vec<TrackedUnityFilePath>>,
     pub(super) operations: Vec<FileOperation>,
     pub(super) directories_to_remove: Vec<TrackedUnityFilePath>,
     pub(super) directories_to_create: Vec<TrackedUnityFilePath>,
@@ -35,34 +33,13 @@ pub(super) struct TransactionJournal {
 pub(super) enum JournalState {
     Created,
     Staged,
-    ApplyingTarget,
-    VerifyingTarget,
-    AwaitingUnity,
-    CommittedTarget,
-    RolledBack,
-    // RollbackToBefore is retained as an explicit recovery mode for fault
-    // tests and future user-requested cancellation. New user operations use
-    // the target-authoritative states above.
     Applying,
     Committed,
     Recovered,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(super) enum TransactionIntent {
-    CompleteToTarget,
-    RollbackToBefore,
-}
-
 fn journal_state_is_terminal(state: JournalState) -> bool {
-    matches!(
-        state,
-        JournalState::CommittedTarget
-            | JournalState::RolledBack
-            | JournalState::Committed
-            | JournalState::Recovered
-    )
+    matches!(state, JournalState::Committed | JournalState::Recovered)
 }
 
 pub(super) fn validate_transaction_journal_identity(
@@ -527,15 +504,10 @@ fn transaction_cleanup_candidate(
     tree_hasher.update(rescue_tree_digest.as_bytes());
     let tree_metadata_digest = tree_hasher.finalize().to_hex().to_string();
     let state = match journal.state {
-        JournalState::CommittedTarget => "committedTarget",
-        JournalState::RolledBack => "rolledBack",
         JournalState::Committed => "committed",
         JournalState::Recovered => "recovered",
         JournalState::Created => "created",
         JournalState::Staged => "staged",
-        JournalState::ApplyingTarget => "applyingTarget",
-        JournalState::VerifyingTarget => "verifyingTarget",
-        JournalState::AwaitingUnity => "awaitingUnity",
         JournalState::Applying => "applying",
     };
     Ok(TransactionCleanupCandidate {

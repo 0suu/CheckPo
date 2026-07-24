@@ -944,7 +944,11 @@ function renderStorage() {
 
 function invalidateStoredSize() {
   state.storageSizeLoadedProjectPath = null;
-  if (state.storage) state.storage.storedSizeBytes = null;
+  if (state.storage) {
+    state.storage.storedSizeBytes = null;
+    state.storage.recoveryRescueBytes = null;
+    state.storage.recoveryRescueFileCount = null;
+  }
   renderStorage();
 }
 
@@ -1053,11 +1057,9 @@ function renderTransactionQuarantineAction() {
   reasonElement.textContent = guidance.message;
   guidanceElement.hidden = false;
   recoverButton.hidden = !guidance.retryable;
-  recoverButton.textContent = failed.awaitingUnity
-    ? "復旧を続ける"
-    : guidance.retryable
-      ? "もう一度復旧"
-      : t("recoverTransactions");
+  recoverButton.textContent = guidance.retryable
+    ? "もう一度復旧"
+    : t("recoverTransactions");
 
   if (guidance.canSelectFiles) {
     quarantineButton?.remove();
@@ -2595,7 +2597,7 @@ async function discardPaths(paths) {
       CONFIRM_PATH_RENDER_LIMIT,
     );
     confirmed = await confirmAction(
-      `${preview.total} 件の変更を戻します。\n\n${preview.text}\n\n復元中にUnityが保存した内容も、選んだチェックポイントで上書きします。\n\n続行しますか？`,
+      `${preview.total} 件の変更を戻します。\n\n${preview.text}\n\nUnityを起動したまま実行できます。CheckPoは確認した対象だけを書き戻します。書き戻し完了後にUnityが対象パスへ保存した内容は、新しい変更として扱われます。\n\n続行しますか？`,
       "戻す",
     );
   } finally {
@@ -2618,6 +2620,7 @@ async function discardPaths(paths) {
     });
     setBusyIndeterminate("再読み込み中");
     setStatus("変更を取り消しました。");
+    invalidateStoredSize();
     await refreshProject();
     state.currentDiffSelectedPaths.clear();
     state.lastSelectedChangePath = null;
@@ -3032,6 +3035,7 @@ function bindEvents() {
       state.rollbackPlan = null;
       state.rollbackPlanContext = null;
       $("rollbackOverlay").hidden = true;
+      invalidateStoredSize();
       await refreshProject();
       await refreshLatestDiff({ allowBusy: true });
       if (result.warnings?.length) {
@@ -3117,6 +3121,8 @@ function bindEvents() {
       $("cleanupSummary").textContent = t("cleanupEmpty");
       $("cleanupResult").textContent =
         `削除 ${result.deletedDirectoryCount ?? 0} 件 / ${formatBytes(result.deletedBytes ?? 0)}`;
+      invalidateStoredSize();
+      scheduleStorageSizeRefresh({ force: true });
       updateControls();
     });
   });

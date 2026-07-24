@@ -714,7 +714,6 @@ fn run() -> Result<u8, String> {
                     println!("Failed: {}", result.failed_transaction_count);
                     for failure in &result.failed_transactions {
                         println!("  failed {}", failure.transaction_id);
-                        println!("    awaiting Unity close: {}", failure.awaiting_unity);
                         println!(
                             "    recovery conflicts: {}",
                             failure.recovery_conflict_count

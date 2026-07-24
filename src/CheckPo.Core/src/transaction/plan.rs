@@ -1,15 +1,29 @@
 use super::*;
 
-pub fn build_plan(
+const OPERATION_PLAN_AUTH_KEY_PATH: &str = "locks/operation-plan-auth.key";
+const OPERATION_PLAN_AUTH_KEY_BYTES: u64 = 64;
+
+pub fn build_plan_with_progress_and_cancellation(
     project: &ProjectContext,
     checkpoint_id: SnapshotId,
     kind: OperationPlanKind,
     selected: Option<&[TrackedUnityFilePath]>,
+    progress: Option<&dyn Fn(OperationProgress)>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<OperationPlan> {
-    build_plan_with_progress_and_cancellation(project, checkpoint_id, kind, selected, None, None)
+    let mut plan = build_unsigned_plan_with_progress_and_cancellation(
+        project,
+        checkpoint_id,
+        kind,
+        selected,
+        progress,
+        cancellation,
+    )?;
+    authorize_operation_plan(project, &mut plan)?;
+    Ok(plan)
 }
 
-pub fn build_plan_with_progress_and_cancellation(
+fn build_unsigned_plan_with_progress_and_cancellation(
     project: &ProjectContext,
     checkpoint_id: SnapshotId,
     kind: OperationPlanKind,
@@ -228,6 +242,104 @@ pub fn build_plan_with_progress_and_cancellation(
     .with_warnings(warnings))
 }
 
+fn operation_plan_authorization_key(project: &ProjectContext) -> Result<[u8; 32]> {
+    let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;
+    let relative = Path::new(OPERATION_PLAN_AUTH_KEY_PATH);
+    let key_path = project.repo_root.join(relative);
+    let bytes =
+        match anchored_repo.read_bytes_bounded_path(&key_path, OPERATION_PLAN_AUTH_KEY_BYTES) {
+            Ok(bytes) => bytes,
+            Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+                let generated =
+                    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()).into_bytes();
+                match anchored_repo.write_bytes_atomic_new(relative, &generated) {
+                    Ok(()) => generated,
+                    Err(CheckPoError::Io { source, .. })
+                        if source.kind() == ErrorKind::AlreadyExists =>
+                    {
+                        anchored_repo
+                            .read_bytes_bounded_path(&key_path, OPERATION_PLAN_AUTH_KEY_BYTES)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+    if bytes.len() != OPERATION_PLAN_AUTH_KEY_BYTES as usize
+        || !bytes.iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(CheckPoError::Corruption(format!(
+            "operation plan authorization key is invalid: {}",
+            key_path.display()
+        )));
+    }
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+fn operation_plan_authorization(project: &ProjectContext, plan: &OperationPlan) -> Result<String> {
+    let mut payload = plan.clone();
+    payload.authorization.clear();
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|error| crate::json_error("operation plan authorization", error))?;
+    Ok(
+        blake3::keyed_hash(&operation_plan_authorization_key(project)?, &bytes)
+            .to_hex()
+            .to_string(),
+    )
+}
+
+fn authorize_operation_plan(project: &ProjectContext, plan: &mut OperationPlan) -> Result<()> {
+    plan.authorization = operation_plan_authorization(project, plan)?;
+    Ok(())
+}
+
+fn authorization_matches(actual: &str, expected: &str) -> bool {
+    if actual.len() != expected.len() {
+        return false;
+    }
+    actual
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn validate_operation_plan_authorization(
+    project: &ProjectContext,
+    plan: &OperationPlan,
+) -> Result<()> {
+    let expected = operation_plan_authorization(project, plan)?;
+    if !authorization_matches(&plan.authorization, &expected) {
+        return Err(CheckPoError::Corruption(
+            "operation plan authorization is invalid; preview the operation again".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_full_restore_target(
+    project: &ProjectContext,
+    checkpoint_id: &SnapshotId,
+) -> Result<()> {
+    let remaining = build_unsigned_plan_with_progress_and_cancellation(
+        project,
+        checkpoint_id.clone(),
+        OperationPlanKind::Restore,
+        None,
+        None,
+        None,
+    )?;
+    if !remaining.warnings.is_empty() || remaining.has_changes {
+        return Err(CheckPoError::WorkingTreeChanged(
+            "the working tree does not exactly match the restored checkpoint".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn plan_directory_topology_changes(
     project: &ProjectContext,
     operations: &[FileOperation],
@@ -364,17 +476,108 @@ fn plan_directory_topology_changes(
     Ok((remove, create))
 }
 
-pub(crate) fn normalize_discard_selection(
+pub(crate) fn validate_discard_request_scope(
     project: &ProjectContext,
-    checkpoint_id: &SnapshotId,
-    selected: &[TrackedUnityFilePath],
-) -> Result<Vec<TrackedUnityFilePath>> {
-    let snapshot = load_project_snapshot(project, checkpoint_id)?;
-    normalize_discard_selection_with_snapshot(
-        project,
-        snapshot.files.iter().map(|file| &file.path),
-        selected,
-    )
+    requested: &[TrackedUnityFilePath],
+    plan: &OperationPlan,
+) -> Result<()> {
+    if plan.kind != OperationPlanKind::Discard {
+        return Err(CheckPoError::Corruption(
+            "discard request requires a discard operation plan".to_string(),
+        ));
+    }
+    reject_selected_directory_meta(project, requested)?;
+    let requested = requested.iter().cloned().collect::<BTreeSet<_>>();
+    if requested.is_empty() {
+        return Err(CheckPoError::InvalidTrackedPath(
+            "discard requires selected tracked paths".to_string(),
+        ));
+    }
+    let selected = plan.selected_paths.as_ref().ok_or_else(|| {
+        CheckPoError::Corruption("discard plan requires selected paths".to_string())
+    })?;
+    let selected_set = selected.iter().cloned().collect::<BTreeSet<_>>();
+    if selected_set.len() != selected.len() || !selected.iter().eq(selected_set.iter()) {
+        return Err(CheckPoError::Corruption(
+            "discard plan selected paths are not normalized".to_string(),
+        ));
+    }
+    if !requested.is_subset(&selected_set) {
+        return Err(CheckPoError::WorkingTreeChanged(
+            "discard path set changed after preview".to_string(),
+        ));
+    }
+
+    // The preview owns the destructive scope. Validate its frozen expansion
+    // without walking the current tree, because Unity may legitimately create
+    // new files or companions after preview.
+    let mut authorized = requested.clone();
+    for candidate in &selected_set {
+        if requested
+            .iter()
+            .any(|root| path_is_same_or_descendant(candidate, root))
+        {
+            authorized.insert(candidate.clone());
+        }
+    }
+    loop {
+        let previous_len = authorized.len();
+        for path in authorized.clone() {
+            if let Some(companion) = unity_asset_companion_path(&path) {
+                if selected_set.contains(&companion) {
+                    authorized.insert(companion);
+                }
+            }
+        }
+        for candidate in selected_set
+            .difference(&authorized)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let deletes_blocker = plan.operations.iter().any(|operation| {
+                operation.path == candidate && operation.operation_type == FileOperationType::Delete
+            });
+            let creates_replacement_directory = plan.directories_to_create.contains(&candidate);
+            let blocks_authorized_target = plan.operations.iter().any(|operation| {
+                authorized.contains(&operation.path)
+                    && matches!(
+                        operation.operation_type,
+                        FileOperationType::Restore | FileOperationType::Replace
+                    )
+                    && path_is_strict_descendant(&operation.path, &candidate)
+            });
+            if deletes_blocker && creates_replacement_directory && blocks_authorized_target {
+                authorized.insert(candidate);
+            }
+        }
+        if authorized.len() == previous_len {
+            break;
+        }
+    }
+    if authorized != selected_set {
+        return Err(CheckPoError::WorkingTreeChanged(
+            "discard path set changed after preview".to_string(),
+        ));
+    }
+    validate_operation_plan_authorization(project, plan)?;
+    Ok(())
+}
+
+fn path_is_same_or_descendant(
+    candidate: &TrackedUnityFilePath,
+    root: &TrackedUnityFilePath,
+) -> bool {
+    candidate == root || path_is_strict_descendant(candidate, root)
+}
+
+fn path_is_strict_descendant(
+    candidate: &TrackedUnityFilePath,
+    root: &TrackedUnityFilePath,
+) -> bool {
+    candidate
+        .as_str()
+        .strip_prefix(root.as_str())
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn normalize_discard_selection_with_snapshot<'a>(
@@ -428,6 +631,30 @@ fn reject_selected_directory_meta(
         ) {
             return Err(CheckPoError::UnsafeFolderMetaOperation(path.to_string()));
         }
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_discard_folder_meta_operation_is_safe(
+    project: &ProjectContext,
+    path: &TrackedUnityFilePath,
+) -> Result<()> {
+    let value = path.as_str();
+    if !value.starts_with("Assets/") {
+        return Ok(());
+    }
+    let Some(asset) = value.strip_suffix(".meta") else {
+        return Ok(());
+    };
+    let asset = TrackedUnityFilePath::parse(asset)?;
+    if matches!(
+        current_path_kind(project, &asset)?,
+        CurrentPathKind::Directory
+    ) {
+        return Err(CheckPoError::WorkingTreeChanged(format!(
+            "{} became a Unity folder while discard was running",
+            path
+        )));
     }
     Ok(())
 }
@@ -587,24 +814,11 @@ fn current_companion_is_regular_file(
 
 pub(super) fn validate_expected_plan(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {
     validate_plan_shape(project, plan)?;
-    let current = build_plan(
-        project,
-        plan.checkpoint_id.clone(),
-        plan.kind,
-        plan.selected_paths.as_deref(),
-    )?;
-    if !current.warnings.is_empty() {
-        return Err(crate::user_error(format!(
-            "operation cannot be applied while scan warnings exist: {}",
-            current.warnings.join("; ")
-        )));
-    }
-    if &current != plan {
-        return Err(CheckPoError::WorkingTreeChanged(
-            "operation plan changed after preview".to_string(),
-        ));
-    }
-    Ok(())
+    validate_operation_plan_authorization(project, plan)?;
+    // The preview freezes the authorized paths. Changes outside that fixed
+    // plan remain ordinary working-tree differences instead of expanding a
+    // restore into newly discovered destructive operations.
+    recheck_preconditions(project, plan)
 }
 
 fn validate_plan_shape(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {
@@ -716,15 +930,38 @@ fn validate_plan_shape(project: &ProjectContext, plan: &OperationPlan) -> Result
                 "restore plan must not include selected paths".to_string(),
             ));
         }
-        OperationPlanKind::Discard if plan.selected_paths.is_none() => {
-            return Err(CheckPoError::Corruption(
-                "discard plan requires selected paths".to_string(),
-            ));
+        OperationPlanKind::Discard => {
+            let selected = plan.selected_paths.as_ref().ok_or_else(|| {
+                CheckPoError::Corruption("discard plan requires selected paths".to_string())
+            })?;
+            let selected_set = selected.iter().collect::<BTreeSet<_>>();
+            if selected.is_empty()
+                || selected_set.len() != selected.len()
+                || !selected.iter().eq(selected_set)
+            {
+                return Err(CheckPoError::Corruption(
+                    "discard plan selected paths are not normalized".to_string(),
+                ));
+            }
+            if plan
+                .operations
+                .iter()
+                .any(|operation| !selected.contains(&operation.path))
+            {
+                return Err(CheckPoError::Corruption(
+                    "discard plan operations exceed the selected scope".to_string(),
+                ));
+            }
         }
         _ => {}
     }
 
-    validate_journal_operations(project, &plan.checkpoint_id, &plan.operations)
+    validate_journal_operations(project, &plan.checkpoint_id, &plan.operations)?;
+    validate_journal_directory_topology(
+        &plan.operations,
+        &plan.directories_to_remove,
+        &plan.directories_to_create,
+    )
 }
 
 pub(super) fn validate_journal_operations(

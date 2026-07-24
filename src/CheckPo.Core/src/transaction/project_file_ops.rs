@@ -24,6 +24,9 @@ pub(super) struct DeferredBackupSource {
 pub(super) fn recheck_preconditions(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {
     let anchored_project = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
     for operation in &plan.operations {
+        if plan.kind == OperationPlanKind::Discard {
+            super::plan::ensure_discard_folder_meta_operation_is_safe(project, &operation.path)?;
+        }
         let full_path = operation
             .path
             .to_project_path(project.project_root.as_path());
@@ -270,13 +273,16 @@ pub(super) fn stage_object_for_transaction_prepared(
 /// must be removed after the backup parent barrier.
 pub(super) fn backup_project_file_deferred(
     project: &ProjectContext,
+    plan_kind: OperationPlanKind,
     anchored_project: &crate::storage::AnchoredRoot,
     anchored_repo: &crate::storage::AnchoredRoot,
     operation: &FileOperation,
     backup_path: &Path,
     backup_sync_batch: &mut crate::storage::AnchoredParentSyncBatch,
-    _project_sync_batch: &mut crate::storage::AnchoredParentSyncBatch,
 ) -> Result<Option<DeferredBackupSource>> {
+    if plan_kind == OperationPlanKind::Discard {
+        super::plan::ensure_discard_folder_meta_operation_is_safe(project, &operation.path)?;
+    }
     let expected_hash = required_before_hash(operation)?;
     let expected_size = operation.before_size_bytes.ok_or_else(|| {
         CheckPoError::Corruption(format!(
@@ -374,16 +380,25 @@ pub(super) fn backup_project_file_deferred(
 }
 
 pub(super) fn remove_deferred_backup_source(
+    project: &ProjectContext,
+    plan_kind: OperationPlanKind,
     anchored_project: &crate::storage::AnchoredRoot,
     deferred: DeferredBackupSource,
     source_sync_batch: &mut crate::storage::AnchoredParentSyncBatch,
 ) -> Result<()> {
+    if plan_kind == OperationPlanKind::Discard {
+        super::plan::ensure_discard_folder_meta_operation_is_safe(project, &deferred.path)?;
+    }
     let relative = Path::new(deferred.path.as_str());
     let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
     let (parent, leaf) = anchored_project.open_parent_for_mutation(relative, false)?;
     anchored_project.verify_parent_binding(parent_relative, &parent)?;
     parent.unlink_file_if_bound_versioned(&leaf, deferred.source, deferred.version)?;
-    source_sync_batch.record(parent)
+    source_sync_batch.record(parent)?;
+    if plan_kind == OperationPlanKind::Discard {
+        super::plan::ensure_discard_folder_meta_operation_is_safe(project, &deferred.path)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -502,15 +517,25 @@ fn restore_quarantined_project_file(source: &Path, quarantine_path: &Path) -> Re
 ///
 /// Returns true when the staged source remains and must be removed after the
 /// project-directory barrier has completed.
+pub(super) struct StagedFilePublishContext<'a> {
+    pub(super) project: &'a ProjectContext,
+    pub(super) plan_kind: OperationPlanKind,
+    pub(super) transaction_id: &'a str,
+}
+
 pub(super) fn restore_new_staged_file_to_project_deferred(
-    project: &ProjectContext,
+    context: StagedFilePublishContext<'_>,
     operation: &FileOperation,
     staged: &Path,
     destination: &Path,
-    transaction_id: &str,
     staged_sync_batch: &mut crate::storage::AnchoredParentSyncBatch,
     project_sync_batch: &mut crate::storage::AnchoredParentSyncBatch,
 ) -> Result<bool> {
+    let StagedFilePublishContext {
+        project,
+        plan_kind,
+        transaction_id,
+    } = context;
     if !matches!(
         operation.operation_type,
         FileOperationType::Restore | FileOperationType::Replace
@@ -587,6 +612,9 @@ pub(super) fn restore_new_staged_file_to_project_deferred(
         staged_parent.verify_file_binding(&staged_leaf, &staged_file)?;
         anchored_repo.verify_root_binding()?;
 
+        if plan_kind == OperationPlanKind::Discard {
+            super::plan::ensure_discard_folder_meta_operation_is_safe(project, &operation.path)?;
+        }
         match staged_parent.rename_no_replace_to(
             &staged_leaf,
             &staged_file,
@@ -609,6 +637,12 @@ pub(super) fn restore_new_staged_file_to_project_deferred(
                 staged_sync_batch.record(staged_parent)?;
                 anchored_project.verify_root_binding()?;
                 anchored_repo.verify_root_binding()?;
+                if plan_kind == OperationPlanKind::Discard {
+                    super::plan::ensure_discard_folder_meta_operation_is_safe(
+                        project,
+                        &operation.path,
+                    )?;
+                }
                 return Ok(false);
             }
             Err(error) if is_cross_device_error(&error) => {}
@@ -667,6 +701,9 @@ pub(super) fn restore_new_staged_file_to_project_deferred(
         destination_parent.verify_file_binding(temporary_leaf, &output)?;
         staged_parent.verify_file_binding(&staged_leaf, &staged_file)?;
         anchored_project.verify_parent_binding(project_parent_relative, &destination_parent)?;
+        if plan_kind == OperationPlanKind::Discard {
+            super::plan::ensure_discard_folder_meta_operation_is_safe(project, &operation.path)?;
+        }
         destination_parent
             .rename_no_replace_to(
                 temporary_leaf,
@@ -685,6 +722,12 @@ pub(super) fn restore_new_staged_file_to_project_deferred(
     match copy_result {
         Ok(()) => {
             project_sync_batch.record(destination_parent)?;
+            if plan_kind == OperationPlanKind::Discard {
+                super::plan::ensure_discard_folder_meta_operation_is_safe(
+                    project,
+                    &operation.path,
+                )?;
+            }
             Ok(true)
         }
         Err(error) => {
@@ -1029,61 +1072,6 @@ pub(super) fn set_project_file_mtime(
             "metadata readback mismatch for {}: expected {}, got {}",
             operation.path, target_modified_at_utc, readback
         )));
-    }
-    anchored_project.verify_binding(relative, &file)?;
-    anchored_project.verify_root_binding()
-}
-
-pub(super) fn set_project_file_mtime_to_target(
-    project: &ProjectContext,
-    operation: &FileOperation,
-) -> Result<()> {
-    let target_modified_at_utc = operation.after_modified_at_utc.as_deref().ok_or_else(|| {
-        CheckPoError::Corruption(format!(
-            "target operation missing mtime for {}",
-            operation.path
-        ))
-    })?;
-    let expected_hash = required_after_hash(operation)?;
-    let expected_size = operation.after_size_bytes.ok_or_else(|| {
-        CheckPoError::Corruption(format!(
-            "target operation missing size for {}",
-            operation.path
-        ))
-    })?;
-    let path = operation
-        .path
-        .to_project_path(project.project_root.as_path());
-    let relative = Path::new(operation.path.as_str());
-    let anchored_project = crate::storage::AnchoredRoot::open(project.project_root.as_path())?;
-    let mut file = anchored_project.open_file_read_write(relative)?;
-    let hashed = file.hash()?;
-    if &hashed.object_id != expected_hash || hashed.metadata.len() != expected_size {
-        return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
-    }
-    let current_modified_at_utc = hashed
-        .metadata
-        .modified()
-        .map(crate::canonical_utc)
-        .map_err(|error| crate::io_error(&path, error))?;
-    if current_modified_at_utc != target_modified_at_utc {
-        let time = chrono::DateTime::parse_from_rfc3339(target_modified_at_utc)
-            .map_err(|error| CheckPoError::Corruption(error.to_string()))?
-            .with_timezone(&chrono::Utc);
-        file.set_mtime(time.into())?;
-        file.sync_all()?;
-    }
-    let readback = file.hash()?;
-    let readback_modified_at_utc = readback
-        .metadata
-        .modified()
-        .map(crate::canonical_utc)
-        .map_err(|error| crate::io_error(&path, error))?;
-    if readback.object_id != *expected_hash
-        || readback.metadata.len() != expected_size
-        || readback_modified_at_utc != target_modified_at_utc
-    {
-        return Err(CheckPoError::WorkingTreeChanged(operation.path.to_string()));
     }
     anchored_project.verify_binding(relative, &file)?;
     anchored_project.verify_root_binding()
