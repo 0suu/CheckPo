@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(all(test, unix))]
-mod tests {
+mod unix_tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
