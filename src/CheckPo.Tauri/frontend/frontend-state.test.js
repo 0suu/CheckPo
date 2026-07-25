@@ -790,6 +790,8 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
   assert.match(appJs, /statusBannerText/);
   assert.match(appJs, /contextMenuReturnFocus/);
   assert.match(appJs, /visibleModalOverlay\(\) \|\| document\.body/);
+  assert.match(appJs, /menu\.inert = false/);
+  assert.match(appJs, /menu\.removeAttribute\("aria-hidden"\)/);
   assert.match(stylesCss, /\.confirm-box \{[\s\S]*?max-height: calc\(100vh - 36px\);[\s\S]*?overflow: auto;/);
   assert.match(stylesCss, /#projectStatusPath \{[\s\S]*?text-overflow: ellipsis;/);
   assert.match(indexHtml, /id="checkpointName"[^>]*aria-label="チェックポイント名"/);

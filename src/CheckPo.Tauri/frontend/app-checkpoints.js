@@ -514,6 +514,8 @@ function showContextMenu(x, y, items) {
   if (!menu) return;
   contextMenuReturnFocus = document.activeElement;
   (visibleModalOverlay() || document.body).append(menu);
+  menu.inert = false;
+  menu.removeAttribute("aria-hidden");
   menu.replaceChildren();
   for (const item of items) {
     if (item.separator) {
