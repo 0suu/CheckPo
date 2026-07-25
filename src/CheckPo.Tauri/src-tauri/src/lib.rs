@@ -226,6 +226,49 @@ async fn start_as_separate_project(
 }
 
 #[tauri::command]
+async fn start_new_history_after_storage_loss(
+    app: AppHandle,
+    state: tauri::State<'_, OperationState>,
+    project_path: String,
+    storage_root_path: Option<String>,
+    confirmed: bool,
+    create_initial_checkpoint: Option<bool>,
+    initial_checkpoint_name: Option<String>,
+) -> AppResult {
+    require_confirmation(
+        confirmed,
+        "starting a new history after storage loss requires confirmation.",
+    )?;
+    run_cancellable_blocking(app, state, move |token, progress| {
+        match storage_root_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        {
+            Some(storage_root_path) => {
+                core::start_new_history_after_storage_loss_with_storage_root(
+                    &project_path,
+                    storage_root_path,
+                    core::ApplyOptions { yes: confirmed },
+                )
+            }
+            None => core::start_new_history_after_storage_loss(
+                &project_path,
+                core::ApplyOptions { yes: confirmed },
+            ),
+        }
+        .map_err(to_app_error)?;
+        project_snapshot_after_start(
+            project_path,
+            create_initial_checkpoint.unwrap_or(false),
+            initial_checkpoint_name,
+            token,
+            progress,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 async fn set_storage_root(
     state: tauri::State<'_, OperationState>,
     project_path: String,
@@ -877,6 +920,7 @@ pub fn run() {
             confirm_project_location,
             init_project,
             start_as_separate_project,
+            start_new_history_after_storage_loss,
             set_storage_root,
             refresh_project,
             create_checkpoint,

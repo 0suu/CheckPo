@@ -74,6 +74,7 @@ pub use project::{
     confirm_project_location, default_storage_root, init_project, init_project_with_storage_root,
     load_project, load_project_view, marker_path, project_view, registry_path,
     start_as_separate_project, start_as_separate_project_with_storage_root,
+    start_new_history_after_storage_loss, start_new_history_after_storage_loss_with_storage_root,
 };
 pub use restore::{
     apply_restore_plan, apply_restore_plan_with_progress_and_cancellation, preview_restore,

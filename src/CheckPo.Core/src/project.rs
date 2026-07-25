@@ -42,7 +42,11 @@ pub fn start_as_separate_project(
     options: crate::ApplyOptions,
 ) -> Result<ProjectView> {
     require_start_as_separate_confirmation(project_path.as_ref(), options)?;
-    init_project_internal(project_path.as_ref(), InitMode::ForceNewProject, None)
+    init_project_internal(
+        project_path.as_ref(),
+        InitMode::ForceNewProject(ForceNewProjectReason::CopiedProject),
+        None,
+    )
 }
 
 pub fn start_as_separate_project_with_storage_root(
@@ -53,7 +57,32 @@ pub fn start_as_separate_project_with_storage_root(
     require_start_as_separate_confirmation(project_path.as_ref(), options)?;
     init_project_internal(
         project_path.as_ref(),
-        InitMode::ForceNewProject,
+        InitMode::ForceNewProject(ForceNewProjectReason::CopiedProject),
+        Some(storage_root_path.as_ref()),
+    )
+}
+
+pub fn start_new_history_after_storage_loss(
+    project_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
+) -> Result<ProjectView> {
+    require_start_as_separate_confirmation(project_path.as_ref(), options)?;
+    init_project_internal(
+        project_path.as_ref(),
+        InitMode::ForceNewProject(ForceNewProjectReason::StorageLoss),
+        None,
+    )
+}
+
+pub fn start_new_history_after_storage_loss_with_storage_root(
+    project_path: impl AsRef<Path>,
+    storage_root_path: impl AsRef<Path>,
+    options: crate::ApplyOptions,
+) -> Result<ProjectView> {
+    require_start_as_separate_confirmation(project_path.as_ref(), options)?;
+    init_project_internal(
+        project_path.as_ref(),
+        InitMode::ForceNewProject(ForceNewProjectReason::StorageLoss),
         Some(storage_root_path.as_ref()),
     )
 }
@@ -315,7 +344,22 @@ pub(crate) fn validate_unity_project_root(project_root: &Path) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitMode {
     Normal,
-    ForceNewProject,
+    ForceNewProject(ForceNewProjectReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForceNewProjectReason {
+    CopiedProject,
+    StorageLoss,
+}
+
+impl InitMode {
+    fn force_new_reason(self) -> Option<ForceNewProjectReason> {
+        match self {
+            Self::Normal => None,
+            Self::ForceNewProject(reason) => Some(reason),
+        }
+    }
 }
 
 fn init_project_internal(
@@ -339,7 +383,7 @@ fn init_project_internal(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(crate::io_error(&marker_path, error)),
     };
-    let pending_separate_init = if mode == InitMode::ForceNewProject {
+    let pending_separate_init = if mode.force_new_reason().is_some() {
         load_separate_init_pending(&project_root)?
     } else {
         None
@@ -358,7 +402,7 @@ fn init_project_internal(
             )));
         }
     }
-    let marker = if mode == InitMode::ForceNewProject {
+    let marker = if mode.force_new_reason().is_some() {
         pending_separate_init
             .as_ref()
             .map(|pending| pending.new_marker.clone())
@@ -401,7 +445,7 @@ fn init_project_internal(
         )));
     }
     let registry = load_registry()?;
-    if mode == InitMode::ForceNewProject {
+    if mode.force_new_reason().is_some() {
         if let Some(entry) = registry.projects.get(marker.project_id.as_str()) {
             let registered_project_root = normalize_path_for_check(&entry.last_project_root_path)?;
             if pending_separate_init.is_none() || registered_project_root != project_root {
@@ -413,7 +457,7 @@ fn init_project_internal(
             }
         }
     }
-    if mode == InitMode::ForceNewProject {
+    if let Some(reason) = mode.force_new_reason() {
         let existing_marker = load_project_marker(&marker_path).map_err(|error| match error {
             CheckPoError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
                 crate::user_error(
@@ -433,22 +477,45 @@ fn init_project_internal(
             })?;
         let (status, _) =
             project_location_status_and_warnings(&project_root, &existing_marker.project_id, entry);
-        if status != ProjectLocationStatus::CopiedSuspected {
-            return Err(crate::user_error(
-                "starting as a separate project is only allowed for a copied project.",
-            ));
-        }
         let old_storage_root = normalize_existing_dir_or_create_parent(&entry.storage_root_path)?;
+        let old_repo_root = repo_root(&old_storage_root, &existing_marker.project_id);
+        match reason {
+            ForceNewProjectReason::CopiedProject => {
+                if status != ProjectLocationStatus::CopiedSuspected {
+                    return Err(crate::user_error(
+                        "starting as a separate project is only allowed for a copied project.",
+                    ));
+                }
+            }
+            ForceNewProjectReason::StorageLoss => {
+                if status == ProjectLocationStatus::CopiedSuspected {
+                    return Err(crate::user_error(
+                        "starting a new history after storage loss is not allowed for a copied project.",
+                    ));
+                }
+                if pending_separate_init.is_none()
+                    && old_repo_root
+                        .try_exists()
+                        .map_err(|error| crate::io_error(&old_repo_root, error))?
+                {
+                    return Err(crate::user_error(
+                        "starting a new history after storage loss is only allowed when the registered repository is unavailable.",
+                    ));
+                }
+            }
+        }
         let old_context = ProjectContext {
             project_id: existing_marker.project_id.clone(),
             project_root: ProjectRoot::new(project_root.clone()),
-            repo_root: repo_root(&old_storage_root, &existing_marker.project_id),
+            repo_root: old_repo_root,
             storage_root: StorageRoot::new(old_storage_root),
             location_status: status,
             warnings: Vec::new(),
         };
-        crate::ensure_no_pending_transactions(&old_context)?;
-        crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
+        if reason == ForceNewProjectReason::CopiedProject {
+            crate::ensure_no_pending_transactions(&old_context)?;
+            crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
+        }
     }
     if mode == InitMode::Normal
         && registered_project_root_conflict(
@@ -494,7 +561,7 @@ fn init_project_internal(
         crate::storage::AnchoredRoot::open(&project_root)?
             .write_json_atomic_path(&marker_path, &marker)?;
     }
-    if mode == InitMode::ForceNewProject && pending_separate_init.is_none() {
+    if mode.force_new_reason().is_some() && pending_separate_init.is_none() {
         let previous_project_id = existing_marker
             .as_ref()
             .ok_or_else(|| {
@@ -521,7 +588,7 @@ fn init_project_internal(
         &project_root,
         &storage_root,
     )?;
-    if mode == InitMode::ForceNewProject {
+    if mode.force_new_reason().is_some() {
         crate::storage::AnchoredRoot::open(&project_root)?
             .write_json_atomic_path(&marker_path, &marker)?;
         remove_separate_init_pending(&project_root)?;

@@ -108,6 +108,7 @@ function confirmAction(message, okLabel = "戻す", options = {}) {
     const overlay = $("confirmOverlay");
     const okButton = $("confirmOkButton");
     const cancelButton = $("confirmCancelButton");
+    const alternativeButton = $("confirmAlternativeButton");
     const initialCheckpointChoice = $("confirmInitialCheckpointChoice");
     const includeInitialCheckpointChoice = Boolean(options.initialCheckpointChoice);
     $("confirmMessage").textContent = message;
@@ -119,6 +120,7 @@ function confirmAction(message, okLabel = "戻す", options = {}) {
     overlay.hidden = false;
     okButton.disabled = false;
     cancelButton.disabled = false;
+    alternativeButton.hidden = true;
 
     const finish = (value) => {
       overlay.hidden = true;
@@ -154,6 +156,7 @@ function chooseCopiedProjectAction(message) {
     const overlay = $("confirmOverlay");
     const okButton = $("confirmOkButton");
     const cancelButton = $("confirmCancelButton");
+    const alternativeButton = $("confirmAlternativeButton");
     const initialCheckpointChoice = $("confirmInitialCheckpointChoice");
     $("confirmMessage").textContent = message;
     cancelButton.textContent = "この場所を使う";
@@ -163,6 +166,7 @@ function chooseCopiedProjectAction(message) {
     overlay.hidden = false;
     okButton.disabled = false;
     cancelButton.disabled = false;
+    alternativeButton.hidden = true;
 
     const finish = (value) => {
       overlay.hidden = true;
@@ -188,6 +192,53 @@ function chooseCopiedProjectAction(message) {
 
     okButton.addEventListener("click", onStartSeparate);
     cancelButton.addEventListener("click", onUseLocation);
+    overlay.addEventListener("click", onOverlayClick);
+    document.addEventListener("keydown", onKeyDown);
+    cancelButton.focus();
+  });
+}
+
+function chooseUnavailableStorageAction(message) {
+  return new Promise((resolve) => {
+    const overlay = $("confirmOverlay");
+    const okButton = $("confirmOkButton");
+    const alternativeButton = $("confirmAlternativeButton");
+    const cancelButton = $("confirmCancelButton");
+    const initialCheckpointChoice = $("confirmInitialCheckpointChoice");
+    $("confirmMessage").textContent = message;
+    cancelButton.textContent = "キャンセル";
+    alternativeButton.textContent = "再接続せず新しい履歴で開始";
+    okButton.textContent = "保存データへ再接続";
+    initialCheckpointChoice.hidden = true;
+    overlay.hidden = false;
+    okButton.disabled = false;
+    alternativeButton.hidden = false;
+    alternativeButton.disabled = false;
+    cancelButton.disabled = false;
+
+    const finish = (action) => {
+      overlay.hidden = true;
+      alternativeButton.hidden = true;
+      alternativeButton.removeEventListener("click", onStartNewHistory);
+      okButton.removeEventListener("click", onReconnect);
+      cancelButton.removeEventListener("click", onCancel);
+      overlay.removeEventListener("click", onOverlayClick);
+      document.removeEventListener("keydown", onKeyDown);
+      resolve(action);
+    };
+    const onStartNewHistory = () => finish("startNewHistory");
+    const onReconnect = () => finish("reconnect");
+    const onCancel = () => finish(null);
+    const onOverlayClick = (event) => {
+      if (event.target === overlay) finish(null);
+    };
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") finish(null);
+    };
+
+    alternativeButton.addEventListener("click", onStartNewHistory);
+    okButton.addEventListener("click", onReconnect);
+    cancelButton.addEventListener("click", onCancel);
     overlay.addEventListener("click", onOverlayClick);
     document.addEventListener("keydown", onKeyDown);
     cancelButton.focus();
