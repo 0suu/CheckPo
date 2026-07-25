@@ -7,6 +7,7 @@ on:
         description: Checkpoints in the hosted-runner correctness scale
         required: false
         default: "100"
+        type: string
   schedule:
     - cron: "23 18 * * *"
 
@@ -23,8 +24,6 @@ jobs:
       # Hosted runners are noisy, so this catches catastrophic regressions rather
       # than attempting a precise benchmark comparison.
       CHECKPO_SCALE_MAX_SECONDS: "300"
-      CHECKPO_SCALE_REPORT: ${{ runner.temp }}/checkpo-scale-report.json
-      CHECKPO_SCALE_ROOT: ${{ runner.temp }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,6 +40,9 @@ jobs:
             . -> target
 
       - name: Run scale correctness and integrity checks
+        env:
+          CHECKPO_SCALE_REPORT: ${{ runner.temp }}/checkpo-scale-report.json
+          CHECKPO_SCALE_ROOT: ${{ runner.temp }}
         run: cargo test --release -p checkpo-core --test v2_scale --locked -- --ignored --nocapture
 
       - name: Upload scale measurements
@@ -48,5 +50,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: checkpo-scale-${{ runner.os }}
-          path: ${{ env.CHECKPO_SCALE_REPORT }}
+          path: ${{ runner.temp }}/checkpo-scale-report.json
           if-no-files-found: error
