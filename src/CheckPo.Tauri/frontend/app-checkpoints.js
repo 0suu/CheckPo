@@ -5,11 +5,8 @@ function createWorkingCheckpointSection(changeCount) {
   const heading = document.createElement("div");
   heading.className = "checkpoint-section-label";
   heading.textContent = t("workingFolder");
-  const working = document.createElement("button");
-  working.type = "button";
+  const working = document.createElement("div");
   working.className = "checkpoint-row working-row";
-  working.setAttribute("role", "option");
-  working.setAttribute("aria-selected", "false");
   working.innerHTML = `
     <span class="checkpoint-id mono">now</span>
     <strong class="checkpoint-title">未保存の変更</strong>
@@ -17,12 +14,6 @@ function createWorkingCheckpointSection(changeCount) {
   `;
   working.querySelector(".checkpoint-meta").textContent =
     `${CheckPoFrontendState.latestDiffCountText(changeCount, state.latestDiffExact)}${t("fileUnit")}`;
-  working.addEventListener("click", async () => {
-    await run("再読み込み中", async () => {
-      await refreshProject();
-      await refreshLatestDiff({ allowBusy: true });
-    });
-  });
   section.append(heading, working);
   return section;
 }
