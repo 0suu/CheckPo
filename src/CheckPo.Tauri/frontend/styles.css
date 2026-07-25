@@ -2236,6 +2236,7 @@ input[type="text"] {
 .checkpoint-row.is-selected,
 .history-sidebar .checkpoint-row.is-selected {
   outline: 1px solid #bfdbfe;
+  outline-offset: -1px;
   background: var(--primary-soft);
 }
 
@@ -2251,11 +2252,6 @@ input[type="text"] {
 .history-sidebar .checkpoint-row.working-row {
   border: 1px solid rgba(245, 158, 11, 0.32);
   background: rgba(245, 158, 11, 0.1);
-}
-
-.checkpoint-row.working-row:hover,
-.history-sidebar .checkpoint-row.working-row:hover {
-  background: rgba(245, 158, 11, 0.16);
 }
 
 .checkpoint-id {
