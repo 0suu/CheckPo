@@ -55,6 +55,7 @@ const {
   storageSummaryWithRetainedSize,
   transactionRecoveryGuidance,
   transactionCleanupPlanHasCandidates,
+  userFacingPath,
   virtualTreeWindowRange,
   visibleProgressPhase,
   warningBannerText,
@@ -191,6 +192,16 @@ test("storage input comparison trims whitespace and trailing separators only", (
   assert.equal(samePathInput("/Volumes/Data/", "/Volumes/Data"), true);
   assert.equal(samePathInput("/Volumes/Data", "/volumes/data"), false);
   assert.equal(samePathInput("", ""), false);
+});
+
+test("user-facing Windows paths hide the verbatim path prefix", () => {
+  assert.equal(userFacingPath("\\\\?\\D:\\ACP"), "D:\\ACP");
+  assert.equal(
+    userFacingPath("\\\\?\\UNC\\server\\share\\CheckPo"),
+    "\\\\server\\share\\CheckPo",
+  );
+  assert.equal(userFacingPath("D:\\ACP"), "D:\\ACP");
+  assert.equal(samePathInput("\\\\?\\D:\\ACP", "D:\\ACP"), true);
 });
 
 test("checkpoint search is case-insensitive and preserves matching object identity", () => {
