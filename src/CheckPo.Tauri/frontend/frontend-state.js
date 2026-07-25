@@ -192,9 +192,21 @@
     return trimmed.replace(/[\\/]+$/, "") || trimmed;
   }
 
+  function userFacingPath(value) {
+    const path = String(value || "");
+    const verbatimPrefix = "\\\\?\\";
+    if (!path.startsWith(verbatimPrefix)) return path;
+    const withoutPrefix = path.slice(verbatimPrefix.length);
+    if (withoutPrefix.toUpperCase().startsWith("UNC\\")) {
+      return `\\\\${withoutPrefix.slice(4)}`;
+    }
+    return withoutPrefix;
+  }
+
   function samePathInput(left, right) {
-    const normalizedLeft = normalizedPathInput(left);
-    return Boolean(normalizedLeft) && normalizedLeft === normalizedPathInput(right);
+    const normalizedLeft = normalizedPathInput(userFacingPath(left));
+    return Boolean(normalizedLeft)
+      && normalizedLeft === normalizedPathInput(userFacingPath(right));
   }
 
   function checkpointSearchText(checkpoint) {
@@ -719,6 +731,7 @@
     groupRecoveryConflicts,
     transactionRecoveryGuidance,
     transactionCleanupPlanHasCandidates,
+    userFacingPath,
     restorePlanHasChanges,
     restorePlanCanApply,
     restorePreviewIsRedundant,

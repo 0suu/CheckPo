@@ -898,12 +898,14 @@ async function restoreLastProject() {
 
 function renderProjectLabels() {
   const label = state.project?.projectName || basename(state.projectPath) || t("projectSelectPlaceholder");
+  const projectPath = CheckPoFrontendState.userFacingPath(state.projectPath);
+  const storageRootPath = CheckPoFrontendState.userFacingPath(state.project?.storageRootPath);
   $("projectMenuLabel").textContent = label;
   $("projectMenuButton").classList.toggle("has-selection", Boolean(state.projectPath));
   if ($("projectRegistrationOverlay").hidden) {
-    $("projectPath").value = state.projectPath || "";
+    $("projectPath").value = projectPath;
   }
-  $("settingsStorageRootPath").value = state.project?.storageRootPath ?? "-";
+  $("settingsStorageRootPath").value = storageRootPath || "-";
   $("settingsNewStorageRootPath").value = "";
   renderDefaultStorageRootPath();
   const active = selectedCheckpoint();
@@ -911,8 +913,8 @@ function renderProjectLabels() {
   $("activeCheckpointTitle").textContent = active
     ? `${active.name || active.checkpointId} → ${t("workingFolder")}`
     : t("noSelection");
-  $("projectStatusPath").textContent = state.projectPath || "-";
-  $("projectStatusPath").title = state.projectPath || "";
+  $("projectStatusPath").textContent = projectPath || "-";
+  $("projectStatusPath").title = projectPath;
   updateProjectEmptyState();
 }
 
@@ -1049,8 +1051,10 @@ function renderProjectWarnings(warnings) {
 
 function projectWarningText(warning) {
   if (["projectMoved", "copiedProjectSuspected"].includes(warning?.kind)) {
-    const previous = warning.previousProjectRootPath || "-";
-    const current = warning.currentProjectRootPath || state.projectPath || "-";
+    const previous = CheckPoFrontendState.userFacingPath(warning.previousProjectRootPath) || "-";
+    const current = CheckPoFrontendState.userFacingPath(
+      warning.currentProjectRootPath || state.projectPath,
+    ) || "-";
     if (warning.previousMarkerHasSameProjectId || warning.locationStatus === "copiedSuspected") {
       return `同じ project_id が別の場所にも登録されています。以前の場所: ${previous} / 現在の場所: ${current}。コピーした Unity プロジェクトの可能性があります。`;
     }
@@ -1343,10 +1347,11 @@ async function isCopiedProjectAtPath(projectPath) {
 }
 
 function copiedProjectRegistrationChoiceMessage(projectPath) {
+  const displayedProjectPath = CheckPoFrontendState.userFacingPath(projectPath);
   return [
     "この Unity プロジェクトは、すでに CheckPo に登録済みのプロジェクトをコピーした可能性があります。",
     "",
-    `現在の場所: ${projectPath || "現在の場所"}`,
+    `現在の場所: ${displayedProjectPath || "現在の場所"}`,
     "",
     "既存のチェックポイント履歴をこの場所に紐づけ直す場合は「この場所を使う」を選んでください。",
     "コピー元とは別の履歴として始める場合は「別プロジェクトとして開始」を選んでください。",
@@ -1428,8 +1433,11 @@ function copiedLocationConfirmMessage() {
   const warning = (state.projectWarnings || []).find((item) =>
     item?.kind === "copiedProjectSuspected" || item?.locationStatus === "copiedSuspected"
   );
-  const previous = warning?.previousProjectRootPath || "以前の場所";
-  const current = warning?.currentProjectRootPath || state.projectPath || "現在の場所";
+  const previous = CheckPoFrontendState.userFacingPath(warning?.previousProjectRootPath)
+    || "以前の場所";
+  const current = CheckPoFrontendState.userFacingPath(
+    warning?.currentProjectRootPath || state.projectPath,
+  ) || "現在の場所";
   return [
     "この場所を同じプロジェクトとして使います。",
     "",
@@ -1446,8 +1454,11 @@ function startSeparateProjectConfirmMessage() {
   const warning = (state.projectWarnings || []).find((item) =>
     item?.kind === "copiedProjectSuspected" || item?.locationStatus === "copiedSuspected"
   );
-  const previous = warning?.previousProjectRootPath || "コピー元の場所";
-  const current = warning?.currentProjectRootPath || state.projectPath || "現在の場所";
+  const previous = CheckPoFrontendState.userFacingPath(warning?.previousProjectRootPath)
+    || "コピー元の場所";
+  const current = CheckPoFrontendState.userFacingPath(
+    warning?.currentProjectRootPath || state.projectPath,
+  ) || "現在の場所";
   return [
     "この場所を別プロジェクトとして開始します。",
     "",
