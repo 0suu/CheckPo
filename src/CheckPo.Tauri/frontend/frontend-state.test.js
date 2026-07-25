@@ -814,6 +814,17 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
   assert.equal(tauriConfig.app.windows[0].minHeight, 560);
 });
 
+test("errors use the error presentation without duplicating the status banner", () => {
+  const appJs = readAppSource();
+  const showError = appJs.match(
+    /function showError\(error\) \{[\s\S]*?\r?\n}\r?\n/,
+  )?.[0] || "";
+
+  assert.match(showError, /appendLog\(display\.message\)/);
+  assert.match(showError, /showVisibleError\(display\.message\)/);
+  assert.doesNotMatch(showError, /setStatus\(/);
+});
+
 test("pending transaction errors resync the project so the recovery action becomes visible", () => {
   const appJs = readAppSource();
   const helper = appJs.match(

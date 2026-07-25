@@ -342,7 +342,7 @@ function displayError(error) {
 
 function showError(error) {
   const display = displayError(error);
-  setStatus(display.message);
+  appendLog(display.message);
   setResult(display.detail ? { error: display.message, detail: display.detail } : { error: display.message });
   showVisibleError(display.message);
   if (!$('rollbackOverlay')?.hidden) {
