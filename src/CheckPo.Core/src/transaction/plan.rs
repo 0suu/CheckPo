@@ -652,8 +652,7 @@ pub(super) fn ensure_discard_folder_meta_operation_is_safe(
         CurrentPathKind::Directory
     ) {
         return Err(CheckPoError::WorkingTreeChanged(format!(
-            "{} became a Unity folder while discard was running",
-            path
+            "{path} became a Unity folder while discard was running"
         )));
     }
     Ok(())
