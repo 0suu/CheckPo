@@ -533,69 +533,6 @@ fn platform_fingerprint_is_strong_enough_for_hash_reuse() -> bool {
     false
 }
 
-#[cfg(unix)]
-pub(crate) fn file_fingerprint(_path: &Path, metadata: &fs::Metadata) -> Result<Option<String>> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(Some(format!(
-        "unix-v1:{}:{}:{}:{}:{}:{}:{}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec()
-    )))
-}
-
-#[cfg(windows)]
-pub(crate) fn file_fingerprint(path: &Path, metadata: &fs::Metadata) -> Result<Option<String>> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO,
-    };
-
-    let file = fs::File::open(path).map_err(|error| crate::io_error(path, error))?;
-    let mut handle_info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), handle_info.as_mut_ptr()) };
-    if ok == 0 {
-        return Err(crate::io_error(path, std::io::Error::last_os_error()));
-    }
-    let handle_info = unsafe { handle_info.assume_init() };
-
-    let mut basic_info = MaybeUninit::<FILE_BASIC_INFO>::uninit();
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileBasicInfo,
-            basic_info.as_mut_ptr().cast(),
-            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
-        )
-    };
-    if ok == 0 {
-        return Err(crate::io_error(path, std::io::Error::last_os_error()));
-    }
-    let basic_info = unsafe { basic_info.assume_init() };
-    let file_index = ((handle_info.nFileIndexHigh as u64) << 32) | handle_info.nFileIndexLow as u64;
-    Ok(Some(format!(
-        "windows-v2:{}:{}:{}:{}:{}:{}:{}",
-        handle_info.dwVolumeSerialNumber,
-        file_index,
-        metadata.len(),
-        basic_info.CreationTime,
-        basic_info.LastWriteTime,
-        basic_info.ChangeTime,
-        handle_info.dwFileAttributes
-    )))
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn file_fingerprint(_path: &Path, _metadata: &fs::Metadata) -> Result<Option<String>> {
-    Ok(None)
-}
-
 #[cfg(test)]
 mod benchmarks {
     use super::*;
@@ -691,12 +628,14 @@ mod benchmarks {
         assert!(!incomplete, "scan warnings: {warnings:?}");
 
         let fingerprint_started = Instant::now();
+        let anchored_project = crate::storage::AnchoredRoot::open(&project).unwrap();
         let fingerprints = files
             .par_iter()
             .map(|file| {
-                let metadata = fs::metadata(&file.full_path)
-                    .map_err(|error| crate::io_error(&file.full_path, error))?;
-                file_fingerprint(&file.full_path, &metadata)
+                let relative = file.full_path.strip_prefix(&project).map_err(|_| {
+                    CheckPoError::OutsideTrackedScope(file.full_path.display().to_string())
+                })?;
+                anchored_project.open_file(relative)?.fingerprint()
             })
             .collect::<Result<Vec<_>>>()
             .unwrap();

@@ -763,16 +763,28 @@ pub fn list_checkpoints(project_path: impl AsRef<Path>) -> Result<Vec<Checkpoint
     list_checkpoints_for_project(&project)
 }
 
-pub fn list_checkpoints_for_project(
+pub(crate) fn list_checkpoints_for_project(
     project: &crate::ProjectContext,
 ) -> Result<Vec<CheckpointSummary>> {
-    Ok(list_checkpoints_with_warnings_for_project(project)?.checkpoints)
+    // Preserve the legacy Vec-returning API by surfacing result-level warnings
+    // on its first item. New callers should use CheckpointListResult instead.
+    let mut result = list_checkpoints_with_warnings_for_project(project)?;
+    if let Some(first) = result.checkpoints.first_mut() {
+        first.warnings.append(&mut result.warnings);
+    }
+    Ok(result.checkpoints)
 }
 
 pub fn list_checkpoints_with_warnings_for_project(
     project: &crate::ProjectContext,
 ) -> Result<CheckpointListResult> {
     let _lock = crate::acquire_project_repository_shared_lock(project, "checkpoint-list")?;
+    list_checkpoints_with_warnings_for_project_unlocked(project)
+}
+
+pub(crate) fn list_checkpoints_with_warnings_for_project_unlocked(
+    project: &crate::ProjectContext,
+) -> Result<CheckpointListResult> {
     let mut checkpoints = crate::list_checkpoint_summaries_from_index(project)?;
     let mut warnings = Vec::new();
     warnings.extend(crate::apply_checkpoint_name_overrides(
@@ -879,7 +891,7 @@ pub fn delete_checkpoint(
         ));
     }
     let update_index = matches!(
-        crate::checkpoint_index_status(&project),
+        crate::checkpoint_index_status_unlocked(&project),
         Ok(status) if status.state == crate::CheckpointIndexState::Current
     );
     let (_, name_warnings) = crate::read_checkpoint_name_overrides(&project);

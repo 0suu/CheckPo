@@ -1,0 +1,52 @@
+name: Performance regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      checkpoint_count:
+        description: Checkpoints in the hosted-runner correctness scale
+        required: false
+        default: "100"
+  schedule:
+    - cron: "23 18 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-scale:
+    name: Snapshot scale invariants
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CHECKPO_SCALE_CHECKPOINTS: ${{ inputs.checkpoint_count || '100' }}
+      # Hosted runners are noisy, so this catches catastrophic regressions rather
+      # than attempting a precise benchmark comparison.
+      CHECKPO_SCALE_MAX_SECONDS: "300"
+      CHECKPO_SCALE_REPORT: ${{ runner.temp }}/checkpo-scale-report.json
+      CHECKPO_SCALE_ROOT: ${{ runner.temp }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Run scale correctness and integrity checks
+        run: cargo test --release -p checkpo-core --test v2_scale --locked -- --ignored --nocapture
+
+      - name: Upload scale measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkpo-scale-${{ runner.os }}
+          path: ${{ env.CHECKPO_SCALE_REPORT }}
+          if-no-files-found: error

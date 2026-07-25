@@ -114,6 +114,77 @@ fn open_test_index(repo: &std::path::Path) -> rusqlite::Connection {
 }
 
 #[test]
+fn project_status_uses_one_typed_shape_for_index_only_and_exact_storage() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "one", Default::default()).unwrap();
+
+    let index_only = core::project_status(
+        &project,
+        core::ProjectStatusOptions {
+            storage_detail: core::StorageSummaryDetail::IndexOnly,
+        },
+    )
+    .unwrap();
+    let exact = core::project_status(
+        &project,
+        core::ProjectStatusOptions {
+            storage_detail: core::StorageSummaryDetail::Exact,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(index_only.checkpoints.as_ref().map(Vec::len), Some(1));
+    assert_eq!(exact.checkpoints.as_ref().map(Vec::len), Some(1));
+    let index_only_storage = index_only.storage.unwrap();
+    let exact_storage = exact.storage.unwrap();
+    assert_eq!(
+        index_only_storage.checkpoint_count,
+        exact_storage.checkpoint_count
+    );
+    assert_eq!(
+        index_only_storage.unique_blob_count,
+        exact_storage.unique_blob_count
+    );
+    assert_eq!(
+        index_only_storage.logical_size_bytes,
+        exact_storage.logical_size_bytes
+    );
+    assert_eq!(
+        index_only_storage.detail,
+        core::StorageSummaryDetail::IndexOnly
+    );
+    assert!(index_only_storage.stored_size_bytes.is_none());
+    assert_eq!(exact_storage.detail, core::StorageSummaryDetail::Exact);
+    assert!(exact_storage.stored_size_bytes.is_some());
+}
+
+#[test]
+fn project_status_represents_an_unavailable_index_with_null_collections() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    fs::remove_file(core::db_path(&repo_path(&view)).unwrap()).unwrap();
+
+    let status = core::project_status(
+        &project,
+        core::ProjectStatusOptions {
+            storage_detail: core::StorageSummaryDetail::IndexOnly,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        status.checkpoint_index.state,
+        core::CheckpointIndexState::Missing
+    );
+    assert!(status.checkpoints.is_none());
+    assert!(status.storage.is_none());
+}
+
+#[test]
 fn derived_sqlite_databases_live_outside_the_repository() {
     let (_guard, _temp, project, data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
@@ -1434,6 +1505,61 @@ fn storage_summary_rejects_an_exclusive_repository_operation() {
 }
 
 #[test]
+fn project_status_rejects_an_exclusive_repository_operation() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    init_project_for_test(&project).unwrap();
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let reported = Arc::new(AtomicBool::new(false));
+    let project_for_create = project.clone();
+    let create_worker = {
+        let entered = entered.clone();
+        let release = release.clone();
+        std::thread::spawn(move || {
+            core::create_checkpoint(
+                project_for_create,
+                "one",
+                core::CreateCheckpointOptions {
+                    progress: Some(Arc::new(move |_| {
+                        if !reported.swap(true, Ordering::SeqCst) {
+                            entered.wait();
+                            release.wait();
+                        }
+                    })),
+                    ..Default::default()
+                },
+            )
+        })
+    };
+    entered.wait();
+    assert!(matches!(
+        core::project_status(
+            &project,
+            core::ProjectStatusOptions {
+                storage_detail: core::StorageSummaryDetail::IndexOnly,
+            },
+        ),
+        Err(core::CheckPoError::RepositoryLocked(_))
+    ));
+    release.wait();
+    assert!(create_worker.join().unwrap().is_ok());
+    assert_eq!(
+        core::project_status(
+            &project,
+            core::ProjectStatusOptions {
+                storage_detail: core::StorageSummaryDetail::IndexOnly,
+            },
+        )
+        .unwrap()
+        .storage
+        .unwrap()
+        .checkpoint_count,
+        1
+    );
+}
+
+#[test]
 fn rename_checkpoint_preserves_id_and_applies_to_all_summary_paths() {
     let (_guard, _temp, project, _data) = setup();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
@@ -1451,10 +1577,11 @@ fn rename_checkpoint_preserves_id_and_applies_to_all_summary_paths() {
     assert_eq!(checkpoints[0].name, "after");
 
     let context = core::load_project(&project).unwrap();
-    let (indexed_checkpoints, storage) =
+    let (indexed, storage) =
         core::checkpoint_summaries_and_storage_summary_from_index(&context).unwrap();
-    assert_eq!(indexed_checkpoints[0].checkpoint_id, created.checkpoint_id);
-    assert_eq!(indexed_checkpoints[0].name, "after");
+    assert!(indexed.warnings.is_empty());
+    assert_eq!(indexed.checkpoints[0].checkpoint_id, created.checkpoint_id);
+    assert_eq!(indexed.checkpoints[0].name, "after");
     assert_eq!(storage.checkpoint_count, 1);
 
     let repo = repo_path(&view);
@@ -1481,10 +1608,10 @@ fn corrupt_checkpoint_display_names_do_not_block_checkpoint_list() {
     let context = core::load_project(&project).unwrap();
     let list_result = core::list_checkpoints_with_warnings_for_project(&context).unwrap();
     assert!(!list_result.warnings.is_empty());
-    let (indexed_checkpoints, _) =
-        core::checkpoint_summaries_and_storage_summary_from_index(&context).unwrap();
-    assert_eq!(indexed_checkpoints[0].name, "before");
-    assert!(!indexed_checkpoints[0].warnings.is_empty());
+    let (indexed, _) = core::checkpoint_summaries_and_storage_summary_from_index(&context).unwrap();
+    assert_eq!(indexed.checkpoints[0].name, "before");
+    assert!(!indexed.warnings.is_empty());
+    assert!(indexed.checkpoints[0].warnings.is_empty());
 }
 
 #[test]
@@ -1513,6 +1640,35 @@ fn corrupt_checkpoint_display_names_block_rename_and_delete_without_overwriting_
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(checkpoints[0].name, "before");
     assert!(!checkpoints[0].warnings.is_empty());
+}
+
+#[test]
+fn index_rebuild_prunes_display_names_for_checkpoints_outside_the_inventory() {
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let created = core::create_checkpoint(&project, "before", Default::default()).unwrap();
+    core::rename_checkpoint(&project, created.checkpoint_id.as_str(), "after").unwrap();
+    let names_path = repo_path(&view).join("refs").join("checkpoint_names.json");
+    let orphan_id = "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut names = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+        &fs::read(&names_path).unwrap(),
+    )
+    .unwrap();
+    names.insert(orphan_id.to_string(), serde_json::json!("orphan"));
+    fs::write(&names_path, serde_json::to_vec(&names).unwrap()).unwrap();
+
+    core::rebuild_index(&project).unwrap();
+
+    let names = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+        &fs::read(&names_path).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        names.get(created.checkpoint_id.as_str()),
+        Some(&serde_json::json!("after"))
+    );
+    assert!(!names.contains_key(orphan_id));
 }
 
 #[test]
@@ -4223,6 +4379,47 @@ fn checkpoint_create_recovery_finishes_published_root_with_compare_and_swap_late
         core::CheckpointIndexState::Current
     );
     assert!(core::list_checkpoints(&project)
+        .unwrap()
+        .iter()
+        .any(|checkpoint| checkpoint.checkpoint_id == published_id));
+}
+
+#[test]
+fn project_status_recovers_a_published_checkpoint_creation_before_collecting_state() {
+    let (_guard, _temp, project, _data) = setup();
+    let view = init_project_for_test(&project).unwrap();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let first = core::create_checkpoint(&project, "one", Default::default()).unwrap();
+    let repo = repo_path(&view);
+    let mut published = core::load_snapshot(&repo, &first.checkpoint_id).unwrap();
+    published.parent_snapshot_id = Some(first.checkpoint_id.clone());
+    published.created_at_utc = "2026-07-13T00:00:00.000000000Z".to_string();
+    published.name = "two".to_string();
+    let published_id = core::__debug_test_save_snapshot(&repo, &published).unwrap();
+    let journal = write_checkpoint_create_journal(
+        &repo,
+        "33333333333333333333333333333333",
+        &published_id,
+        Some(&first.checkpoint_id),
+        "rootPublished",
+    );
+
+    let status = core::project_status(
+        &project,
+        core::ProjectStatusOptions {
+            storage_detail: core::StorageSummaryDetail::IndexOnly,
+        },
+    )
+    .unwrap();
+
+    assert!(!journal.exists());
+    assert_eq!(
+        status.checkpoint_index.state,
+        core::CheckpointIndexState::Current
+    );
+    assert!(status
+        .checkpoints
         .unwrap()
         .iter()
         .any(|checkpoint| checkpoint.checkpoint_id == published_id));

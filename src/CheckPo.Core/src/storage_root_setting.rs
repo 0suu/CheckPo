@@ -90,7 +90,7 @@ pub fn set_project_storage_root(
     crate::ensure_no_unresolved_transaction_quarantines(&context)?;
     if recovered_new_repository {
         let index_is_current = matches!(
-            crate::checkpoint_index_status(&context),
+            crate::checkpoint_index_status_unlocked(&context),
             Ok(status) if status.state == crate::CheckpointIndexState::Current
         );
         if !index_is_current {

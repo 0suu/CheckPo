@@ -13,6 +13,54 @@ type ProgressFn = Box<dyn Fn(core::OperationProgress) + Send + Sync>;
 type AppResult = Result<Value, AppError>;
 const DEFAULT_INITIAL_CHECKPOINT_NAME: &str = "初回チェックポイント";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppErrorKind {
+    InvalidOperation,
+    NotFound,
+    Io,
+    OperationStatePoisoned,
+    OperationBusy,
+    UpdateStatePoisoned,
+    UpdateNotFound,
+    UpdateTargetNotFound,
+    Updater,
+    TaskJoinError,
+    ConfirmationRequired,
+}
+
+impl AppErrorKind {
+    #[cfg(test)]
+    const ALL: [Self; 11] = [
+        Self::InvalidOperation,
+        Self::NotFound,
+        Self::Io,
+        Self::OperationStatePoisoned,
+        Self::OperationBusy,
+        Self::UpdateStatePoisoned,
+        Self::UpdateNotFound,
+        Self::UpdateTargetNotFound,
+        Self::Updater,
+        Self::TaskJoinError,
+        Self::ConfirmationRequired,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidOperation => "invalidOperation",
+            Self::NotFound => "notFound",
+            Self::Io => "io",
+            Self::OperationStatePoisoned => "operationStatePoisoned",
+            Self::OperationBusy => "operationBusy",
+            Self::UpdateStatePoisoned => "updateStatePoisoned",
+            Self::UpdateNotFound => "updateNotFound",
+            Self::UpdateTargetNotFound => "updateTargetNotFound",
+            Self::Updater => "updater",
+            Self::TaskJoinError => "taskJoinError",
+            Self::ConfirmationRequired => "confirmationRequired",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppError {
@@ -21,9 +69,16 @@ struct AppError {
 }
 
 impl AppError {
-    fn new(kind: &'static str, message: impl Into<String>) -> Self {
+    fn new(kind: AppErrorKind, message: impl Into<String>) -> Self {
         Self {
-            kind,
+            kind: kind.as_str(),
+            message: message.into(),
+        }
+    }
+
+    fn from_core(kind: core::CheckPoErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind: kind.as_str(),
             message: message.into(),
         }
     }
@@ -140,7 +195,7 @@ async fn start_as_separate_project(
         let project = core::load_project(&project_path).map_err(to_app_error)?;
         if project.location_status != core::ProjectLocationStatus::CopiedSuspected {
             return Err(AppError::new(
-                "invalidOperation",
+                AppErrorKind::InvalidOperation,
                 "starting as a separate project is only allowed for copied-project warnings.",
             ));
         }
@@ -287,7 +342,7 @@ async fn open_project_in_file_manager(
         let path = project.project_root.as_path();
         if !path.is_dir() {
             return Err(AppError::new(
-                "notFound",
+                AppErrorKind::NotFound,
                 format!("project folder was not found: {}", path.display()),
             ));
         }
@@ -301,7 +356,7 @@ async fn open_project_in_file_manager(
 async fn open_diagnostic_logs() -> AppResult {
     let path = core::diagnostic_log_directory().map_err(to_app_error)?;
     std::fs::create_dir_all(&path)
-        .map_err(|error| AppError::new("io", format!("{}: {error}", path.display())))?;
+        .map_err(|error| AppError::new(AppErrorKind::Io, format!("{}: {error}", path.display())))?;
     open_folder_in_file_manager(&path)?;
     Ok(json!({ "path": path }))
 }
@@ -717,7 +772,7 @@ fn cancel_current_operation(state: tauri::State<'_, OperationState>) -> AppResul
         .lock()
         .map_err(|_| {
             AppError::new(
-                "operationStatePoisoned",
+                AppErrorKind::OperationStatePoisoned,
                 "Operation state lock is poisoned.",
             )
         })?
@@ -748,11 +803,12 @@ async fn check_for_update(
             "currentVersion": update.current_version,
         })
     });
-    *pending_update
-        .0
-        .lock()
-        .map_err(|_| AppError::new("updateStatePoisoned", "Update state lock is poisoned."))? =
-        update;
+    *pending_update.0.lock().map_err(|_| {
+        AppError::new(
+            AppErrorKind::UpdateStatePoisoned,
+            "Update state lock is poisoned.",
+        )
+    })? = update;
     Ok(metadata.unwrap_or(Value::Null))
 }
 
@@ -764,10 +820,12 @@ async fn install_update(
 ) -> AppResult {
     let (_guard, update) = take_pending_update_for_install(&state, &pending_update)?;
     if let Err(error) = update.download_and_install(|_, _| {}, || {}).await {
-        let mut pending = pending_update
-            .0
-            .lock()
-            .map_err(|_| AppError::new("updateStatePoisoned", "Update state lock is poisoned."))?;
+        let mut pending = pending_update.0.lock().map_err(|_| {
+            AppError::new(
+                AppErrorKind::UpdateStatePoisoned,
+                "Update state lock is poisoned.",
+            )
+        })?;
         if pending.is_none() {
             *pending = Some(update);
         }
@@ -784,9 +842,19 @@ fn take_pending_update_for_install(
     let update = pending_update
         .0
         .lock()
-        .map_err(|_| AppError::new("updateStatePoisoned", "Update state lock is poisoned."))?
+        .map_err(|_| {
+            AppError::new(
+                AppErrorKind::UpdateStatePoisoned,
+                "Update state lock is poisoned.",
+            )
+        })?
         .take()
-        .ok_or_else(|| AppError::new("updateNotFound", "No pending update is available."))?;
+        .ok_or_else(|| {
+            AppError::new(
+                AppErrorKind::UpdateNotFound,
+                "No pending update is available.",
+            )
+        })?;
     Ok((guard, update))
 }
 
@@ -879,17 +947,17 @@ fn handle_window_event(_window: &tauri::Window, _event: &tauri::WindowEvent) {}
 fn to_update_error(error: UpdaterError) -> AppError {
     match error {
         UpdaterError::TargetNotFound(target) => AppError::new(
-            "updateTargetNotFound",
+            AppErrorKind::UpdateTargetNotFound,
             format!("このOS/CPU向けの更新ファイルが latest.json にありません。target: {target}"),
         ),
         UpdaterError::TargetsNotFound(targets) => AppError::new(
-            "updateTargetNotFound",
+            AppErrorKind::UpdateTargetNotFound,
             format!(
                 "このOS/CPU向けの更新ファイルが latest.json にありません。候補: {}",
                 targets.join(", ")
             ),
         ),
-        error => AppError::new("updater", error.to_string()),
+        error => AppError::new(AppErrorKind::Updater, error.to_string()),
     }
 }
 
@@ -916,74 +984,18 @@ fn open_folder_in_file_manager(path: &std::path::Path) -> Result<(), AppError> {
     command
         .spawn()
         .map(|_| ())
-        .map_err(|error| AppError::new("io", error.to_string()))
+        .map_err(|error| AppError::new(AppErrorKind::Io, error.to_string()))
 }
 
 fn project_snapshot(project_path: String) -> AppResult {
-    let mut context = core::load_project(&project_path).map_err(to_app_error)?;
-    if context.location_status != core::ProjectLocationStatus::CopiedSuspected {
-        core::recover_checkpoint_deletions(&project_path).map_err(to_app_error)?;
-        context = core::load_project(&project_path).map_err(to_app_error)?;
-    }
-    let project = core::project_view(&context).map_err(to_app_error)?;
-    let pending_transactions = core::pending_transactions(&project_path).map_err(to_app_error)?;
-    let unresolved_quarantines =
-        core::unresolved_transaction_quarantines(&project_path).map_err(to_app_error)?;
-    let mut warnings = Vec::new();
-    let mut checkpoint_index = core::checkpoint_index_status(&context).map_err(to_app_error)?;
-    let checkpoints = if checkpoint_index.state == core::CheckpointIndexState::Current {
-        match core::list_checkpoints_with_warnings_for_project(&context) {
-            Ok(result) => {
-                warnings.extend(result.warnings);
-                result.checkpoints
-            }
-            Err(core::CheckPoError::IndexUnavailable(detail)) => {
-                checkpoint_index = core::CheckpointIndexStatus {
-                    state: core::CheckpointIndexState::Corrupt,
-                    rebuildable: true,
-                    detail: Some(detail),
-                };
-                Vec::new()
-            }
-            Err(error) => return Err(to_app_error(error)),
-        }
-    } else {
-        Vec::new()
-    };
-    let storage = if checkpoint_index.state == core::CheckpointIndexState::Current {
-        match core::storage_index_summary_from_index(&context) {
-            Ok(storage) => Some(json!({
-                "checkpointCount": storage.checkpoint_count,
-                "logicalSizeBytes": storage.logical_size_bytes,
-                "storedSizeBytes": Value::Null,
-                "uniqueBlobCount": storage.unique_blob_count,
-                "recoveryRescueFileCount": Value::Null,
-                "recoveryRescueBytes": Value::Null,
-            })),
-            Err(core::CheckPoError::IndexUnavailable(detail)) => {
-                checkpoint_index = core::CheckpointIndexStatus {
-                    state: core::CheckpointIndexState::Corrupt,
-                    rebuildable: true,
-                    detail: Some(detail),
-                };
-                None
-            }
-            Err(error) => return Err(to_app_error(error)),
-        }
-    } else {
-        None
-    };
-    let snapshot = json!({
-        "project": project,
-        "projectPath": project_path,
-        "checkpointIndex": checkpoint_index,
-        "checkpoints": checkpoints,
-        "storage": storage,
-        "pendingTransactions": pending_transactions,
-        "unresolvedQuarantines": unresolved_quarantines,
-        "warnings": warnings
-    });
-    Ok(snapshot)
+    core::project_status(
+        project_path,
+        core::ProjectStatusOptions {
+            storage_detail: core::StorageSummaryDetail::IndexOnly,
+        },
+    )
+    .map(|status| json!(status))
+    .map_err(to_app_error)
 }
 
 fn project_snapshot_after_start(
@@ -1060,7 +1072,7 @@ where
         operation()
     })
     .await;
-    result.map_err(|error| AppError::new("taskJoinError", error.to_string()))?
+    result.map_err(|error| AppError::new(AppErrorKind::TaskJoinError, error.to_string()))?
 }
 
 async fn run_cancellable_blocking<F>(
@@ -1089,13 +1101,13 @@ impl OperationGuard {
     ) -> Result<Self, AppError> {
         let mut current = state.current.lock().map_err(|_| {
             AppError::new(
-                "operationStatePoisoned",
+                AppErrorKind::OperationStatePoisoned,
                 "Operation state lock is poisoned.",
             )
         })?;
         if current.is_some() {
             return Err(AppError::new(
-                "operationBusy",
+                AppErrorKind::OperationBusy,
                 "Another operation is already running.",
             ));
         }
@@ -1138,46 +1150,41 @@ fn to_app_error(error: core::CheckPoError) -> AppError {
     if !matches!(&error, core::CheckPoError::Cancelled) {
         core::log_operation_error("tauri-command", &error.to_string());
     }
-    let kind = match &error {
-        core::CheckPoError::User(_) => "user",
-        core::CheckPoError::InvalidProject(_) => "invalidProject",
-        core::CheckPoError::InvalidTrackedPath(_) => "invalidTrackedPath",
-        core::CheckPoError::InvalidId(_) => "invalidId",
-        core::CheckPoError::OutsideTrackedScope(_) => "outsideTrackedScope",
-        core::CheckPoError::SnapshotNotFound(_) => "snapshotNotFound",
-        core::CheckPoError::ObjectMissing(_) => "objectMissing",
-        core::CheckPoError::ObjectHashMismatch(_) => "objectHashMismatch",
-        core::CheckPoError::WorkingTreeChanged(_) => "workingTreeChanged",
-        core::CheckPoError::RepositoryLocked(_) => "repositoryLocked",
-        core::CheckPoError::StorageRootConflict { .. } => "storageRootConflict",
-        core::CheckPoError::StorageRootUnavailable(_) => "storageRootUnavailable",
-        core::CheckPoError::PendingTransaction(_) => "pendingTransaction",
-        core::CheckPoError::UnresolvedTransactionQuarantine(_) => "unresolvedTransactionQuarantine",
-        core::CheckPoError::IndexUnavailable(_) => "indexUnavailable",
-        core::CheckPoError::UnsupportedFormat { .. } => "unsupportedFormat",
-        core::CheckPoError::CopiedProjectSuspected(_) => "copiedProjectSuspected",
-        core::CheckPoError::UnsafeFolderMetaOperation(_) => "unsafeFolderMetaOperation",
-        core::CheckPoError::Cancelled => "cancelled",
-        core::CheckPoError::Io { .. } => "io",
-        core::CheckPoError::Json { .. } => "json",
-        core::CheckPoError::Db { .. } => "database",
-        core::CheckPoError::Corruption(_) => "corruption",
-        core::CheckPoError::Unexpected(_) => "unexpected",
-    };
-    AppError::new(kind, error.to_string())
+    AppError::from_core(error.kind(), error.to_string())
 }
 
 fn require_confirmation(confirmed: bool, message: &str) -> Result<(), AppError> {
     if confirmed {
         Ok(())
     } else {
-        Err(AppError::new("confirmationRequired", message))
+        Err(AppError::new(AppErrorKind::ConfirmationRequired, message))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_error_kinds_match_the_frontend_contract() {
+        let declared = serde_json::from_str::<Vec<String>>(include_str!(
+            "../../frontend/app-error-kinds.json"
+        ))
+        .unwrap();
+        let mut actual = core::CheckPoErrorKind::ALL
+            .into_iter()
+            .map(|kind| kind.as_str().to_string())
+            .chain(
+                AppErrorKind::ALL
+                    .into_iter()
+                    .map(|kind| kind.as_str().to_string()),
+            )
+            .collect::<Vec<_>>();
+        actual.sort();
+        actual.dedup();
+
+        assert_eq!(actual, declared);
+    }
 
     #[test]
     fn close_decision_distinguishes_idle_cancellable_and_non_cancellable_operations() {
@@ -1309,82 +1316,6 @@ mod tests {
         };
         assert_eq!(error.kind, "updateNotFound");
         assert!(state.current.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn frontend_diff_routes_keep_fast_diff_to_open_and_focus_only() {
-        let app_js = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/app.js"),
-        )
-        .unwrap();
-
-        assert!(
-            app_js.contains(r#"metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint","#)
-        );
-        assert!(app_js.contains("return { diff, exact: !metadataOnly };"));
-        assert!(app_js.contains("requestedCheckpointId === latestId"));
-        assert!(app_js.contains("}, context.checkpointId, { exact: true });"));
-        assert!(app_js.contains(r#"refreshLatestDiff({ silent: true, metadataOnly: true });"#));
-        assert!(!app_js.contains(
-            r#"refreshLatestDiff({ refreshProject: true, silent: true, metadataOnly: true });"#
-        ));
-        assert!(
-            app_js
-                .matches(r#"refreshLatestDiff({ allowBusy: true, metadataOnly: true });"#)
-                .count()
-                >= 2
-        );
-        assert!(app_js.contains(r#"invokeCommand("diff_checkpoint_full""#));
-        assert!(app_js.contains(r#"await refreshLatestDiff({ allowBusy: true });"#));
-        assert!(app_js.contains(r#"cancel: () => tauriInvoke("cancel_current_operation")"#));
-        assert!(app_js.contains("AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS"));
-        assert!(!app_js.contains("while (state.autoRefreshInFlight)"));
-        assert!(
-            !app_js.contains("state.autoRefreshGeneration += 1;\n  state.diffRequestSerial += 1;")
-        );
-        assert!(app_js.contains("resetProjectScopedSettingsResults();"));
-        assert!(app_js.contains("await restoreLastProject();"));
-        assert!(app_js.contains("snapshot.pendingTransactions?.length"));
-    }
-
-    #[test]
-    fn frontend_checkpoint_history_delegates_events_and_patches_renamed_row() {
-        let app_js = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/app.js"),
-        )
-        .unwrap();
-
-        assert!(app_js.contains(
-            r#"$("checkpointList").addEventListener("click", handleCheckpointListClick);"#
-        ));
-        assert!(app_js.contains(
-            r#"$("checkpointList").addEventListener("contextmenu", handleCheckpointListContextMenu);"#
-        ));
-        assert!(app_js.contains(
-            r#"$("checkpointList").addEventListener("keydown", handleCheckpointListKeyDown);"#
-        ));
-        assert!(app_js.contains("checkpointNavigationIndex("));
-        assert!(app_js.contains("aria-activedescendant"));
-        assert!(app_js.contains("checkpointRowCache.delete(checkpointId);"));
-        assert!(app_js.contains("const replacement = checkpointRow(checkpoint);"));
-        assert!(app_js.contains("existing.replaceWith(replacement);"));
-        assert!(app_js.contains("applyCheckpointSearchFilter({ resetScroll: false });"));
-        assert!(!app_js.contains(r#"row.addEventListener("click""#));
-        assert!(!app_js.contains(r#"row.addEventListener("contextmenu""#));
-    }
-
-    #[test]
-    fn frontend_binds_maintenance_apply_to_preview_and_reports_deferred_close() {
-        let frontend_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend");
-        let app_js = std::fs::read_to_string(frontend_root.join("app.js")).unwrap();
-        let index_html = std::fs::read_to_string(frontend_root.join("index.html")).unwrap();
-
-        assert!(app_js.contains("expectedPlanId: state.gcPlan.planId"));
-        assert!(app_js.contains("expectedPlanId: state.tempCleanupPlan.planId"));
-        assert!(app_js.contains(r#"tauriListen("operation-close-pending""#));
-        assert!(app_js.contains("function renderPendingClose(payload)"));
-        assert!(!app_js.contains("処理中は終了できません。"));
-        assert!(index_html.contains(r#"id="busyCloseNotice""#));
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::{CheckpointSummary, ProjectContext, Result, SnapshotId};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_CHECKPOINT_NAMES_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -16,7 +16,6 @@ pub(crate) fn apply_checkpoint_name_overrides(
             }
         }
     }
-    attach_warnings(checkpoints, warnings.clone());
     warnings
 }
 
@@ -115,11 +114,20 @@ pub(crate) fn remove_checkpoint_name_override(
     Ok(Vec::new())
 }
 
-fn attach_warnings(checkpoints: &mut [CheckpointSummary], warnings: Vec<String>) {
-    if warnings.is_empty() {
-        return;
+pub(crate) fn prune_checkpoint_name_overrides(
+    project: &ProjectContext,
+    live_checkpoint_ids: &[SnapshotId],
+) -> Result<usize> {
+    let mut names = read_checkpoint_name_overrides_for_mutation(project)?;
+    let live_checkpoint_ids = live_checkpoint_ids
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<BTreeSet<_>>();
+    let before = names.len();
+    names.retain(|checkpoint_id, _| live_checkpoint_ids.contains(checkpoint_id.as_str()));
+    let removed = before.saturating_sub(names.len());
+    if removed > 0 {
+        write_checkpoint_name_overrides(project, &names)?;
     }
-    if let Some(first) = checkpoints.first_mut() {
-        first.warnings.extend(warnings);
-    }
+    Ok(removed)
 }

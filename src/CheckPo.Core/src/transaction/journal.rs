@@ -101,7 +101,7 @@ pub fn pending_transactions(project_path: impl AsRef<Path>) -> Result<Vec<Pendin
     pending_transactions_for_project(&project)
 }
 
-pub fn pending_transactions_for_project(
+pub(crate) fn pending_transactions_for_project(
     project: &ProjectContext,
 ) -> Result<Vec<PendingTransaction>> {
     crate::validate_repository_layout_no_follow(&project.repo_root)?;
@@ -556,6 +556,7 @@ fn cleanup_trash_candidate(root: &Path) -> Result<TransactionCleanupCandidate> {
 }
 
 fn transaction_tree_metadata(root: &Path) -> Result<(usize, u64, String)> {
+    let anchored_root = crate::storage::AnchoredRoot::open(root)?;
     let mut tree_hasher = blake3::Hasher::new();
     tree_hasher.update(b"checkpo-transaction-cleanup-tree-v2\0");
     let mut file_count = 0_usize;
@@ -587,15 +588,19 @@ fn transaction_tree_metadata(root: &Path) -> Result<(usize, u64, String)> {
         if metadata.is_dir() {
             tree_hasher.update(b"d");
         } else if metadata.is_file() {
+            let opened = anchored_root.open_file(relative)?;
+            let opened_metadata = opened.metadata()?;
             tree_hasher.update(b"f");
-            tree_hasher.update(&metadata.len().to_le_bytes());
-            hash_cleanup_file_identity(&mut tree_hasher, entry.path(), &metadata)?;
+            tree_hasher.update(&opened_metadata.len().to_le_bytes());
+            hash_cleanup_file_identity(&mut tree_hasher, entry.path(), &opened, &opened_metadata)?;
             file_count = file_count.checked_add(1).ok_or_else(|| {
                 CheckPoError::Corruption("transaction file count overflow".into())
             })?;
-            size_bytes = size_bytes.checked_add(metadata.len()).ok_or_else(|| {
-                CheckPoError::Corruption("transaction payload size overflow".into())
-            })?;
+            size_bytes = size_bytes
+                .checked_add(opened_metadata.len())
+                .ok_or_else(|| {
+                    CheckPoError::Corruption("transaction payload size overflow".into())
+                })?;
         } else {
             return Err(CheckPoError::Corruption(format!(
                 "transaction payload contains an unsupported entry: {}",
@@ -613,9 +618,10 @@ fn transaction_tree_metadata(root: &Path) -> Result<(usize, u64, String)> {
 fn hash_cleanup_file_identity(
     hasher: &mut blake3::Hasher,
     path: &Path,
+    file: &crate::storage::AnchoredFile,
     metadata: &fs::Metadata,
 ) -> Result<()> {
-    if let Some(fingerprint) = crate::scanner::file_fingerprint(path, metadata)? {
+    if let Some(fingerprint) = file.fingerprint()? {
         let bytes = fingerprint.as_bytes();
         let length = u64::try_from(bytes.len())
             .map_err(|_| CheckPoError::Corruption("cleanup fingerprint length overflow".into()))?;

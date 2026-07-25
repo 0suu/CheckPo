@@ -32,9 +32,10 @@ use apply::{
     estimated_project_required_bytes, estimated_repository_required_bytes, TransactionFaultPoint,
     TRANSACTION_BACKUP_FILE_BATCH_SIZE,
 };
+pub(crate) use journal::pending_transactions_for_project;
 pub use journal::{
     analyze_transaction_cleanup, cleanup_journals_with_expected_plan,
-    ensure_no_pending_transactions, pending_transactions, pending_transactions_for_project,
+    ensure_no_pending_transactions, pending_transactions,
 };
 use journal::{
     dir_size, journals_dir, read_transaction_journal, validate_transaction_journal_identity,
@@ -50,8 +51,9 @@ use plan::{
 use project_file_ops::backup_project_file_by_reflink_or_copy;
 use project_file_ops::*;
 use recovery::invalidate_operation_fingerprints;
+pub(crate) use recovery::unresolved_transaction_quarantines_for_project;
 pub use recovery::{
     analyze_transaction_recovery_conflicts, ensure_no_unresolved_transaction_quarantines,
     quarantine_transaction, recover_transaction_with_conflict_export, recover_transactions,
-    unresolved_transaction_quarantines, unresolved_transaction_quarantines_for_project,
+    unresolved_transaction_quarantines,
 };

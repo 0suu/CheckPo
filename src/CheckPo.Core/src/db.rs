@@ -6,9 +6,9 @@ use crate::storage::snapshot_v2::{
 use crate::storage::{object_path_no_follow, open_file_fingerprint_db};
 use crate::{
     db_error, ensure_no_pending_transactions, report_operation_progress, CancellationToken,
-    CheckpointIndexState, CheckpointIndexStatus, CheckpointSummary, ObjectId, OperationProgress,
-    ProjectContext, RebuildIndexResult, Result, SnapshotFile, SnapshotId, StorageSummary,
-    TrackedUnityFilePath,
+    CheckpointIndexState, CheckpointIndexStatus, CheckpointListResult, CheckpointSummary, ObjectId,
+    OperationProgress, ProjectContext, RebuildIndexResult, Result, SnapshotFile, SnapshotId,
+    StorageSummary, TrackedUnityFilePath,
 };
 use rusqlite::{params, OpenFlags, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,7 +104,7 @@ impl std::ops::Deref for BoundSnapshotIndexConnection {
 }
 
 pub(crate) fn open_index_connection(project: &ProjectContext) -> Result<IndexConnection> {
-    let status = checkpoint_index_status(project)?;
+    let status = checkpoint_index_status_unlocked(project)?;
     if status.state != CheckpointIndexState::Current {
         return Err(index_unavailable(&status));
     }
@@ -114,6 +114,13 @@ pub(crate) fn open_index_connection(project: &ProjectContext) -> Result<IndexCon
 }
 
 pub fn checkpoint_index_status(project: &ProjectContext) -> Result<CheckpointIndexStatus> {
+    let _lock = crate::acquire_project_repository_shared_lock(project, "checkpoint-index-status")?;
+    checkpoint_index_status_unlocked(project)
+}
+
+pub(crate) fn checkpoint_index_status_unlocked(
+    project: &ProjectContext,
+) -> Result<CheckpointIndexStatus> {
     let db_path = crate::db_path(&project.repo_root)?;
     let metadata = match fs::symlink_metadata(&db_path) {
         Ok(metadata) => metadata,
@@ -217,7 +224,7 @@ fn index_unavailable(status: &CheckpointIndexStatus) -> crate::CheckPoError {
 }
 
 fn require_current_index(project: &ProjectContext) -> Result<()> {
-    let status = checkpoint_index_status(project)?;
+    let status = checkpoint_index_status_unlocked(project)?;
     if status.state == CheckpointIndexState::Current {
         Ok(())
     } else {
@@ -239,7 +246,7 @@ pub(crate) fn index_snapshot_with_index_connection(
     )
 }
 
-pub fn list_checkpoint_summaries_from_index(
+pub(crate) fn list_checkpoint_summaries_from_index(
     project: &ProjectContext,
 ) -> Result<Vec<CheckpointSummary>> {
     require_current_index(project)?;
@@ -250,6 +257,12 @@ pub fn list_checkpoint_summaries_from_index(
 
 pub fn storage_summary_from_index(project: &ProjectContext) -> Result<StorageSummary> {
     let _lock = crate::acquire_project_repository_shared_lock(project, "storage-summary")?;
+    storage_summary_from_index_unlocked(project)
+}
+
+pub(crate) fn storage_summary_from_index_unlocked(
+    project: &ProjectContext,
+) -> Result<StorageSummary> {
     require_current_index(project)?;
     let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_only(&db_path).map_err(index_read_error)?;
@@ -260,6 +273,12 @@ pub fn storage_index_summary_from_index(
     project: &ProjectContext,
 ) -> Result<crate::StorageIndexSummary> {
     let _lock = crate::acquire_project_repository_shared_lock(project, "storage-index-summary")?;
+    storage_index_summary_from_index_unlocked(project)
+}
+
+pub(crate) fn storage_index_summary_from_index_unlocked(
+    project: &ProjectContext,
+) -> Result<crate::StorageIndexSummary> {
     require_current_index(project)?;
     let db_path = crate::db_path(&project.repo_root)?;
     let conn = open_snapshot_index_read_only(&db_path).map_err(index_read_error)?;
@@ -268,7 +287,7 @@ pub fn storage_index_summary_from_index(
 
 pub fn checkpoint_summaries_and_storage_summary_from_index(
     project: &ProjectContext,
-) -> Result<(Vec<CheckpointSummary>, StorageSummary)> {
+) -> Result<(CheckpointListResult, StorageSummary)> {
     let _lock =
         crate::acquire_project_repository_shared_lock(project, "checkpoint-storage-summary")?;
     require_current_index(project)?;
@@ -276,9 +295,15 @@ pub fn checkpoint_summaries_and_storage_summary_from_index(
     let conn = open_snapshot_index_read_only(&db_path).map_err(index_read_error)?;
     let mut checkpoints =
         query_checkpoint_summaries(&conn, &db_path, project).map_err(index_read_error)?;
-    let _ = crate::apply_checkpoint_name_overrides(project, &mut checkpoints);
+    let warnings = crate::apply_checkpoint_name_overrides(project, &mut checkpoints);
     let storage = query_storage_summary(&conn, &db_path, project).map_err(index_read_error)?;
-    Ok((checkpoints, storage))
+    Ok((
+        CheckpointListResult {
+            checkpoints,
+            warnings,
+        },
+        storage,
+    ))
 }
 
 fn index_read_error(error: crate::CheckPoError) -> crate::CheckPoError {
@@ -687,6 +712,14 @@ pub(crate) fn rebuild_index_for_project_unlocked(
         return Err(crate::CheckPoError::IndexUnavailable(
             "checkpoint files changed while the index was being rebuilt".to_string(),
         ));
+    }
+    if let Err(error) = crate::prune_checkpoint_name_overrides(project, &snapshot_ids) {
+        crate::diagnostics::log_warning(
+            "checkpoint-name-prune",
+            &format!(
+                "checkpoint index was rebuilt, but stale display-name metadata could not be pruned: {error}"
+            ),
+        );
     }
     report_operation_progress(progress, "committingIndex", 0, 0, None);
     if let Err(error) = temp_file.sync_all().and_then(|()| {

@@ -12,6 +12,7 @@ mod path;
 mod project;
 mod restore;
 mod scanner;
+mod status;
 mod storage;
 mod storage_root_setting;
 mod transaction;
@@ -19,8 +20,7 @@ mod verify;
 
 pub use checkpoint::{
     create_checkpoint, create_checkpoint_profiled, delete_checkpoint, list_checkpoints,
-    list_checkpoints_for_project, list_checkpoints_with_warnings_for_project,
-    recover_checkpoint_deletions, rename_checkpoint,
+    list_checkpoints_with_warnings_for_project, recover_checkpoint_deletions, rename_checkpoint,
 };
 pub use db::{
     checkpoint_index_status, checkpoint_summaries_and_storage_summary_from_index, rebuild_index,
@@ -52,10 +52,11 @@ pub use models::{
     DiffOptions, DiffResult, FileOperation, FileOperationType, InvalidManifestChunkLocation,
     InvalidObjectLocation, MissingBlobReference, OperationPlan, OperationPlanKind,
     OperationProgress, OrphanTempFile, PendingTransaction, ProfiledCheckpointResult,
-    ProjectContext, ProjectLocationStatus, ProjectMarkerFile, ProjectView, ProjectWarning,
-    ProjectWarningKind, RebuildIndexResult, RegistryFile, RegistryProjectEntry, RepositoryConfig,
-    RepositoryTempFile, ScanWarning, ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry,
-    SnapshotFile, StorageGcPlan, StorageGcResult, StorageIndexSummary, StorageSummary,
+    ProjectContext, ProjectLocationStatus, ProjectMarkerFile, ProjectStatus, ProjectStatusOptions,
+    ProjectStorageSummary, ProjectView, ProjectWarning, ProjectWarningKind, RebuildIndexResult,
+    RegistryFile, RegistryProjectEntry, RepositoryConfig, RepositoryTempFile, ScanWarning,
+    ScannedFile, SkippedSnapshot, SnapshotContent, SnapshotEntry, SnapshotFile, StorageGcPlan,
+    StorageGcResult, StorageIndexSummary, StorageSummary, StorageSummaryDetail,
     TempFileCleanupPlan, TempFileCleanupResult, TransactionCleanupCandidate,
     TransactionCleanupPlan, TransactionCleanupResult, TransactionQuarantineResult,
     TransactionRecoveryConflict, TransactionRecoveryConflictPlan,
@@ -78,6 +79,7 @@ pub use restore::{
     apply_restore_plan, apply_restore_plan_with_progress_and_cancellation, preview_restore,
     preview_restore_with_progress_and_cancellation,
 };
+pub use status::project_status;
 pub use storage::{
     canonical_snapshot_bytes, db_path, file_fingerprint_db_path, load_snapshot, object_path,
     read_json, read_latest_snapshot_id, snapshot_id_from_bytes, snapshot_path,
@@ -85,28 +87,32 @@ pub use storage::{
 pub use storage_root_setting::set_project_storage_root;
 pub use transaction::{
     analyze_transaction_cleanup, analyze_transaction_recovery_conflicts, apply_plan,
-    cleanup_journals_with_expected_plan, pending_transactions, pending_transactions_for_project,
-    quarantine_transaction, recover_transaction_with_conflict_export, recover_transactions,
-    unresolved_transaction_quarantines, unresolved_transaction_quarantines_for_project,
+    cleanup_journals_with_expected_plan, pending_transactions, quarantine_transaction,
+    recover_transaction_with_conflict_export, recover_transactions,
+    unresolved_transaction_quarantines,
 };
 pub use verify::{
     verify_checkpoint, verify_checkpoint_with_progress_and_cancellation, verify_project,
     verify_project_with_progress_and_cancellation,
 };
 
+pub(crate) use checkpoint::list_checkpoints_with_warnings_for_project_unlocked;
 pub(crate) use checkpoint::recover_checkpoint_deletions_unlocked;
 pub(crate) use checkpoint_create_journal::{
     recover_checkpoint_creations_unlocked, CreateJournalHandle,
 };
 pub(crate) use checkpoint_names::{
-    apply_checkpoint_name_overrides, read_checkpoint_name_overrides,
-    remove_checkpoint_name_override, write_checkpoint_name_overrides,
+    apply_checkpoint_name_overrides, prune_checkpoint_name_overrides,
+    read_checkpoint_name_overrides, remove_checkpoint_name_override,
+    write_checkpoint_name_overrides,
 };
 pub(crate) use db::{
-    delete_snapshot_from_index, index_snapshot_with_index_connection, invalidate_file_fingerprints,
+    checkpoint_index_status_unlocked, delete_snapshot_from_index,
+    index_snapshot_with_index_connection, invalidate_file_fingerprints,
     list_checkpoint_summaries_from_index, load_file_fingerprints,
     load_object_integrity_fingerprints, open_index_connection, rebuild_index_for_project_unlocked,
     refresh_file_fingerprints, refresh_object_integrity_fingerprints,
+    storage_index_summary_from_index_unlocked, storage_summary_from_index_unlocked,
     ObjectIntegrityFingerprintUpdate,
 };
 pub(crate) use models::{ensure_not_cancelled, report_operation_progress};
@@ -137,6 +143,9 @@ pub(crate) use storage::{
 pub(crate) use transaction::{
     build_plan_with_progress_and_cancellation, ensure_no_pending_transactions,
     ensure_no_unresolved_transaction_quarantines,
+};
+pub(crate) use transaction::{
+    pending_transactions_for_project, unresolved_transaction_quarantines_for_project,
 };
 
 /// Debug-build test seam for corruption and recovery integration tests.
@@ -170,6 +179,92 @@ pub fn __debug_test_add_snapshot_to_inventory(
 }
 
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckPoErrorKind {
+    User,
+    InvalidProject,
+    InvalidTrackedPath,
+    InvalidId,
+    OutsideTrackedScope,
+    SnapshotNotFound,
+    ObjectMissing,
+    ObjectHashMismatch,
+    WorkingTreeChanged,
+    RepositoryLocked,
+    StorageRootConflict,
+    StorageRootUnavailable,
+    PendingTransaction,
+    UnresolvedTransactionQuarantine,
+    IndexUnavailable,
+    UnsupportedFormat,
+    CopiedProjectSuspected,
+    UnsafeFolderMetaOperation,
+    Cancelled,
+    Io,
+    Json,
+    Database,
+    Corruption,
+    Unexpected,
+}
+
+impl CheckPoErrorKind {
+    pub const ALL: [Self; 24] = [
+        Self::User,
+        Self::InvalidProject,
+        Self::InvalidTrackedPath,
+        Self::InvalidId,
+        Self::OutsideTrackedScope,
+        Self::SnapshotNotFound,
+        Self::ObjectMissing,
+        Self::ObjectHashMismatch,
+        Self::WorkingTreeChanged,
+        Self::RepositoryLocked,
+        Self::StorageRootConflict,
+        Self::StorageRootUnavailable,
+        Self::PendingTransaction,
+        Self::UnresolvedTransactionQuarantine,
+        Self::IndexUnavailable,
+        Self::UnsupportedFormat,
+        Self::CopiedProjectSuspected,
+        Self::UnsafeFolderMetaOperation,
+        Self::Cancelled,
+        Self::Io,
+        Self::Json,
+        Self::Database,
+        Self::Corruption,
+        Self::Unexpected,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::InvalidProject => "invalidProject",
+            Self::InvalidTrackedPath => "invalidTrackedPath",
+            Self::InvalidId => "invalidId",
+            Self::OutsideTrackedScope => "outsideTrackedScope",
+            Self::SnapshotNotFound => "snapshotNotFound",
+            Self::ObjectMissing => "objectMissing",
+            Self::ObjectHashMismatch => "objectHashMismatch",
+            Self::WorkingTreeChanged => "workingTreeChanged",
+            Self::RepositoryLocked => "repositoryLocked",
+            Self::StorageRootConflict => "storageRootConflict",
+            Self::StorageRootUnavailable => "storageRootUnavailable",
+            Self::PendingTransaction => "pendingTransaction",
+            Self::UnresolvedTransactionQuarantine => "unresolvedTransactionQuarantine",
+            Self::IndexUnavailable => "indexUnavailable",
+            Self::UnsupportedFormat => "unsupportedFormat",
+            Self::CopiedProjectSuspected => "copiedProjectSuspected",
+            Self::UnsafeFolderMetaOperation => "unsafeFolderMetaOperation",
+            Self::Cancelled => "cancelled",
+            Self::Io => "io",
+            Self::Json => "json",
+            Self::Database => "database",
+            Self::Corruption => "corruption",
+            Self::Unexpected => "unexpected",
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckPoError {
@@ -242,6 +337,39 @@ pub enum CheckPoError {
     Unexpected(String),
 }
 
+impl CheckPoError {
+    pub const fn kind(&self) -> CheckPoErrorKind {
+        match self {
+            Self::User(_) => CheckPoErrorKind::User,
+            Self::InvalidProject(_) => CheckPoErrorKind::InvalidProject,
+            Self::InvalidTrackedPath(_) => CheckPoErrorKind::InvalidTrackedPath,
+            Self::InvalidId(_) => CheckPoErrorKind::InvalidId,
+            Self::OutsideTrackedScope(_) => CheckPoErrorKind::OutsideTrackedScope,
+            Self::SnapshotNotFound(_) => CheckPoErrorKind::SnapshotNotFound,
+            Self::ObjectMissing(_) => CheckPoErrorKind::ObjectMissing,
+            Self::ObjectHashMismatch(_) => CheckPoErrorKind::ObjectHashMismatch,
+            Self::WorkingTreeChanged(_) => CheckPoErrorKind::WorkingTreeChanged,
+            Self::RepositoryLocked(_) => CheckPoErrorKind::RepositoryLocked,
+            Self::StorageRootConflict { .. } => CheckPoErrorKind::StorageRootConflict,
+            Self::StorageRootUnavailable(_) => CheckPoErrorKind::StorageRootUnavailable,
+            Self::PendingTransaction(_) => CheckPoErrorKind::PendingTransaction,
+            Self::UnresolvedTransactionQuarantine(_) => {
+                CheckPoErrorKind::UnresolvedTransactionQuarantine
+            }
+            Self::IndexUnavailable(_) => CheckPoErrorKind::IndexUnavailable,
+            Self::UnsupportedFormat { .. } => CheckPoErrorKind::UnsupportedFormat,
+            Self::CopiedProjectSuspected(_) => CheckPoErrorKind::CopiedProjectSuspected,
+            Self::UnsafeFolderMetaOperation(_) => CheckPoErrorKind::UnsafeFolderMetaOperation,
+            Self::Cancelled => CheckPoErrorKind::Cancelled,
+            Self::Io { .. } => CheckPoErrorKind::Io,
+            Self::Json { .. } => CheckPoErrorKind::Json,
+            Self::Db { .. } => CheckPoErrorKind::Database,
+            Self::Corruption(_) => CheckPoErrorKind::Corruption,
+            Self::Unexpected(_) => CheckPoErrorKind::Unexpected,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CheckPoError>;
 
 pub(crate) fn io_error(path: impl Into<PathBuf>, source: std::io::Error) -> CheckPoError {
@@ -267,4 +395,67 @@ pub(crate) fn db_error(path: impl Into<PathBuf>, source: rusqlite::Error) -> Che
 
 pub(crate) fn user_error(message: impl Into<String>) -> CheckPoError {
     CheckPoError::User(message.into())
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::{CheckPoError, CheckPoErrorKind};
+    use std::path::PathBuf;
+
+    #[test]
+    fn every_error_variant_maps_to_the_declared_wire_kind() {
+        let errors = vec![
+            CheckPoError::User("x".into()),
+            CheckPoError::InvalidProject("x".into()),
+            CheckPoError::InvalidTrackedPath("x".into()),
+            CheckPoError::InvalidId("x".into()),
+            CheckPoError::OutsideTrackedScope("x".into()),
+            CheckPoError::SnapshotNotFound("x".into()),
+            CheckPoError::ObjectMissing("x".into()),
+            CheckPoError::ObjectHashMismatch("x".into()),
+            CheckPoError::WorkingTreeChanged("x".into()),
+            CheckPoError::RepositoryLocked("x".into()),
+            CheckPoError::StorageRootConflict {
+                requested: PathBuf::from("requested"),
+                registered: PathBuf::from("registered"),
+            },
+            CheckPoError::StorageRootUnavailable("x".into()),
+            CheckPoError::PendingTransaction("x".into()),
+            CheckPoError::UnresolvedTransactionQuarantine("x".into()),
+            CheckPoError::IndexUnavailable("x".into()),
+            CheckPoError::UnsupportedFormat {
+                artifact: "x".into(),
+                found: 2,
+                supported: 1,
+            },
+            CheckPoError::CopiedProjectSuspected("x".into()),
+            CheckPoError::UnsafeFolderMetaOperation("x".into()),
+            CheckPoError::Cancelled,
+            CheckPoError::Io {
+                path: PathBuf::from("x"),
+                source: std::io::Error::other("x"),
+            },
+            CheckPoError::Json {
+                path: PathBuf::from("x"),
+                source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            },
+            CheckPoError::Db {
+                path: PathBuf::from("x"),
+                source: rusqlite::Error::InvalidQuery,
+            },
+            CheckPoError::Corruption("x".into()),
+            CheckPoError::Unexpected("x".into()),
+        ];
+        let actual = errors.iter().map(CheckPoError::kind).collect::<Vec<_>>();
+
+        assert_eq!(actual, CheckPoErrorKind::ALL);
+        assert_eq!(
+            CheckPoErrorKind::ALL
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            CheckPoErrorKind::ALL.len()
+        );
+    }
 }
