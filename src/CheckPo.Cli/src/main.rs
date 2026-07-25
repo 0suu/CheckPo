@@ -310,77 +310,30 @@ fn run() -> Result<u8, String> {
             })?;
         }
         Command::Status { project_path } => {
-            let mut context = core::load_project(&project_path).map_err(to_message)?;
-            if context.location_status != core::ProjectLocationStatus::CopiedSuspected {
-                core::recover_checkpoint_deletions(&project_path).map_err(to_message)?;
-                context = core::load_project(&project_path).map_err(to_message)?;
-            }
-            let project = core::project_view(&context).map_err(to_message)?;
-            let pending_transactions =
-                core::pending_transactions(&project_path).map_err(to_message)?;
-            let unresolved_quarantines =
-                core::unresolved_transaction_quarantines(&project_path).map_err(to_message)?;
-            let mut warnings = Vec::new();
-            let mut checkpoint_index =
-                core::checkpoint_index_status(&context).map_err(to_message)?;
-            let checkpoints = if checkpoint_index.state == core::CheckpointIndexState::Current {
-                match core::list_checkpoints_with_warnings_for_project(&context) {
-                    Ok(result) => {
-                        warnings.extend(result.warnings);
-                        Some(result.checkpoints)
-                    }
-                    Err(core::CheckPoError::IndexUnavailable(detail)) => {
-                        checkpoint_index = core::CheckpointIndexStatus {
-                            state: core::CheckpointIndexState::Corrupt,
-                            rebuildable: true,
-                            detail: Some(detail),
-                        };
-                        None
-                    }
-                    Err(error) => return Err(to_message(error)),
-                }
-            } else {
-                None
-            };
-            let storage = if checkpoint_index.state == core::CheckpointIndexState::Current {
-                match core::storage_summary_from_index(&context) {
-                    Ok(storage) => Some(storage),
-                    Err(core::CheckPoError::IndexUnavailable(detail)) => {
-                        checkpoint_index = core::CheckpointIndexStatus {
-                            state: core::CheckpointIndexState::Corrupt,
-                            rebuildable: true,
-                            detail: Some(detail),
-                        };
-                        None
-                    }
-                    Err(error) => return Err(to_message(error)),
-                }
-            } else {
-                None
-            };
-            let value = serde_json::json!({
-                "project": project,
-                "checkpointIndex": checkpoint_index,
-                "checkpoints": checkpoints,
-                "storage": storage,
-                "pendingTransactions": pending_transactions,
-                "unresolvedQuarantines": unresolved_quarantines,
-                "warnings": warnings
-            });
+            let value = core::project_status(
+                &project_path,
+                core::ProjectStatusOptions {
+                    storage_detail: core::StorageSummaryDetail::Exact,
+                },
+            )
+            .map_err(to_message)?;
             print_or_json(cli.json, &value, || {
-                println!("Project: {}", project.project_root_path.display());
-                println!("Storage: {}", project.storage_root_path.display());
-                match &checkpoints {
+                println!("Project: {}", value.project.project_root_path.display());
+                println!("Storage: {}", value.project.storage_root_path.display());
+                match &value.checkpoints {
                     Some(checkpoints) => println!("Checkpoints: {}", checkpoints.len()),
-                    None => println!("Checkpoints: unavailable ({:?})", checkpoint_index.state),
+                    None => println!(
+                        "Checkpoints: unavailable ({:?})",
+                        value.checkpoint_index.state
+                    ),
                 }
-                for warning in &project.warnings {
+                for warning in &value.project.warnings {
                     println!("Warning: {}", project_warning_text(warning));
                 }
-                for warning in &warnings {
+                for warning in &value.warnings {
                     println!("Warning: {warning}");
                 }
-                for quarantine in &unresolved_quarantines {
+                for quarantine in &value.unresolved_quarantines {
                     println!(
                         "Warning: unresolved quarantined transaction {}. Restore a known good checkpoint before making changes.",
                         quarantine.transaction_id

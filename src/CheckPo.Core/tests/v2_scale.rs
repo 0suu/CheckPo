@@ -5,7 +5,7 @@ use std::time::Instant;
 /// Destructive end-to-end scale verification for the snapshot v2 repository.
 ///
 /// Run explicitly, for example:
-/// `CHECKPO_SCALE_CHECKPOINTS=1000 cargo test -p checkpo-core --test v2_scale -- --ignored --nocapture`
+/// `CHECKPO_SCALE_ROOT=/safe/scratch CHECKPO_SCALE_CHECKPOINTS=1000 CHECKPO_SCALE_MAX_SECONDS=600 cargo test -p checkpo-core --test v2_scale -- --ignored --nocapture`
 #[test]
 #[ignore = "destructive scale test; run explicitly on the CheckPo test volume"]
 fn snapshot_v2_checkpoint_scale() {
@@ -14,16 +14,27 @@ fn snapshot_v2_checkpoint_scale() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1000);
     assert!(checkpoint_count > 0);
-    let base = std::env::var_os("CHECKPO_SCALE_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(format!(
-                "/Volumes/870EVO/CheckPo-TestProjects/snapshot-v2-scale-{checkpoint_count}"
-            ))
+    let maximum_seconds = std::env::var("CHECKPO_SCALE_MAX_SECONDS")
+        .ok()
+        .map(|value| {
+            let seconds = value
+                .parse::<f64>()
+                .expect("CHECKPO_SCALE_MAX_SECONDS must be a positive number");
+            assert!(
+                seconds.is_finite() && seconds > 0.0,
+                "CHECKPO_SCALE_MAX_SECONDS must be a positive finite number"
+            );
+            seconds
         });
-    if base.exists() {
-        fs::remove_dir_all(&base).unwrap();
-    }
+    let scratch_root = std::env::var_os("CHECKPO_SCALE_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("CHECKPO_SCALE_ROOT must name a dedicated scratch directory");
+    fs::create_dir_all(&scratch_root).unwrap();
+    let temporary = tempfile::Builder::new()
+        .prefix("checkpo-snapshot-v2-scale-")
+        .tempdir_in(&scratch_root)
+        .unwrap();
+    let base = temporary.path();
     let project = base.join("UnityProject");
     let storage = base.join("Storage");
     fs::create_dir_all(project.join("Assets/Scale")).unwrap();
@@ -100,4 +111,28 @@ fn snapshot_v2_checkpoint_scale() {
     assert!(manifest_files_after <= manifest_files_before);
     let verification = core::verify_project(&project, true).unwrap();
     assert!(verification.is_valid, "{:?}", verification.errors);
+
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    if let Some(report_path) = std::env::var_os("CHECKPO_SCALE_REPORT") {
+        let report_path = std::path::PathBuf::from(report_path);
+        if let Some(parent) = report_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let report = serde_json::json!({
+            "schemaVersion": 1,
+            "checkpointCount": checkpoint_count,
+            "sourceFileCount": 256,
+            "elapsedSeconds": elapsed_seconds,
+            "maximumSeconds": maximum_seconds,
+            "fullVerificationValid": verification.is_valid,
+        });
+        fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+
+    if let Some(maximum_seconds) = maximum_seconds {
+        assert!(
+            elapsed_seconds <= maximum_seconds,
+            "scale regression: {checkpoint_count} checkpoints took {elapsed_seconds:.2}s, exceeding the {maximum_seconds:.2}s limit"
+        );
+    }
 }

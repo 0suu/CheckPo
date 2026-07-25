@@ -87,9 +87,10 @@ fn apply_gc_internal(
             "storage gc cannot apply while missing objects, unsafe storage locations, or unreadable snapshots exist.",
         ));
     }
-    // The delete phase is intentionally non-cancellable. Returning Cancelled
-    // after deleting only a prefix would misrepresent a successfully modified
-    // repository as an untouched cancellation.
+    // This is the final cancellation check before deletion starts. The delete
+    // loops themselves do not poll cancellation because returning Cancelled
+    // after deleting a prefix would misrepresent a modified repository as
+    // untouched.
     crate::ensure_not_cancelled(cancellation)?;
 
     let anchored_repo = crate::storage::AnchoredRoot::open(&project.repo_root)?;

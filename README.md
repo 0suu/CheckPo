@@ -153,6 +153,10 @@ unknown option は `clap` で error になります。旧クラウド出力、�
 
 公式リリースのWindows installerはNSISです。MSIはローカル検証・組織内配布向けに生成できますが、現行のrelease workflowはMSIを公開しません。どちらのinstallerもWindows Authenticode署名は未設定です。更新機能の署名はTauri updaterの署名鍵で別途検証します。
 
+## macOS 配布
+
+macOS bundle は hardened runtime を有効にしてビルドします。ただし、現行設定の `signingIdentity: "-"` は ad-hoc 署名であり、Developer ID 署名や Apple notarization の代替ではありません。正式配布前には別管理の release workflow へ証明書と notarization 資格情報を設定し、生成した `.app` に対して `bash scripts/verify-macos-bundle.sh /path/to/CheckPo.app` を実行してください。検証を通していない macOS artifact は正式リリース扱いにしません。
+
 ## 診断ログ
 
 アプリとCLIは、ユーザーデータ領域の `diagnostic-logs/` に日次ログを保存し、直近約1週間分を保持します。操作名、エラー種別、checkpoint / transaction ID、ローカルpathを記録する場合がありますが、Unityファイルの内容は記録しません。GUIの詳細画面から診断ログフォルダを開けます。

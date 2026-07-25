@@ -4,7 +4,13 @@ target/
 .tauri/
 __pycache__/
 *.py[cod]
+AGENTS.md
 
 .DS_Store
 __MACOSX/
-AGENTS.md
+
+# Local review inputs and generated review bundles are not product sources.
+/.review-share/
+/review-inputs/
+/review-artifacts/
+/CheckPo-source-review-*.zip

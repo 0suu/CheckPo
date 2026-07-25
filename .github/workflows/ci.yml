@@ -65,6 +65,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           node --check src/CheckPo.Tauri/frontend/app.js
+          node --check src/CheckPo.Tauri/frontend/app-checkpoints.js
+          node --check src/CheckPo.Tauri/frontend/app-progress.js
+          node --check src/CheckPo.Tauri/frontend/app-recovery.js
           node --check src/CheckPo.Tauri/frontend/config.js
           node --check src/CheckPo.Tauri/frontend/dialogs.js
           node --check src/CheckPo.Tauri/frontend/diff-tree.js

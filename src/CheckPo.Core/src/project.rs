@@ -649,7 +649,7 @@ pub(crate) fn acquire_project_repository_lock(
     let recovered_deletion = crate::recover_checkpoint_deletions_unlocked(project)?;
     if recovered_creation || recovered_deletion {
         let index_is_current = matches!(
-            crate::checkpoint_index_status(project),
+            crate::checkpoint_index_status_unlocked(project),
             Ok(status) if status.state == crate::CheckpointIndexState::Current
         );
         if !index_is_current {

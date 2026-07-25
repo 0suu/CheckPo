@@ -16,7 +16,10 @@
     repositoryLocked: "別のCheckPo処理が実行中です。完了してから、もう一度実行してください。",
     storageRootConflict: "指定した場所と登録済みの保存先が一致しません。手動移動済みの保存データへ再接続してください。",
     storageRootUnavailable: "登録済みの保存データを読み込めません。手動移動済みの保存データがある場所を選んで再接続してください。",
+    invalidOperation: "現在のプロジェクト状態では、この操作を実行できません。",
+    notFound: "対象のファイルまたはフォルダーが見つかりません。",
     operationBusy: "別の処理が実行中です。完了してから、もう一度実行してください。",
+    operationStatePoisoned: "処理状態を読み込めませんでした。CheckPoを再起動してください。",
     pendingTransaction: "中断された作業があります。先に復旧してください。",
     unresolvedTransactionQuarantine: "プロジェクトの状態を安全と確認できません。既知のチェックポイントへ全体復元してください。",
     transactionRecoveryFailed: "自動復旧を完了できませんでした。上の案内を確認してください。",
@@ -30,7 +33,12 @@
     database: "一覧用データを読み込めませんでした。インデックスの再構築を実行してください。",
     corruption: "CheckPoの保存データに問題があります。破損チェックを実行してください。",
     confirmationRequired: "この操作には確認が必要です。",
+    taskJoinError: "バックグラウンド処理を完了できませんでした。CheckPoを再起動してください。",
     unexpected: "予期しない問題が発生しました。詳しい内容を確認してください。",
+    updateNotFound: "インストールできる更新がありません。もう一度更新を確認してください。",
+    updateStatePoisoned: "更新状態を読み込めませんでした。CheckPoを再起動してください。",
+    updateTargetNotFound: "このOSまたはCPU向けの更新ファイルが見つかりません。",
+    updater: "更新の確認またはインストールに失敗しました。",
   });
 
   function projectIdentity(projectPath, project) {
@@ -215,6 +223,46 @@
     return current;
   }
 
+  function checkpointListEventBindings(handlers) {
+    return [
+      ["click", handlers.click],
+      ["contextmenu", handlers.contextmenu],
+      ["keydown", handlers.keydown],
+    ];
+  }
+
+  function checkpointRowPatchMode(checkpointExists, rowExists, matchesQuery) {
+    if (!checkpointExists) return "rerender";
+    return rowExists && matchesQuery ? "replace" : "refilter";
+  }
+
+  function diffCommandName(metadataOnly) {
+    return metadataOnly ? "diff_checkpoint_metadata" : "diff_checkpoint";
+  }
+
+  function diffLoadResult(diff, metadataOnly) {
+    return { diff, exact: !metadataOnly };
+  }
+
+  function maintenanceApplyArgs(projectPath, plan) {
+    return {
+      projectPath,
+      expectedPlanId: plan?.planId,
+      confirmed: true,
+    };
+  }
+
+  function pendingClosePresentation(payload, busy) {
+    const cancellationRequested = Boolean(payload?.cancellationRequested);
+    return {
+      cancellationRequested,
+      inline: Boolean(busy),
+      message: cancellationRequested
+        ? "安全に中止できる地点で処理を止め、その後アプリを終了します。"
+        : "現在の処理が安全に完了してからアプリを終了します。",
+    };
+  }
+
   function transactionCleanupPlanHasCandidates(plan) {
     return Number(plan?.directoryCount || 0) > 0
       && Array.isArray(plan?.candidates)
@@ -346,6 +394,10 @@
     return detail === null
       ? { kind: normalizedKind, message }
       : { kind: normalizedKind, message, detail };
+  }
+
+  function localizedErrorKinds() {
+    return Object.keys(localizedErrorMessages).sort();
   }
 
   function retainPendingTransactionFailures(pendingTransactions, failedTransactions) {
@@ -627,12 +679,16 @@
     buildChangeTreeModel,
     cancelAndWaitForIdle,
     checkpointIndexPresentation,
+    checkpointListEventBindings,
     checkpointNavigationIndex,
+    checkpointRowPatchMode,
     checkpointSearchText,
     collectChangeTreeFilePaths,
     collectChangeTreeFolderPaths,
     diffResultIsComplete,
     diffResultIsProvisionalZero,
+    diffCommandName,
+    diffLoadResult,
     diffChangeCount,
     latestDiffState,
     latestDiffCountText,
@@ -645,13 +701,16 @@
     projectIdentity,
     projectScopedStateReset,
     mergeDiffRefreshOptions,
+    maintenanceApplyArgs,
     normalizedPathInput,
     operationProgressPercent,
+    pendingClosePresentation,
     pathConfirmationPreview,
     progressPhaseCanCancel,
     removeProjectFromHistory,
     restorableLastProjectPath,
     localizedErrorDisplay,
+    localizedErrorKinds,
     retainPendingTransactionFailures,
     retainVisibleChangeSelection,
     selectChangePaths,

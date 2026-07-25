@@ -2,14 +2,26 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+
+function readAppSource() {
+  return fs.readdirSync(__dirname)
+    .filter((name) => /^app(?:-[^.]+)?\.js$/.test(name))
+    .sort()
+    .map((name) => fs.readFileSync(path.join(__dirname, name), "utf8"))
+    .join("\n");
+}
 const {
   buildChangeTreeModel,
   cancelAndWaitForIdle,
   checkpointIndexPresentation,
+  checkpointListEventBindings,
   checkpointNavigationIndex,
+  checkpointRowPatchMode,
   checkpointSearchText,
   collectChangeTreeFolderPaths,
   diffChangeCount,
+  diffCommandName,
+  diffLoadResult,
   diffResultIsComplete,
   diffResultIsProvisionalZero,
   detectedDiffCountText,
@@ -21,9 +33,12 @@ const {
   latestDiffState,
   latestDiffCountText,
   localizedErrorDisplay,
+  localizedErrorKinds,
+  maintenanceApplyArgs,
   mergeDiffRefreshOptions,
   normalizedPathInput,
   operationProgressPercent,
+  pendingClosePresentation,
   projectChanged,
   projectScopedStateReset,
   pathConfirmationPreview,
@@ -338,6 +353,66 @@ test("missing checkpoint index can render without dereferencing a null storage s
   assert.deepEqual(
     storageSummaryWithRetainedSize({ checkpointCount: 3, storedSizeBytes: 1024 }, 2048),
     { checkpointCount: 3, storedSizeBytes: 1024 },
+  );
+});
+
+test("diff routing distinguishes metadata previews from exact diffs", () => {
+  const diff = { added: ["Assets/A.asset"] };
+  assert.equal(diffCommandName(true), "diff_checkpoint_metadata");
+  assert.equal(diffCommandName(false), "diff_checkpoint");
+  assert.deepEqual(diffLoadResult(diff, true), { diff, exact: false });
+  assert.deepEqual(diffLoadResult(diff, false), { diff, exact: true });
+});
+
+test("checkpoint list binds one delegated handler per supported event", () => {
+  const handlers = {
+    click: () => "click",
+    contextmenu: () => "contextmenu",
+    keydown: () => "keydown",
+  };
+  assert.deepEqual(checkpointListEventBindings(handlers), [
+    ["click", handlers.click],
+    ["contextmenu", handlers.contextmenu],
+    ["keydown", handlers.keydown],
+  ]);
+});
+
+test("checkpoint row updates replace only an existing matching row", () => {
+  assert.equal(checkpointRowPatchMode(false, true, true), "rerender");
+  assert.equal(checkpointRowPatchMode(true, true, true), "replace");
+  assert.equal(checkpointRowPatchMode(true, false, true), "refilter");
+  assert.equal(checkpointRowPatchMode(true, true, false), "refilter");
+});
+
+test("maintenance apply binds execution to the previewed plan", () => {
+  assert.deepEqual(maintenanceApplyArgs("C:/Avatar", { planId: "plan-1" }), {
+    projectPath: "C:/Avatar",
+    expectedPlanId: "plan-1",
+    confirmed: true,
+  });
+});
+
+test("deferred close presentation distinguishes cancellation and completion waits", () => {
+  const cancellation = pendingClosePresentation({ cancellationRequested: true }, true);
+  assert.equal(cancellation.inline, true);
+  assert.equal(cancellation.cancellationRequested, true);
+  assert.match(cancellation.message, /中止/);
+
+  const completion = pendingClosePresentation({ cancellationRequested: false }, false);
+  assert.equal(completion.inline, false);
+  assert.equal(completion.cancellationRequested, false);
+  assert.match(completion.message, /完了/);
+});
+
+test("every backend error kind has a localized frontend message", () => {
+  const backendKinds = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "app-error-kinds.json"), "utf8"),
+  );
+  const localizedKinds = new Set(localizedErrorKinds());
+
+  assert.deepEqual(
+    backendKinds.filter((kind) => !localizedKinds.has(kind)),
+    [],
   );
 });
 
@@ -700,7 +775,7 @@ test("change trees start collapsed and expose sibling positions for ARIA", () =>
 });
 
 test("GUI usability guards keep dialogs reachable and accessible", () => {
-  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const appJs = readAppSource();
   const dialogsJs = fs.readFileSync(path.join(__dirname, "dialogs.js"), "utf8");
   const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   const stylesCss = fs.readFileSync(path.join(__dirname, "styles.css"), "utf8");
@@ -727,7 +802,7 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
 });
 
 test("pending transaction errors resync the project so the recovery action becomes visible", () => {
-  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const appJs = readAppSource();
   const helper = appJs.match(
     /async function syncPendingTransactionsAfterError[\s\S]*?\r?\n}\r?\n/,
   )?.[0] || "";
@@ -745,7 +820,7 @@ test("pending transaction errors resync the project so the recovery action becom
 });
 
 test("journal cleanup invalidates and refreshes the rescue-size footer", () => {
-  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const appJs = readAppSource();
   const cleanupPath = appJs.match(
     /const result = await invokeCommand\("cleanup_journals"[\s\S]*?\r?\n    }\);/,
   )?.[0] || "";
@@ -757,7 +832,7 @@ test("journal cleanup invalidates and refreshes the rescue-size footer", () => {
 });
 
 test("restore and discard refresh the rescue-size footer after creating journals", () => {
-  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const appJs = readAppSource();
   const discardApplyPath = appJs.match(
     /const result = await invokeCommand\("apply_discard_files"[\s\S]*?await refreshProject\(\);/,
   )?.[0] || "";
@@ -770,7 +845,7 @@ test("restore and discard refresh the rescue-size footer after creating journals
 });
 
 test("recovery conflict UI selects files and a destination before applying", () => {
-  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const appJs = readAppSource();
   const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   const i18nJs = fs.readFileSync(path.join(__dirname, "i18n.js"), "utf8");
   const dialogsJs = fs.readFileSync(path.join(__dirname, "dialogs.js"), "utf8");
@@ -801,7 +876,7 @@ test("recovery conflict UI selects files and a destination before applying", () 
 });
 
 test("GUI uses user-facing maintenance and storage reconnect wording", () => {
-  const appJs = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const appJs = readAppSource();
   const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   const i18nJs = fs.readFileSync(path.join(__dirname, "i18n.js"), "utf8");
   assert.match(indexHtml, /手動移動済みの保存データへ再接続/);
