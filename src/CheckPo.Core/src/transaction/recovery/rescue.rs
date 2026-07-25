@@ -40,7 +40,7 @@ fn ensure_recovery_rescue_capacity(
             Err(error) => return Err(crate::io_error(&path, error)),
         }
     }
-    super::apply::ensure_available_space("checkpoint storage", &project.repo_root, required_bytes)
+    super::apply::ensure_checkpoint_storage_available_space(&project.repo_root, required_bytes)
 }
 
 pub(super) fn prepare_recovery_conflict_rescue(

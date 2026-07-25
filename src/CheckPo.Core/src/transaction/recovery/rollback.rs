@@ -106,7 +106,10 @@ pub(super) fn recover_one(project: &ProjectContext, pending: &PendingTransaction
     Ok(())
 }
 
-fn remove_repository_tree_if_exists(repo_root: &Path, directory: &Path) -> Result<()> {
+pub(in crate::transaction) fn remove_repository_tree_if_exists(
+    repo_root: &Path,
+    directory: &Path,
+) -> Result<()> {
     let relative = directory.strip_prefix(repo_root).map_err(|_| {
         CheckPoError::Corruption(format!(
             "transaction cleanup is outside repository: {}",

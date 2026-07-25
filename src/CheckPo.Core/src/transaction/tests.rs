@@ -49,6 +49,14 @@ fn injected_fault(point: TransactionFaultPoint) -> CheckPoError {
     CheckPoError::Unexpected(format!("injected fault at {point:?}"))
 }
 
+fn only_recovered_transaction_root(project: &Path, context: &ProjectContext) -> PathBuf {
+    let cleanup = crate::analyze_transaction_cleanup(project).unwrap();
+    assert_eq!(cleanup.candidates.len(), 1);
+    let candidate = cleanup.candidates.first().unwrap();
+    assert_eq!(candidate.state, "recovered");
+    journals_dir(&context.repo_root).join(&candidate.transaction_id)
+}
+
 #[test]
 fn recovery_after_fault_immediately_after_applying_journal_keeps_original_file() {
     let (_guard, _temp, project, _view) = setup_project();
@@ -1460,13 +1468,29 @@ fn backup_reflink_or_copy_keeps_project_file_when_backup_hash_mismatches() {
 #[test]
 fn capacity_check_blocks_when_required_bytes_exceed_available_space() {
     let (_guard, temp, _project, _view) = setup_project();
-    let available = crate::available_space_bytes(temp.path()).unwrap();
+    let required = u64::MAX;
 
-    let error = ensure_available_space("test volume", temp.path(), available.saturating_add(1))
-        .unwrap_err();
+    let error = ensure_available_space("test volume", temp.path(), required).unwrap_err();
 
     assert!(matches!(error, CheckPoError::User(_)));
     assert!(error.to_string().contains("not enough free space"));
+    assert!(!error.to_string().contains("復旧用データの片付け"));
+
+    let checkpoint_error =
+        ensure_checkpoint_storage_available_space(temp.path(), required).unwrap_err();
+
+    assert!(matches!(checkpoint_error, CheckPoError::User(_)));
+    assert!(
+        checkpoint_error
+            .to_string()
+            .contains("復旧用データの片付け")
+    );
+    assert!(checkpoint_error
+        .to_string()
+        .contains("checkpo maintenance cleanup-journals analyze <project-path>"));
+    assert!(checkpoint_error
+        .to_string()
+        .contains("checkpo maintenance cleanup-journals apply <project-path>"));
 }
 
 #[test]
@@ -1787,6 +1811,8 @@ fn parallel_staging_returns_the_lowest_plan_index_error() {
     ));
     assert!(!bulk.exists());
     assert!(crate::pending_transactions(&project).unwrap().is_empty());
+    let transaction_root = only_recovered_transaction_root(&project, &context);
+    assert!(!transaction_root.join("staged").exists());
 }
 
 #[test]
@@ -1858,6 +1884,9 @@ fn cancellation_during_staging_aborts_without_leaving_a_pending_transaction() {
     assert!(matches!(error, CheckPoError::Cancelled));
     assert_eq!(fs::read_to_string(&file).unwrap(), "two");
     assert!(crate::pending_transactions(&project).unwrap().is_empty());
+    let transaction_root = only_recovered_transaction_root(&project, &context);
+    assert!(transaction_root.join("journal.json").is_file());
+    assert!(!transaction_root.join("staged").exists());
 }
 
 #[test]
@@ -1886,6 +1915,54 @@ fn precondition_failure_after_staging_aborts_without_leaving_a_pending_transacti
     assert!(matches!(error, CheckPoError::WorkingTreeChanged(_)));
     assert_eq!(fs::read_to_string(&file).unwrap(), "three");
     assert!(crate::pending_transactions(&project).unwrap().is_empty());
+    let transaction_root = only_recovered_transaction_root(&project, &context);
+    assert!(transaction_root.join("journal.json").is_file());
+    assert!(!transaction_root.join("staged").exists());
+}
+
+#[test]
+fn staging_abort_cleanup_failure_preserves_original_error_and_cleanup_eligibility() {
+    let (_guard, _temp, project, _view) = setup_project();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    let (context, plan) = replace_plan(&project);
+    let cancellation = CancellationToken::new();
+    let progress = |event: OperationProgress| {
+        if event.phase == "staging" {
+            cancellation.cancel();
+        }
+    };
+
+    let error = apply_plan_inner(
+        &context,
+        plan,
+        ApplyOptions { yes: true },
+        Some(&progress),
+        Some(&cancellation),
+        Some(&|point| {
+            if point == TransactionFaultPoint::StagedPayloadCleanupBefore {
+                return Err(injected_fault(point));
+            }
+            Ok(())
+        }),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, CheckPoError::Cancelled));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "two");
+    assert!(crate::pending_transactions(&project).unwrap().is_empty());
+    let transaction_root = only_recovered_transaction_root(&project, &context);
+    let staged_root = transaction_root.join("staged");
+    assert!(staged_root.is_dir());
+    assert!(dir_size(&staged_root).unwrap() > 0);
+
+    let cleanup = crate::analyze_transaction_cleanup(&project).unwrap();
+    let result =
+        crate::cleanup_journals_with_expected_plan(&project, &cleanup, ApplyOptions { yes: true })
+            .unwrap();
+
+    assert_eq!(result.deleted_directory_count, 1);
+    assert!(!transaction_root.exists());
 }
 
 #[test]
