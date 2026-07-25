@@ -130,7 +130,7 @@ jobs:
     needs:
       - prepare
       - release
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Publish GitHub Release
         shell: bash
