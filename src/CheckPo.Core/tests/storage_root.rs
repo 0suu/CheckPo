@@ -407,6 +407,126 @@ fn start_as_separate_project_uses_custom_storage_root() {
 }
 
 #[test]
+fn start_new_history_after_storage_loss_preserves_old_registration() {
+    let (_guard, _temp, project, data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let original = core::init_project(&project).unwrap();
+    core::create_checkpoint(&project, "Original", Default::default()).unwrap();
+    let old_repo = original
+        .storage_root_path
+        .join("repos")
+        .join(&original.project_id);
+    fs::remove_dir_all(&old_repo).unwrap();
+    let new_storage = data.join("new-history-store");
+
+    let restarted = core::start_new_history_after_storage_loss_with_storage_root(
+        &project,
+        &new_storage,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_ne!(restarted.project_id, original.project_id);
+    assert_eq!(
+        restarted.storage_root_path.canonicalize().unwrap(),
+        new_storage.canonicalize().unwrap()
+    );
+    assert!(new_storage
+        .join("repos")
+        .join(&restarted.project_id)
+        .is_dir());
+    assert!(core::list_checkpoints(&project).unwrap().is_empty());
+    let registry: serde_json::Value = core::read_json(&core::registry_path().unwrap()).unwrap();
+    assert!(registry["projects"]
+        .get(original.project_id.as_str())
+        .is_some());
+    assert!(registry["projects"]
+        .get(restarted.project_id.as_str())
+        .is_some());
+}
+
+#[test]
+fn start_new_history_after_storage_loss_rejects_available_repository() {
+    let (_guard, _temp, project, data) = setup();
+    let original = core::init_project(&project).unwrap();
+    let original_marker = fs::read(project.join(".checkpo/project.json")).unwrap();
+    let new_storage = data.join("new-history-store");
+
+    let error = core::start_new_history_after_storage_loss_with_storage_root(
+        &project,
+        &new_storage,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("only allowed when the registered repository is unavailable"));
+    assert_eq!(
+        fs::read(project.join(".checkpo/project.json")).unwrap(),
+        original_marker
+    );
+    assert_eq!(
+        core::load_project_view(&project).unwrap().project_id,
+        original.project_id
+    );
+    assert!(!new_storage.exists());
+}
+
+#[test]
+fn start_new_history_after_storage_loss_requires_confirmation_without_side_effects() {
+    let (_guard, _temp, project, data) = setup();
+    core::init_project(&project).unwrap();
+    let original_marker = fs::read(project.join(".checkpo/project.json")).unwrap();
+    let new_storage = data.join("new-history-store");
+
+    let error = core::start_new_history_after_storage_loss_with_storage_root(
+        &project,
+        &new_storage,
+        core::ApplyOptions { yes: false },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("requires --yes"));
+    assert_eq!(
+        fs::read(project.join(".checkpo/project.json")).unwrap(),
+        original_marker
+    );
+    assert!(!new_storage.exists());
+}
+
+#[test]
+fn start_new_history_after_storage_loss_rejects_copied_project() {
+    let (_guard, temp, project, data) = setup();
+    let original = core::init_project(&project).unwrap();
+    let copied = temp.path().join("UnityProjectCopy");
+    copy_dir(&project, &copied);
+    let old_repo = original
+        .storage_root_path
+        .join("repos")
+        .join(&original.project_id);
+    fs::remove_dir_all(&old_repo).unwrap();
+    let copied_marker = fs::read(copied.join(".checkpo/project.json")).unwrap();
+    let new_storage = data.join("new-history-store");
+
+    let error = core::start_new_history_after_storage_loss_with_storage_root(
+        &copied,
+        &new_storage,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("not allowed for a copied project"));
+    assert_eq!(
+        fs::read(copied.join(".checkpo/project.json")).unwrap(),
+        copied_marker
+    );
+    assert!(!new_storage.exists());
+}
+
+#[test]
 fn start_as_separate_requires_copied_project_and_confirmation_without_side_effects() {
     let (_guard, temp, project, _data) = setup();
     let original = core::init_project(&project).unwrap();

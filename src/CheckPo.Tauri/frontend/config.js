@@ -14,4 +14,5 @@ const immediatelyCancellableCommands = new Set([
 const progressCancellableStartCommands = new Set([
   "init_project",
   "start_as_separate_project",
+  "start_new_history_after_storage_loss",
 ]);

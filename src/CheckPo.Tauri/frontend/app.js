@@ -1179,7 +1179,7 @@ function updateControls() {
   const destructiveBlocked = locationMutationBlocked || pendingMutationBlocked || quarantineMutationBlocked;
   const controlsBlocked = state.busy || state.confirming;
   document.querySelectorAll("button").forEach((button) => {
-    if (["confirmOkButton", "confirmCancelButton"].includes(button.id)) {
+    if (["confirmOkButton", "confirmAlternativeButton", "confirmCancelButton"].includes(button.id)) {
       button.disabled = state.busy && $("confirmOverlay").hidden;
       return;
     }
@@ -1398,27 +1398,78 @@ async function handleCopiedProjectRegistrationChoice(projectPath, storageRootPat
   }
 }
 
-async function reconnectProjectStorageAfterLoadFailure(projectPath, storageRootPath) {
+function unavailableProjectStorageChoiceMessage(storageRootPath) {
+  const reconnectLocation = storageRootPath
+    ? `${storageRootPath} に手動移動済みの保存データがある場合は、既存の履歴へ再接続できます。`
+    : "手動移動済みの保存データがある場合は、その場所を選んで既存の履歴へ再接続できます。";
+  return [
+    "登録済みの保存先を読み込めません。",
+    "",
+    reconnectLocation,
+    "",
+    "「再接続せず新しい履歴で開始」を選ぶと、以前の履歴や復旧用データは削除しませんが、このプロジェクトからは参照されなくなります。",
+    "以前の保存先に進行途中の復元や取り消しがあっても検出・復旧できません。現在の Unity ファイル状態を新しい履歴の起点にします。",
+    "以前の保存先が戻る可能性がある場合は、キャンセルしてください。",
+  ].join("\n");
+}
+
+async function handleUnavailableProjectStorageAfterLoadFailure(
+  projectPath,
+  storageRootPath,
+  createInitialCheckpoint,
+) {
   state.confirming = true;
   updateControls();
-  let reconnect = false;
+  let action = null;
   try {
-    reconnect = await confirmAction(
-      `登録済みの保存先を読み込めません。${storageRootPath} に手動移動済みの保存データがある場合、このプロジェクトを再接続します。`,
-      "保存データへ再接続",
+    action = await chooseUnavailableStorageAction(
+      unavailableProjectStorageChoiceMessage(storageRootPath),
     );
   } finally {
     state.confirming = false;
     updateControls();
   }
-  if (!reconnect) {
-    setStatus("保存データへの再接続を中止しました。");
+  if (!action) {
+    setStatus("保存先の選択を中止しました。");
     return;
   }
+
+  let selectedStorageRootPath = storageRootPath;
+  if (!selectedStorageRootPath) {
+    selectedStorageRootPath = await pickFolder(
+      action === "reconnect"
+        ? "手動移動済みの保存データがある場所を選択"
+        : "新しい履歴の保存先を選択",
+    );
+    if (!selectedStorageRootPath) {
+      setStatus("保存先の選択を中止しました。");
+      return;
+    }
+    $("registrationStorageRootPath").value = selectedStorageRootPath;
+  }
+
+  if (action === "startNewHistory") {
+    await run(
+      createInitialCheckpoint ? "初回チェックポイントを作成中" : "新しい履歴を開始中",
+      async () => {
+        const snapshot = await invokeCommand("start_new_history_after_storage_loss", {
+          projectPath,
+          storageRootPath: selectedStorageRootPath,
+          confirmed: true,
+          createInitialCheckpoint,
+        });
+        renderStartedProject(snapshot, "以前の保存データへ再接続せず、新しい履歴を開始しました。");
+        await refreshLatestDiff({ allowBusy: true, metadataOnly: true });
+        $("projectRegistrationOverlay").hidden = true;
+      },
+    );
+    return;
+  }
+
   await run("保存データへ再接続中", async () => {
     const snapshot = await invokeCommand("set_storage_root", {
       projectPath,
-      storageRootPath,
+      storageRootPath: selectedStorageRootPath,
       confirmed: true,
     });
     invalidateStoredSize();
@@ -1799,7 +1850,7 @@ function bindEvents() {
           renderSnapshot(await invokeCommand("load_project", { projectPath }));
           setStatus("プロジェクトを開きました。");
         } catch (error) {
-          if (error?.kind === "storageRootUnavailable" && storageRootPath) throw error;
+          if (error?.kind === "storageRootUnavailable") throw error;
           if (!shouldStartProjectAfterLoadError(error)) throw error;
           const snapshot = await invokeCommand("init_project", {
             projectPath,
@@ -1812,8 +1863,12 @@ function bindEvents() {
         $("projectRegistrationOverlay").hidden = true;
       }, { rethrow: true, suppressError: true });
     } catch (error) {
-      if (error?.kind === "storageRootUnavailable" && storageRootPath) {
-        await reconnectProjectStorageAfterLoadFailure(projectPath, storageRootPath);
+      if (error?.kind === "storageRootUnavailable") {
+        await handleUnavailableProjectStorageAfterLoadFailure(
+          projectPath,
+          storageRootPath,
+          createInitialCheckpoint,
+        );
       } else if (isCopiedProjectError(error) || await isCopiedProjectAtPath(projectPath)) {
         await handleCopiedProjectRegistrationChoice(projectPath, storageRootPath);
       } else {

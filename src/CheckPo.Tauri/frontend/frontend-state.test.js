@@ -294,7 +294,11 @@ test("checkpoint progress is monotonic and reaches 100 only after UI completion"
 });
 
 test("initial project checkpoint commands use the monotonic checkpoint phase ranges", () => {
-  for (const command of ["init_project", "start_as_separate_project"]) {
+  for (const command of [
+    "init_project",
+    "start_as_separate_project",
+    "start_new_history_after_storage_loss",
+  ]) {
     assert.equal(operationProgressPercent(command, {
       phase: "scan",
       completed: 10,
@@ -796,8 +800,13 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
     "utf8",
   ));
 
-  assert.match(appJs, /async function reconnectProjectStorageAfterLoadFailure/);
-  assert.match(appJs, /storageRootUnavailable" && storageRootPath\) throw error/);
+  assert.match(appJs, /async function handleUnavailableProjectStorageAfterLoadFailure/);
+  assert.match(appJs, /storageRootUnavailable"\) throw error/);
+  assert.match(dialogsJs, /function chooseUnavailableStorageAction/);
+  assert.match(indexHtml, /id="confirmAlternativeButton"[^>]*hidden/);
+  assert.match(appJs, /"start_new_history_after_storage_loss"/);
+  assert.match(appJs, /再接続せず、新しい履歴を開始しました/);
+  assert.match(appJs, /以前の保存先に進行途中の復元や取り消しがあっても検出・復旧できません/);
   assert.match(appJs, /statusBannerText/);
   assert.match(appJs, /contextMenuReturnFocus/);
   assert.match(appJs, /visibleModalOverlay\(\) \|\| document\.body/);

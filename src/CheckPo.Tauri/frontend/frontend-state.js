@@ -326,6 +326,7 @@
       "create_checkpoint",
       "init_project",
       "start_as_separate_project",
+      "start_new_history_after_storage_loss",
     ].includes(command)) {
       const checkpointRanges = {
         scan: [0, 25],
