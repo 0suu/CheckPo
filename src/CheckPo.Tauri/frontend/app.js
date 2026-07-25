@@ -192,7 +192,6 @@ async function invokeCommand(command, args = {}, options = {}) {
           throw { kind: "cancelled", message: "Operation cancelled" };
         }
         if (busyRetryIndex >= OPERATION_BUSY_RETRY_DELAYS_MS.length) throw error;
-        if (busyRetryIndex === 0) setStatus("別の処理の完了を待っています。");
         await sleep(OPERATION_BUSY_RETRY_DELAYS_MS[busyRetryIndex]);
         busyRetryIndex += 1;
       }
