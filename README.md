@@ -155,7 +155,7 @@ unknown option は `clap` で error になります。旧クラウド出力、�
 
 ## macOS 配布
 
-macOS bundle は hardened runtime を有効にしてビルドします。ただし、現行設定の `signingIdentity: "-"` は ad-hoc 署名であり、Developer ID 署名や Apple notarization の代替ではありません。正式配布前には別管理の release workflow へ証明書と notarization 資格情報を設定し、生成した `.app` に対して `bash scripts/verify-macos-bundle.sh /path/to/CheckPo.app` を実行してください。検証を通していない macOS artifact は正式リリース扱いにしません。
+macOS は Apple Silicon のみをサポートし、Intel Mac はサポートしません。macOS bundle は hardened runtime を有効にしてビルドします。ただし、現行設定の `signingIdentity: "-"` は ad-hoc 署名であり、Developer ID 署名や Apple notarization の代替ではありません。正式配布前には別管理の release workflow へ証明書と notarization 資格情報を設定し、生成した `.app` に対して `bash scripts/verify-macos-bundle.sh /path/to/CheckPo.app` を実行してください。検証を通していない macOS artifact は正式リリース扱いにしません。
 
 ## 診断ログ
 
