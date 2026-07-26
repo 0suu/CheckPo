@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   rustsec:
-    name: RustSec advisories
+    name: Dependency policy
     runs-on: windows-latest
     steps:
       - name: Checkout

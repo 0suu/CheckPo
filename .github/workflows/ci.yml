@@ -65,3 +65,20 @@ jobs:
           node --check src/CheckPo.Tauri/frontend/theme.js
           node --check src/CheckPo.Tauri/frontend/utils.js
           node --test src/CheckPo.Tauri/frontend/frontend-state.test.js
+
+  required:
+    name: CI required
+    if: always()
+    needs:
+      - rust
+    runs-on: windows-latest
+    steps:
+      - name: Require every CI matrix job to pass
+        shell: bash
+        env:
+          RUST_RESULT: ${{ needs.rust.result }}
+        run: |
+          if [[ "$RUST_RESULT" != "success" ]]; then
+            echo "Rust CI matrix result was: $RUST_RESULT" >&2
+            exit 1
+          fi
