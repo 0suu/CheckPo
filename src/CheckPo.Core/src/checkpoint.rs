@@ -616,8 +616,28 @@ fn preload_available_current_objects(
                 Err(error) => return Err(error),
             };
             let mut outcomes = Vec::with_capacity(objects.len());
+            #[cfg(windows)]
+            let mut ntfs_volume_serial = parent.ntfs_volume_serial();
             for (leaf, object_id, expected_size) in objects {
-                let metadata = match parent.inspect_metadata_no_follow(&leaf) {
+                #[cfg(windows)]
+                let named_metadata = match ntfs_volume_serial {
+                    Some(volume_serial) => {
+                        parent.inspect_ntfs_metadata_by_name_no_follow(&leaf, volume_serial)?
+                    }
+                    None => None,
+                };
+                #[cfg(windows)]
+                if named_metadata.is_none() {
+                    ntfs_volume_serial = None;
+                }
+                #[cfg(windows)]
+                let metadata_result = match named_metadata {
+                    Some(metadata) => Ok(metadata),
+                    None => parent.inspect_metadata_no_follow(&leaf),
+                };
+                #[cfg(not(windows))]
+                let metadata_result = parent.inspect_metadata_no_follow(&leaf);
+                let metadata = match metadata_result {
                     Ok(metadata) => metadata,
                     Err(CheckPoError::Io { source, .. })
                         if source.kind() == ErrorKind::NotFound =>

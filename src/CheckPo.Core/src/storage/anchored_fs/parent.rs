@@ -15,6 +15,25 @@ impl AnchoredParent {
             .map_err(|error| io_error(&self.display_path, error))
     }
 
+    #[cfg(windows)]
+    pub(crate) fn ntfs_volume_serial(&self) -> Option<u64> {
+        windows_ntfs_volume_serial(&self.directory, self.identity.volume_serial_number)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn inspect_ntfs_metadata_by_name_no_follow(
+        &self,
+        leaf: &std::ffi::OsStr,
+        volume_serial: u64,
+    ) -> Result<Option<AnchoredFileMetadata>> {
+        validate_leaf(leaf, &self.display_path)?;
+        if self.identity.volume_serial_number != volume_serial {
+            return Ok(None);
+        }
+        let display_path = self.display_path.join(leaf);
+        inspect_windows_ntfs_metadata_by_name(&self.directory, leaf, &display_path, volume_serial)
+    }
+
     pub(crate) fn create_new_file(&self, leaf: &std::ffi::OsStr) -> Result<AnchoredFile> {
         validate_leaf(leaf, &self.display_path)?;
         let display_path = self.display_path.join(leaf);

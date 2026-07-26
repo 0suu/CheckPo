@@ -824,6 +824,314 @@ pub(super) fn open_windows_relative(
     Ok(unsafe { File::from_raw_handle(handle as _) })
 }
 
+#[cfg(windows)]
+pub(super) fn windows_ntfs_volume_serial(
+    directory: &File,
+    identity_volume_serial: u64,
+) -> Option<u64> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRemoteProtocolInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+        FILE_REMOTE_PROTOCOL_INFO,
+    };
+
+    // A remote server may report "NTFS" without providing local NTFS file-id
+    // semantics. Keep network filesystems on the handle-based fallback.
+    let mut remote = FILE_REMOTE_PROTOCOL_INFO {
+        StructureVersion: 2,
+        StructureSize: size_of::<FILE_REMOTE_PROTOCOL_INFO>() as u16,
+        ..Default::default()
+    };
+    let remote_result = unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle() as HANDLE,
+            FileRemoteProtocolInfo,
+            (&mut remote as *mut FILE_REMOTE_PROTOCOL_INFO).cast(),
+            size_of::<FILE_REMOTE_PROTOCOL_INFO>() as u32,
+        )
+    };
+    if remote_result == 0 || remote.Protocol != 0 {
+        return None;
+    }
+    let mut file_system = [0u16; 16];
+    let result = unsafe {
+        GetVolumeInformationByHandleW(
+            directory.as_raw_handle() as HANDLE,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            file_system.as_mut_ptr(),
+            file_system.len() as u32,
+        )
+    };
+    if result == 0 {
+        return None;
+    }
+    let name_len = file_system
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(file_system.len());
+    (String::from_utf16_lossy(&file_system[..name_len]).eq_ignore_ascii_case("NTFS"))
+        .then_some(identity_volume_serial)
+}
+
+#[cfg(windows)]
+pub(super) fn inspect_windows_ntfs_metadata_by_name(
+    parent: &File,
+    leaf: &std::ffi::OsStr,
+    display_path: &Path,
+    volume_serial: u64,
+) -> Result<Option<AnchoredFileMetadata>> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    // FILE_STAT_INFORMATION returns the identity and all fingerprint fields in
+    // one snapshot. Query twice to preserve the existing version-stability
+    // check that rejects a file changed while it is being inspected.
+    let Some(before) = query_windows_stat_by_name(parent, leaf, display_path)? else {
+        return Ok(None);
+    };
+    let Some(after) = query_windows_stat_by_name(parent, leaf, display_path)? else {
+        return Ok(None);
+    };
+    if !windows_file_stat_matches(&before, &after) {
+        return Err(CheckPoError::WorkingTreeChanged(
+            display_path.display().to_string(),
+        ));
+    }
+    let size_bytes = u64::try_from(after.EndOfFile).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "file has a negative length: {}",
+            display_path.display()
+        ))
+    })?;
+    // NTFS file ids are 64-bit. FILE_ID_INFO exposes the same value as a
+    // 128-bit little-endian identifier with a zero upper half.
+    let file_id = windows_v3_ntfs_file_id(after.FileId);
+    Ok(Some(AnchoredFileMetadata {
+        size_bytes,
+        modified: windows_file_time_to_system_time(after.LastWriteTime, display_path)?,
+        fingerprint: (after.NumberOfLinks == 1).then(|| {
+            format!(
+                "windows-v3:{volume_serial}:{file_id}:{size_bytes}:{}:{}:{}:{}",
+                after.CreationTime, after.LastWriteTime, after.ChangeTime, after.FileAttributes
+            )
+        }),
+        is_regular: after.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0,
+        is_link: after.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+    }))
+}
+
+#[cfg(windows)]
+pub(super) fn windows_v3_ntfs_file_id(file_id: i64) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(32);
+    for byte in file_id.to_le_bytes().into_iter().chain([0; 8]) {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+#[cfg(windows)]
+type NtQueryInformationByNameFn =
+    unsafe extern "system" fn(
+        *const windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES,
+        *mut windows_sys::Win32::System::IO::IO_STATUS_BLOCK,
+        *mut core::ffi::c_void,
+        u32,
+        windows_sys::Wdk::Storage::FileSystem::FILE_INFORMATION_CLASS,
+    ) -> windows_sys::Win32::Foundation::NTSTATUS;
+
+#[cfg(windows)]
+fn nt_query_information_by_name() -> Option<NtQueryInformationByNameFn> {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    // FileStatInformation was added after the oldest Windows versions that can
+    // still load this binary. Resolve the native entry point lazily so a
+    // missing symbol selects the established handle-based path.
+    static QUERY: OnceLock<Option<NtQueryInformationByNameFn>> = OnceLock::new();
+    *QUERY.get_or_init(|| unsafe {
+        let module_name = [
+            b'n' as u16,
+            b't' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            0,
+        ];
+        let module = GetModuleHandleW(module_name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let address = GetProcAddress(module, c"NtQueryInformationByName".as_ptr().cast())?;
+        Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            NtQueryInformationByNameFn,
+        >(address))
+    })
+}
+
+#[cfg(windows)]
+fn query_windows_stat_by_name(
+    parent: &File,
+    leaf: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<Option<windows_sys::Wdk::Storage::FileSystem::FILE_STAT_INFORMATION>> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{FileStatInformation, FILE_STAT_INFORMATION};
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, HANDLE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+        STATUS_REPARSE_POINT_ENCOUNTERED, UNICODE_STRING,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let Some(query) = nt_query_information_by_name() else {
+        return Ok(None);
+    };
+    let mut wide = leaf.encode_wide().collect::<Vec<_>>();
+    let byte_len = wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| {
+            CheckPoError::Corruption(format!("path is too long: {}", display_path.display()))
+        })?;
+    let unicode = UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len,
+        Buffer: wide.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle() as HANDLE,
+        ObjectName: &unicode,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut stat = MaybeUninit::<FILE_STAT_INFORMATION>::zeroed();
+    let mut io_status = MaybeUninit::<IO_STATUS_BLOCK>::zeroed();
+    let status = unsafe {
+        query(
+            &attributes,
+            io_status.as_mut_ptr(),
+            stat.as_mut_ptr().cast(),
+            size_of::<FILE_STAT_INFORMATION>() as u32,
+            FileStatInformation,
+        )
+    };
+    if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+        return Err(CheckPoError::Corruption(format!(
+            "unsafe anchored path contains a reparse point: {}",
+            display_path.display()
+        )));
+    }
+    if windows_named_stat_should_fallback(status) {
+        return Ok(None);
+    }
+    if status < 0 {
+        let raw_error = unsafe { RtlNtStatusToDosError(status) };
+        if windows_named_stat_error_should_fallback(raw_error) {
+            return Ok(None);
+        }
+        return Err(io_error(
+            display_path,
+            std::io::Error::from_raw_os_error(raw_error as i32),
+        ));
+    }
+    Ok(Some(unsafe { stat.assume_init() }))
+}
+
+#[cfg(windows)]
+pub(super) fn windows_named_stat_should_fallback(
+    status: windows_sys::Win32::Foundation::NTSTATUS,
+) -> bool {
+    use windows_sys::Win32::Foundation::{
+        STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
+        STATUS_NOT_SUPPORTED,
+    };
+
+    matches!(
+        status,
+        STATUS_INVALID_INFO_CLASS
+            | STATUS_INVALID_PARAMETER
+            | STATUS_NOT_IMPLEMENTED
+            | STATUS_NOT_SUPPORTED
+    )
+}
+
+#[cfg(windows)]
+pub(super) fn windows_named_stat_error_should_fallback(raw_error: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+
+    matches!(
+        raw_error,
+        ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED
+    )
+}
+
+#[cfg(windows)]
+fn windows_file_stat_matches(
+    left: &windows_sys::Wdk::Storage::FileSystem::FILE_STAT_INFORMATION,
+    right: &windows_sys::Wdk::Storage::FileSystem::FILE_STAT_INFORMATION,
+) -> bool {
+    left.FileId == right.FileId
+        && left.CreationTime == right.CreationTime
+        && left.LastWriteTime == right.LastWriteTime
+        && left.ChangeTime == right.ChangeTime
+        && left.AllocationSize == right.AllocationSize
+        && left.EndOfFile == right.EndOfFile
+        && left.FileAttributes == right.FileAttributes
+        && left.ReparseTag == right.ReparseTag
+        && left.NumberOfLinks == right.NumberOfLinks
+}
+
+#[cfg(windows)]
+fn windows_file_time_to_system_time(value: i64, path: &Path) -> Result<std::time::SystemTime> {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
+    let unix_100ns = i128::from(value) - WINDOWS_TO_UNIX_EPOCH_100NS;
+    let magnitude = u64::try_from(unix_100ns.unsigned_abs()).map_err(|_| {
+        CheckPoError::Corruption(format!(
+            "file timestamp is out of range: {}",
+            path.display()
+        ))
+    })?;
+    let nanoseconds = magnitude.checked_mul(100).ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "file timestamp is out of range: {}",
+            path.display()
+        ))
+    })?;
+    let duration = std::time::Duration::from_nanos(nanoseconds);
+    let result = if unix_100ns >= 0 {
+        std::time::UNIX_EPOCH.checked_add(duration)
+    } else {
+        std::time::UNIX_EPOCH.checked_sub(duration)
+    };
+    result.ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "file timestamp is out of range: {}",
+            path.display()
+        ))
+    })
+}
+
 #[cfg(not(any(unix, windows)))]
 pub(super) fn open_portable_directory_no_follow(path: &Path) -> Result<File> {
     File::open(path).map_err(|error| io_error(path, error))

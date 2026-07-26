@@ -991,6 +991,176 @@ mod windows_tests {
     }
 
     #[test]
+    fn ntfs_named_stat_matches_identity_bound_metadata_across_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        for shard in 0..4 {
+            let shard_path = root_path.join(format!("{shard:02x}"));
+            fs::create_dir_all(&shard_path).unwrap();
+            for index in 0..16 {
+                fs::write(
+                    shard_path.join(format!("{index:064x}")),
+                    format!("payload-{shard}-{index}"),
+                )
+                .unwrap();
+            }
+        }
+        let root = AnchoredRoot::open(&root_path).unwrap();
+
+        for shard in 0..4 {
+            let shard_path = PathBuf::from(format!("{shard:02x}"));
+            let parent = root.open_directory(&shard_path, false).unwrap();
+            let Some(volume_serial) = parent.ntfs_volume_serial() else {
+                return;
+            };
+            for index in 0..16 {
+                let leaf = std::ffi::OsString::from(format!("{index:064x}"));
+                let named = parent
+                    .inspect_ntfs_metadata_by_name_no_follow(&leaf, volume_serial)
+                    .unwrap()
+                    .expect("NTFS named stat should be supported");
+                let opened = parent.inspect_metadata_no_follow(&leaf).unwrap();
+
+                assert_eq!(named, opened);
+                let file_id = named
+                    .fingerprint
+                    .as_deref()
+                    .unwrap()
+                    .split(':')
+                    .nth(2)
+                    .unwrap();
+                assert_eq!(&file_id[16..], "0000000000000000");
+            }
+        }
+        assert_eq!(
+            windows_v3_ntfs_file_id(i64::MIN),
+            "00000000000000800000000000000000"
+        );
+    }
+
+    #[test]
+    fn ntfs_named_stat_observes_open_hardlink_writer_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("payload"), b"before").unwrap();
+        let outside_link = temp.path().join("outside-link");
+        fs::hard_link(root_path.join("payload"), &outside_link).unwrap();
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let parent = root.open_directory(Path::new(""), false).unwrap();
+        let Some(volume_serial) = parent.ntfs_volume_serial() else {
+            return;
+        };
+        let mut writer = fs::OpenOptions::new()
+            .append(true)
+            .open(&outside_link)
+            .unwrap();
+        writer.write_all(b"-after").unwrap();
+        writer.flush().unwrap();
+
+        let named = parent
+            .inspect_ntfs_metadata_by_name_no_follow(std::ffi::OsStr::new("payload"), volume_serial)
+            .unwrap()
+            .expect("NTFS named stat should be supported");
+
+        assert_eq!(named.size_bytes, b"before-after".len() as u64);
+        assert!(named.fingerprint.is_none());
+        drop(writer);
+    }
+
+    #[test]
+    fn ntfs_named_stat_rejects_cache_after_hardlink_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("payload"), b"approved").unwrap();
+        let outside_link = temp.path().join("outside-link");
+        fs::hard_link(root_path.join("payload"), &outside_link).unwrap();
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let parent = root.open_directory(Path::new(""), false).unwrap();
+        let Some(volume_serial) = parent.ntfs_volume_serial() else {
+            return;
+        };
+        let baseline = parent
+            .inspect_ntfs_metadata_by_name_no_follow(std::ffi::OsStr::new("payload"), volume_serial)
+            .unwrap()
+            .expect("NTFS named stat should be supported");
+        assert!(baseline.fingerprint.is_none());
+
+        fs::write(&outside_link, b"attacker").unwrap();
+
+        let named = parent
+            .inspect_ntfs_metadata_by_name_no_follow(std::ffi::OsStr::new("payload"), volume_serial)
+            .unwrap()
+            .expect("NTFS named stat should be supported");
+        let opened = parent
+            .inspect_metadata_no_follow(std::ffi::OsStr::new("payload"))
+            .unwrap();
+
+        assert_eq!(named.size_bytes, opened.size_bytes);
+        assert_eq!(named.modified, opened.modified);
+        assert!(named.fingerprint.is_none());
+        assert!(opened.fingerprint.is_some());
+    }
+
+    #[test]
+    fn named_stat_unsupported_statuses_use_handle_fallback() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SUPPORTED, STATUS_ACCESS_DENIED, STATUS_INVALID_INFO_CLASS,
+            STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED,
+        };
+
+        for status in [
+            STATUS_INVALID_INFO_CLASS,
+            STATUS_INVALID_PARAMETER,
+            STATUS_NOT_IMPLEMENTED,
+            STATUS_NOT_SUPPORTED,
+        ] {
+            assert!(windows_named_stat_should_fallback(status));
+        }
+        assert!(!windows_named_stat_should_fallback(STATUS_ACCESS_DENIED));
+        for raw_error in [
+            ERROR_INVALID_FUNCTION,
+            ERROR_INVALID_PARAMETER,
+            ERROR_NOT_SUPPORTED,
+        ] {
+            assert!(windows_named_stat_error_should_fallback(raw_error));
+        }
+        assert!(!windows_named_stat_error_should_fallback(
+            ERROR_ACCESS_DENIED
+        ));
+    }
+
+    #[test]
+    fn ntfs_named_stat_rejects_leaf_reparse_points() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        if symlink_file(&outside, root_path.join("linked")).is_err() {
+            return;
+        }
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let parent = root.open_directory(Path::new(""), false).unwrap();
+        let Some(volume_serial) = parent.ntfs_volume_serial() else {
+            return;
+        };
+
+        let metadata = parent
+            .inspect_ntfs_metadata_by_name_no_follow(std::ffi::OsStr::new("linked"), volume_serial)
+            .unwrap()
+            .expect("NTFS named stat should be supported");
+
+        assert!(metadata.is_link);
+        assert_eq!(metadata.size_bytes, 0);
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[test]
     fn no_write_sharing_guard_blocks_in_place_writers() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("root");
