@@ -1127,11 +1127,12 @@ impl AnchoredParent {
 
     /// Inspects an immutable loose object without requesting content-read access.
     ///
-    /// A metadata-only Windows handle is not blocked by an exclusive content
-    /// handle. Keep this restricted to immutable loose objects: the repository
-    /// lock serializes CheckPo writers but cannot exclude external writers, so
-    /// this has the same external-change race as the existing fingerprint cache.
-    /// Working-tree scans must continue through `inspect_metadata_no_follow`.
+    /// A metadata-only Windows handle can coexist with an exclusive content
+    /// handle. The repository lock serializes CheckPo writers only; metadata
+    /// queried through this handle still reflects completed external writes,
+    /// while later writes remain the same TOCTOU risk as the fingerprint cache.
+    /// This optimization stays limited to immutable loose objects here because
+    /// accepting exclusively opened working files is a separate product decision.
     pub(crate) fn inspect_checkpoint_object_metadata_no_follow(
         &self,
         leaf: &std::ffi::OsStr,
