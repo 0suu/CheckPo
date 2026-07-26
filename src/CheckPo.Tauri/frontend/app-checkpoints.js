@@ -591,7 +591,7 @@ async function copyCheckpointId(checkpointId) {
       document.execCommand("copy");
       text.remove();
     }
-    setStatus("チェックポイントIDをコピーしました。");
+    showToast("チェックポイントIDをコピーしました。");
   } catch (error) {
     showError(error);
   }

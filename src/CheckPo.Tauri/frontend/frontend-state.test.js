@@ -807,6 +807,10 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
   assert.match(appJs, /"start_new_history_after_storage_loss"/);
   assert.match(appJs, /再接続せず、新しい履歴を開始しました/);
   assert.match(appJs, /以前の保存先に進行途中の復元や取り消しがあっても検出・復旧できません/);
+  assert.match(
+    appJs,
+    /displayedStorageRootPath = CheckPoFrontendState\.userFacingPath\(storageRootPath\)/,
+  );
   assert.match(appJs, /statusBannerText/);
   assert.match(appJs, /contextMenuReturnFocus/);
   assert.match(appJs, /visibleModalOverlay\(\) \|\| document\.body/);
@@ -814,6 +818,21 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
   assert.match(appJs, /menu\.removeAttribute\("aria-hidden"\)/);
   assert.match(stylesCss, /\.confirm-box \{[\s\S]*?max-height: calc\(100vh - 36px\);[\s\S]*?overflow: auto;/);
   assert.match(stylesCss, /#projectStatusPath \{[\s\S]*?text-overflow: ellipsis;/);
+  assert.match(
+    indexHtml,
+    /class="detail-content"[\s\S]*?id="autoRefreshStatus"[\s\S]*?id="diffGroups"/,
+  );
+  assert.match(
+    stylesCss,
+    /\.diff-refresh-indicator \{[\s\S]*?position: absolute;[\s\S]*?pointer-events: none;/,
+  );
+  assert.match(indexHtml, /id="toast"[^>]*aria-live="polite"[^>]*hidden/);
+  assert.match(appJs, /function showToast\(text\)/);
+  assert.match(appJs, /showToast\("チェックポイントIDをコピーしました。"\)/);
+  assert.match(
+    stylesCss,
+    /\.status-bar #calculateStorageSizeButton \{[\s\S]*?height: 22px;[\s\S]*?min-height: 22px;/,
+  );
   assert.match(indexHtml, /id="checkpointName"[^>]*aria-label="チェックポイント名"/);
   assert.match(indexHtml, /id="themeSystem"[^>]*aria-pressed="true"/);
   assert.match(indexHtml, /class="busy-box"[^>]*tabindex="-1"/);
