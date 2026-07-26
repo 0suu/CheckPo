@@ -136,6 +136,10 @@
           </section>
 
           <section class="detail-content">
+            <div class="diff-refresh-indicator" id="autoRefreshStatus" role="status" aria-live="polite" aria-atomic="true" hidden>
+              <span class="activity-dot" aria-hidden="true"></span>
+              <span data-i18n="refreshingDiffView">差分表示を更新中</span>
+            </div>
             <div class="project-empty-state" id="projectEmptyState">
               <h2 data-i18n="noProjectTitle">プロジェクトを追加</h2>
               <p data-i18n="noProjectDescription">チェックポイントを保存する Unity プロジェクトを選んでください。</p>
@@ -149,14 +153,14 @@
             <button class="ghost-button" id="calculateStorageSizeButton" type="button" data-i18n="calculateStorageSize">保存容量を計算</button>
             <span>🛟 復旧保護データ <strong id="recoveryRescueSize">-</strong></span>
             <span class="status-path">📂 <strong id="projectStatusPath">-</strong></span>
-            <span class="auto-refresh-status" id="autoRefreshStatus" hidden>
-              <span class="activity-dot" aria-hidden="true"></span>
-              <span data-i18n="refreshingDiffView">差分表示を更新中</span>
-            </span>
             <span class="advanced-metric" hidden><strong id="logicalSize">-</strong><strong id="uniqueBlobs">-</strong><strong id="packCount">-</strong></span>
           </footer>
         </section>
       </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <span id="toastText"></span>
     </div>
 
     <div class="context-menu" id="contextMenu" role="menu" hidden></div>

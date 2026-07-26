@@ -6,6 +6,10 @@ const CONFIRM_PATH_RENDER_LIMIT = 30;
 const OPERATION_BUSY_RETRY_DELAYS_MS = [150, 300, 600, 1000, 1500];
 const AUTO_REFRESH_WAIT_INTERVAL_MS = 100;
 const AUTO_REFRESH_PREEMPT_WAIT_TIMEOUT_MS = 1000;
+const TOAST_DURATION_MS = 2400;
+const TOAST_FADE_MS = 160;
+let toastDismissTimer = null;
+let toastHideTimer = null;
 
 function readLocalSetting(key, fallback = "") {
   const current = localStorage.getItem(`checkPo.${key}`);
@@ -281,6 +285,32 @@ function setStatus(text) {
       target.hidden = false;
     }
   }
+}
+
+function showToast(text) {
+  appendLog(text);
+  const toast = $("toast");
+  const toastText = $("toastText");
+  if (!toast || !toastText) return;
+
+  if (toastDismissTimer !== null) window.clearTimeout(toastDismissTimer);
+  if (toastHideTimer !== null) window.clearTimeout(toastHideTimer);
+  toastDismissTimer = null;
+  toastHideTimer = null;
+
+  toastText.textContent = text;
+  toast.classList.remove("is-hiding");
+  toast.hidden = false;
+  toastDismissTimer = window.setTimeout(() => {
+    toast.classList.add("is-hiding");
+    toastHideTimer = window.setTimeout(() => {
+      toast.hidden = true;
+      toast.classList.remove("is-hiding");
+      toastText.textContent = "";
+      toastHideTimer = null;
+    }, TOAST_FADE_MS);
+    toastDismissTimer = null;
+  }, TOAST_DURATION_MS - TOAST_FADE_MS);
 }
 
 function clearVisibleStatus() {
@@ -971,7 +1001,7 @@ async function calculateStorageSize() {
       state.storage = { ...(state.storage || {}), ...summary };
       state.storageSizeLoadedProjectPath = projectPath;
       renderStorage();
-      setStatus("保存容量を計算しました。");
+      showToast("保存容量を計算しました。");
     });
   } finally {
     if (state.storageSizeLoadingProjectPath === projectPath) {
@@ -1394,8 +1424,9 @@ async function handleCopiedProjectRegistrationChoice(projectPath, storageRootPat
 }
 
 function unavailableProjectStorageChoiceMessage(storageRootPath) {
-  const reconnectLocation = storageRootPath
-    ? `${storageRootPath} に手動移動済みの保存データがある場合は、既存の履歴へ再接続できます。`
+  const displayedStorageRootPath = CheckPoFrontendState.userFacingPath(storageRootPath);
+  const reconnectLocation = displayedStorageRootPath
+    ? `${displayedStorageRootPath} に手動移動済みの保存データがある場合は、既存の履歴へ再接続できます。`
     : "手動移動済みの保存データがある場合は、その場所を選んで既存の履歴へ再接続できます。";
   return [
     "登録済みの保存先を読み込めません。",
