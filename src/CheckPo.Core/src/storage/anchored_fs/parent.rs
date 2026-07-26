@@ -711,6 +711,47 @@ impl AnchoredParent {
         sync_batch.record_directory_handle(&self.display_path, &self.directory)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn open_or_create_private_directory(
+        &self,
+        leaf: &std::ffi::OsStr,
+    ) -> Result<AnchoredParent> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        validate_leaf(leaf, &self.display_path)?;
+        let display_path = self.display_path.join(leaf);
+        let created = match create_unix_directory_component_exclusive_with_mode(
+            self.directory.as_raw_fd(),
+            leaf,
+            &display_path,
+            0o700,
+        ) {
+            Ok(()) => true,
+            Err(CheckPoError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        if created {
+            self.directory
+                .sync_all()
+                .map_err(|error| io_error(&self.display_path, error))?;
+        }
+        let directory = self.open_directory_for_mutation(leaf)?;
+        directory
+            .directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|error| io_error(&display_path, error))?;
+        directory
+            .directory
+            .sync_all()
+            .map_err(|error| io_error(&display_path, error))?;
+        Ok(directory)
+    }
+
     pub(crate) fn create_directory(&self, leaf: &std::ffi::OsStr) -> Result<AnchoredParent> {
         validate_leaf(leaf, &self.display_path)?;
         let display_path = self.display_path.join(leaf);
@@ -1708,32 +1749,22 @@ fn list_anchored_directory_entries(
 ) -> Result<Vec<(std::ffi::OsString, bool, bool)>> {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
-    let duplicate = unsafe { libc::dup(parent.directory.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(io_error(
+    // `Dir::read_from` opens an independent directory description from the held
+    // handle. Its iterator distinguishes a `readdir` error from normal EOF.
+    let stream = rustix::fs::Dir::read_from(&parent.directory).map_err(|error| {
+        io_error(
             &parent.display_path,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    let stream = unsafe { libc::fdopendir(duplicate) };
-    if stream.is_null() {
-        let error = std::io::Error::last_os_error();
-        unsafe { libc::close(duplicate) };
-        return Err(io_error(&parent.display_path, error));
-    }
-    let mut names = Vec::new();
-    loop {
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name == b"." || name == b".." {
-            continue;
-        }
-        names.push(std::ffi::OsString::from_vec(name.to_vec()));
-    }
-    unsafe { libc::closedir(stream) };
+            std::io::Error::from_raw_os_error(error.raw_os_error()),
+        )
+    })?;
+    let names = collect_anchored_directory_names(
+        stream.map(|entry| {
+            entry
+                .map(|entry| std::ffi::OsString::from_vec(entry.file_name().to_bytes().to_vec()))
+                .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+        }),
+        &parent.display_path,
+    )?;
 
     let mut entries = Vec::with_capacity(names.len());
     for leaf in names {
@@ -1773,6 +1804,22 @@ fn list_anchored_directory_entries(
         entries.push((leaf, is_directory, is_link));
     }
     Ok(entries)
+}
+
+#[cfg(any(unix, test))]
+fn collect_anchored_directory_names(
+    entries: impl IntoIterator<Item = std::io::Result<std::ffi::OsString>>,
+    display_path: &Path,
+) -> Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry.map_err(|error| io_error(display_path, error))?;
+        if name == "." || name == ".." {
+            continue;
+        }
+        names.push(name);
+    }
+    Ok(names)
 }
 
 #[cfg(windows)]
@@ -1822,4 +1869,23 @@ fn anchored_file_from_open_file(display_path: PathBuf, file: File) -> Result<Anc
         file,
         identity,
     })
+}
+
+#[cfg(test)]
+mod directory_entry_iteration_tests {
+    use super::*;
+
+    #[test]
+    fn directory_iteration_error_is_not_treated_as_eof() {
+        let entries = vec![
+            Ok(std::ffi::OsString::from("first")),
+            Err(std::io::Error::from_raw_os_error(5)),
+            Ok(std::ffi::OsString::from("unreachable")),
+        ];
+
+        let error =
+            collect_anchored_directory_names(entries, Path::new("test-directory")).unwrap_err();
+
+        assert!(matches!(error, CheckPoError::Io { .. }));
+    }
 }

@@ -25,6 +25,29 @@ mod unix_tests {
     }
 
     #[test]
+    fn repeated_directory_listing_uses_an_independent_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("first"), b"1").unwrap();
+        fs::write(root_path.join("second"), b"2").unwrap();
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let directory = root.open_directory(Path::new(""), false).unwrap();
+
+        let first = directory.list_entry_names().unwrap();
+        let second = directory.list_entry_names().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            vec![
+                std::ffi::OsString::from("first"),
+                std::ffi::OsString::from("second")
+            ]
+        );
+    }
+
+    #[test]
     fn anchored_hash_polls_for_cancellation_after_eof() {
         let temp = tempfile::tempdir().unwrap();
         let root_path = temp.path().join("root");

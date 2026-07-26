@@ -845,7 +845,6 @@ function renderSnapshot(snapshot) {
   }
   renderWarningBanner();
   updateControls();
-  scheduleStorageSizeRefresh();
 }
 
 function sortCheckpoints(checkpoints) {
@@ -939,6 +938,11 @@ function renderStorage() {
       ? "-"
       : `${formatBytes(rescueBytes)} / ${rescueFiles ?? 0} files`;
   }
+  const calculateButton = $("calculateStorageSizeButton");
+  if (calculateButton) {
+    calculateButton.disabled = !state.projectPath
+      || state.storageSizeLoadingProjectPath === state.projectPath;
+  }
 }
 
 function invalidateStoredSize() {
@@ -951,39 +955,30 @@ function invalidateStoredSize() {
   renderStorage();
 }
 
-function scheduleStorageSizeRefresh(options = {}) {
+async function calculateStorageSize() {
   const projectPath = state.projectPath;
   if (!tauriInvoke || !projectPath) return;
-  if (!options.force && state.storageSizeLoadedProjectPath === projectPath) return;
   if (state.storageSizeLoadingProjectPath === projectPath) return;
   state.storageSizeLoadingProjectPath = projectPath;
-  window.setTimeout(async () => {
-    let retryWhenIdle = false;
-    try {
+  renderStorage();
+  try {
+    await run("保存容量を計算中", async () => {
       const summary = await invokeCommand(
         "calculate_storage_summary",
         { projectPath },
-        { fromAutoRefresh: true, silentResult: true },
       );
       if (state.projectPath !== projectPath) return;
       state.storage = { ...(state.storage || {}), ...summary };
       state.storageSizeLoadedProjectPath = projectPath;
       renderStorage();
-    } catch (error) {
-      retryWhenIdle = errorKind(error) === "operationBusy"
-        && state.projectPath === projectPath;
-      if (!retryWhenIdle) {
-        console.warn("保存容量のバックグラウンド集計に失敗しました", error);
-      }
-    } finally {
-      if (state.storageSizeLoadingProjectPath === projectPath) {
-        state.storageSizeLoadingProjectPath = null;
-      }
+      setStatus("保存容量を計算しました。");
+    });
+  } finally {
+    if (state.storageSizeLoadingProjectPath === projectPath) {
+      state.storageSizeLoadingProjectPath = null;
     }
-    if (retryWhenIdle) {
-      window.setTimeout(() => scheduleStorageSizeRefresh(options), 500);
-    }
-  }, 0);
+    renderStorage();
+  }
 }
 
 function renderPending(items) {
@@ -1880,6 +1875,9 @@ function bindEvents() {
     await refreshProject();
     await refreshLatestDiff({ allowBusy: true });
   }));
+  $("calculateStorageSizeButton")?.addEventListener("click", async () => {
+    await calculateStorageSize();
+  });
   $("rebuildIndexButton").addEventListener("click", async () => {
     const projectPath = getProjectPath();
     await run("一覧の索引を再構築中", async () => {
@@ -2099,7 +2097,6 @@ function bindEvents() {
       $("cleanupResult").textContent =
         `削除 ${result.deletedDirectoryCount ?? 0} 件 / ${formatBytes(result.deletedBytes ?? 0)}`;
       invalidateStoredSize();
-      scheduleStorageSizeRefresh({ force: true });
       updateControls();
     });
   });

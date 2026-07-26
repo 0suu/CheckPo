@@ -61,26 +61,23 @@ struct SetLeaf {
     ids: Vec<SnapshotId>,
 }
 
-pub(crate) fn initialize_snapshot_inventory(
+pub(crate) fn initialize_snapshot_inventory_anchored(
+    anchored_repo: &super::AnchoredRoot,
     repo_root: &Path,
     project_id: &ProjectId,
 ) -> Result<()> {
-    let head_path = inventory_head_path(repo_root);
-    match fs::symlink_metadata(&head_path) {
-        Ok(metadata) if metadata.is_file() && !crate::metadata_is_link_or_reparse(&metadata) => {
-            inventory_head(repo_root, project_id).map(|_| ())
+    match anchored_repo.open_file(Path::new("inventory/snapshots/head")) {
+        Ok(_) => {
+            validate_inventory_directories_anchored(anchored_repo)?;
+            inventory_head_anchored(anchored_repo, repo_root, project_id).map(|_| ())
         }
-        Ok(_) => Err(CheckPoError::Corruption(format!(
-            "snapshot inventory head is not a regular file: {}",
-            head_path.display()
-        ))),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            if !crate::list_snapshot_ids(repo_root)?.is_empty() {
+        Err(CheckPoError::Io { source, .. }) if source.kind() == ErrorKind::NotFound => {
+            let snapshots = anchored_repo.open_directory(Path::new("snapshots/v2"), false)?;
+            if !snapshots.list_entry_names()?.is_empty() {
                 return Err(CheckPoError::Corruption(
                     "snapshot inventory is missing for a non-empty repository".to_string(),
                 ));
             }
-            let anchored_repo = super::AnchoredRoot::open(repo_root)?;
             for relative in [
                 Path::new("inventory/snapshots/states"),
                 Path::new("inventory/snapshots/sets/roots"),
@@ -95,7 +92,7 @@ pub(crate) fn initialize_snapshot_inventory(
                 count: 0,
                 leaves: vec![None; 256],
             };
-            let set_root = store_set_root(repo_root, &root)?;
+            let set_root = store_set_root_anchored(anchored_repo, repo_root, &root)?;
             let state = InventoryState {
                 project_id: project_id.clone(),
                 generation: 0,
@@ -106,10 +103,10 @@ pub(crate) fn initialize_snapshot_inventory(
                 operation_id: [0; 32],
                 set_root,
             };
-            let id = store_state(repo_root, &state)?;
-            write_head(repo_root, &id)
+            let id = store_state_anchored(anchored_repo, repo_root, &state)?;
+            write_head_anchored(anchored_repo, &id)
         }
-        Err(error) => Err(crate::io_error(&head_path, error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -124,8 +121,11 @@ pub(crate) fn inventory_snapshot_count(repo_root: &Path, project_id: &ProjectId)
 pub(crate) fn inventory_gc_candidates(
     repo_root: &Path,
     project_id: &ProjectId,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> Result<Vec<(PathBuf, u64)>> {
+    crate::ensure_not_cancelled(cancellation)?;
     let head = inventory_head(repo_root, project_id)?;
+    let root_id = head.state.set_root.clone();
     let root = load_set_root(repo_root, &head.state.set_root, project_id)?;
     if root.count != head.state.count {
         return Err(CheckPoError::Corruption(
@@ -133,15 +133,39 @@ pub(crate) fn inventory_gc_candidates(
         ));
     }
     let mut reachable = BTreeSet::new();
+    // Snapshot removal walks every immutable state to find the newest surviving
+    // Add. Keep that lineage intact; historical set roots and leaves are not
+    // needed by the fallback because membership comes from the current set.
+    let mut cursor = head;
+    let mut visited_states = BTreeSet::new();
+    loop {
+        crate::ensure_not_cancelled(cancellation)?;
+        if !visited_states.insert(cursor.id.clone()) {
+            return Err(CheckPoError::Corruption(
+                "snapshot inventory state chain contains a cycle".to_string(),
+            ));
+        }
+        reachable.insert(repo_relative_inventory_path(
+            repo_root,
+            &inventory_state_path(repo_root, &cursor.id),
+        )?);
+        let Some(parent_id) = cursor.state.parent.as_ref() else {
+            break;
+        };
+        let parent = load_state(repo_root, parent_id, project_id)?;
+        if parent.state.generation.checked_add(1) != Some(cursor.state.generation) {
+            return Err(CheckPoError::Corruption(
+                "snapshot inventory state generations are not contiguous".to_string(),
+            ));
+        }
+        cursor = parent;
+    }
     reachable.insert(repo_relative_inventory_path(
         repo_root,
-        &inventory_state_path(repo_root, &head.id),
-    )?);
-    reachable.insert(repo_relative_inventory_path(
-        repo_root,
-        &inventory_set_root_path(repo_root, &head.state.set_root),
+        &inventory_set_root_path(repo_root, &root_id),
     )?);
     for (prefix, reference) in root.leaves.iter().enumerate() {
+        crate::ensure_not_cancelled(cancellation)?;
         let Some(reference) = reference else {
             continue;
         };
@@ -169,6 +193,7 @@ pub(crate) fn inventory_gc_candidates(
             .follow_links(false)
             .min_depth(1)
         {
+            crate::ensure_not_cancelled(cancellation)?;
             let entry = entry.map_err(|error| CheckPoError::Corruption(error.to_string()))?;
             let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| crate::io_error(entry.path(), error))?;
@@ -656,10 +681,18 @@ fn load_inventory_ids(
 }
 
 fn inventory_head(repo_root: &Path, project_id: &ProjectId) -> Result<InventoryHead> {
-    validate_inventory_directories(repo_root)?;
+    let anchored_repo = super::AnchoredRoot::open(repo_root)?;
+    validate_inventory_directories_anchored(&anchored_repo)?;
+    inventory_head_anchored(&anchored_repo, repo_root, project_id)
+}
+
+fn inventory_head_anchored(
+    anchored_repo: &super::AnchoredRoot,
+    repo_root: &Path,
+    project_id: &ProjectId,
+) -> Result<InventoryHead> {
     let path = inventory_head_path(repo_root);
-    let bytes =
-        super::AnchoredRoot::open(repo_root)?.read_bytes_bounded_path(&path, HEAD_BYTES_MAX)?;
+    let bytes = anchored_repo.read_bytes_bounded_path(&path, HEAD_BYTES_MAX)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| {
         CheckPoError::Corruption(format!(
             "snapshot inventory head is not UTF-8: {}",
@@ -684,13 +717,22 @@ fn inventory_head(repo_root: &Path, project_id: &ProjectId) -> Result<InventoryH
             path.display()
         ))
     })?;
-    load_state(repo_root, &id, project_id)
+    load_state_anchored(anchored_repo, repo_root, &id, project_id)
 }
 
 fn load_state(repo_root: &Path, id: &ObjectId, project_id: &ProjectId) -> Result<InventoryHead> {
+    let anchored_repo = super::AnchoredRoot::open(repo_root)?;
+    load_state_anchored(&anchored_repo, repo_root, id, project_id)
+}
+
+fn load_state_anchored(
+    anchored_repo: &super::AnchoredRoot,
+    repo_root: &Path,
+    id: &ObjectId,
+    project_id: &ProjectId,
+) -> Result<InventoryHead> {
     let path = inventory_state_path(repo_root, id);
-    let bytes =
-        super::AnchoredRoot::open(repo_root)?.read_bytes_bounded_path(&path, STATE_BYTES as u64)?;
+    let bytes = anchored_repo.read_bytes_bounded_path(&path, STATE_BYTES as u64)?;
     if bytes.len() != STATE_BYTES {
         return Err(CheckPoError::Corruption(format!(
             "snapshot inventory state has invalid length: {}",
@@ -717,11 +759,19 @@ fn load_state(repo_root: &Path, id: &ObjectId, project_id: &ProjectId) -> Result
 }
 
 fn store_state(repo_root: &Path, state: &InventoryState) -> Result<ObjectId> {
+    let anchored_repo = super::AnchoredRoot::open(repo_root)?;
+    store_state_anchored(&anchored_repo, repo_root, state)
+}
+
+fn store_state_anchored(
+    anchored_repo: &super::AnchoredRoot,
+    repo_root: &Path,
+    state: &InventoryState,
+) -> Result<ObjectId> {
     let bytes = encode_state(state);
     let id = state_id(&bytes)?;
     let path = inventory_state_path(repo_root, &id);
-    super::AnchoredRoot::open(repo_root)?
-        .store_content_addressed_bytes_profiled(&path, &bytes, None, None, false)?;
+    anchored_repo.store_content_addressed_bytes_profiled(&path, &bytes, None, None, false)?;
     Ok(id)
 }
 
@@ -752,11 +802,19 @@ fn load_set_root(repo_root: &Path, id: &ObjectId, project_id: &ProjectId) -> Res
 }
 
 fn store_set_root(repo_root: &Path, root: &SetRoot) -> Result<ObjectId> {
+    let anchored_repo = super::AnchoredRoot::open(repo_root)?;
+    store_set_root_anchored(&anchored_repo, repo_root, root)
+}
+
+fn store_set_root_anchored(
+    anchored_repo: &super::AnchoredRoot,
+    repo_root: &Path,
+    root: &SetRoot,
+) -> Result<ObjectId> {
     let bytes = encode_set_root(root)?;
     let id = set_root_id(&bytes)?;
     let path = inventory_set_root_path(repo_root, &id);
-    super::AnchoredRoot::open(repo_root)?
-        .store_content_addressed_bytes_profiled(&path, &bytes, None, None, false)?;
+    anchored_repo.store_content_addressed_bytes_profiled(&path, &bytes, None, None, false)?;
     Ok(id)
 }
 
@@ -794,7 +852,12 @@ fn store_set_leaf(repo_root: &Path, leaf: &SetLeaf) -> Result<ObjectId> {
 }
 
 fn write_head(repo_root: &Path, id: &ObjectId) -> Result<()> {
-    super::AnchoredRoot::open(repo_root)?.write_bytes_atomic(
+    let anchored_repo = super::AnchoredRoot::open(repo_root)?;
+    write_head_anchored(&anchored_repo, id)
+}
+
+fn write_head_anchored(anchored_repo: &super::AnchoredRoot, id: &ObjectId) -> Result<()> {
+    anchored_repo.write_bytes_atomic(
         Path::new("inventory/snapshots/head"),
         format!("{id}\n").as_bytes(),
     )
@@ -1133,30 +1196,14 @@ fn inventory_set_leaf_path(repo_root: &Path, id: &ObjectId) -> PathBuf {
         .join(format!("{}.leaf", id.as_str()))
 }
 
-fn validate_inventory_directories(repo_root: &Path) -> Result<()> {
-    crate::ensure_regular_directory_no_follow(repo_root)?;
-    for target in [
-        inventory_root(repo_root).join("states"),
-        inventory_root(repo_root).join("sets/roots"),
-        inventory_root(repo_root).join("sets/leaves"),
+fn validate_inventory_directories_anchored(anchored_repo: &super::AnchoredRoot) -> Result<()> {
+    for relative in [
+        Path::new("inventory/snapshots/states"),
+        Path::new("inventory/snapshots/sets/roots"),
+        Path::new("inventory/snapshots/sets/leaves"),
     ] {
-        let relative = target.strip_prefix(repo_root).map_err(|_| {
-            CheckPoError::Corruption(format!(
-                "snapshot inventory is outside repository: {}",
-                target.display()
-            ))
-        })?;
-        let mut current = repo_root.to_path_buf();
-        for component in relative.components() {
-            let std::path::Component::Normal(component) = component else {
-                return Err(CheckPoError::Corruption(format!(
-                    "snapshot inventory has an unsafe path: {}",
-                    target.display()
-                )));
-            };
-            current.push(component);
-            crate::ensure_regular_directory_no_follow(&current)?;
-        }
+        let directory = anchored_repo.open_directory(relative, false)?;
+        anchored_repo.verify_parent_binding(relative, &directory)?;
     }
     Ok(())
 }
@@ -1170,7 +1217,8 @@ mod tests {
         let repo = temp.path().join("repo");
         fs::create_dir_all(crate::snapshots_dir(&repo)).unwrap();
         let project_id = ProjectId::parse("0123456789abcdef0123456789abcdef").unwrap();
-        initialize_snapshot_inventory(&repo, &project_id).unwrap();
+        let anchored_repo = super::super::AnchoredRoot::open(&repo).unwrap();
+        initialize_snapshot_inventory_anchored(&anchored_repo, &repo, &project_id).unwrap();
         (temp, repo, project_id)
     }
 
@@ -1363,6 +1411,71 @@ mod tests {
     }
 
     #[test]
+    fn gc_fails_closed_when_an_ancestor_state_is_missing() {
+        let (_temp, repo, project_id) = setup();
+        let first = snapshot(31);
+        let second = snapshot(32);
+        write_physical_root(&repo, &first);
+        add(&repo, &project_id, &first, "first");
+        write_physical_root(&repo, &second);
+        add(&repo, &project_id, &second, "second");
+
+        let head = inventory_head(&repo, &project_id).unwrap();
+        let parent = head
+            .state
+            .parent
+            .clone()
+            .expect("non-initial state has a parent");
+        fs::remove_file(inventory_state_path(&repo, &parent)).unwrap();
+
+        let error = inventory_gc_candidates(&repo, &project_id, None).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CheckPoError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::NotFound
+            ),
+            "{error}"
+        );
+        assert!(inventory_state_path(&repo, &head.id).is_file());
+    }
+
+    #[test]
+    fn gc_fails_closed_when_state_generations_are_not_contiguous() {
+        let (_temp, repo, project_id) = setup();
+        let first = snapshot(33);
+        write_physical_root(&repo, &first);
+        add(&repo, &project_id, &first, "first");
+
+        let head = inventory_head(&repo, &project_id).unwrap();
+        let mut discontinuous = head.state.clone();
+        discontinuous.generation = head.state.generation + 2;
+        discontinuous.parent = Some(head.id.clone());
+        discontinuous.operation = InventoryOperation::Add;
+        discontinuous.snapshot_id = Some(snapshot(34));
+        discontinuous.operation_id = [34; 32];
+        let discontinuous_id = store_state(&repo, &discontinuous).unwrap();
+        write_head(&repo, &discontinuous_id).unwrap();
+
+        let error = inventory_gc_candidates(&repo, &project_id, None).unwrap_err();
+        assert!(error.to_string().contains("not contiguous"));
+        assert!(inventory_state_path(&repo, &head.id).is_file());
+        assert!(inventory_state_path(&repo, &discontinuous_id).is_file());
+    }
+
+    #[test]
+    fn gc_honors_cancellation_before_walking_inventory() {
+        let (_temp, repo, project_id) = setup();
+        let cancellation = crate::CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            inventory_gc_candidates(&repo, &project_id, Some(&cancellation)),
+            Err(CheckPoError::Cancelled)
+        ));
+    }
+
+    #[test]
     fn same_count_physical_substitution_is_detected() {
         let (_temp, repo, project_id) = setup();
         let tracked = snapshot(10);
@@ -1399,7 +1512,8 @@ mod tests {
         let (_temp, repo, project_id) = setup();
         fs::write(inventory_head_path(&repo), b"not-an-id\n").unwrap();
         assert!(inventory_head_id(&repo, &project_id).is_err());
-        initialize_snapshot_inventory(&repo, &project_id).unwrap_err();
+        let anchored_repo = super::super::AnchoredRoot::open(&repo).unwrap();
+        initialize_snapshot_inventory_anchored(&anchored_repo, &repo, &project_id).unwrap_err();
     }
 
     #[test]

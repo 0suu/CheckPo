@@ -20,7 +20,7 @@ mod verify;
 
 pub use checkpoint::{
     create_checkpoint, create_checkpoint_profiled, delete_checkpoint, list_checkpoints,
-    list_checkpoints_with_warnings_for_project, recover_checkpoint_deletions, rename_checkpoint,
+    list_checkpoints_for_project, recover_checkpoint_deletions, rename_checkpoint,
 };
 pub use db::{
     checkpoint_index_status, checkpoint_summaries_and_storage_summary_from_index, rebuild_index,
@@ -97,7 +97,7 @@ pub use verify::{
     verify_project_with_progress_and_cancellation,
 };
 
-pub(crate) use checkpoint::list_checkpoints_with_warnings_for_project_unlocked;
+pub(crate) use checkpoint::list_checkpoints_for_project_unlocked;
 pub(crate) use checkpoint::recover_checkpoint_deletions_unlocked;
 pub(crate) use checkpoint_create_journal::{
     recover_checkpoint_creations_unlocked, CreateJournalHandle,

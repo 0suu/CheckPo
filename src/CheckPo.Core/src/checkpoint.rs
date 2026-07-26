@@ -754,7 +754,7 @@ fn object_store_parallelism() -> usize {
         })
 }
 
-pub fn list_checkpoints(project_path: impl AsRef<Path>) -> Result<Vec<CheckpointSummary>> {
+pub fn list_checkpoints(project_path: impl AsRef<Path>) -> Result<CheckpointListResult> {
     let mut project = load_project(&project_path)?;
     if project.location_status != crate::ProjectLocationStatus::CopiedSuspected {
         recover_checkpoint_deletions(&project_path)?;
@@ -763,26 +763,14 @@ pub fn list_checkpoints(project_path: impl AsRef<Path>) -> Result<Vec<Checkpoint
     list_checkpoints_for_project(&project)
 }
 
-pub(crate) fn list_checkpoints_for_project(
-    project: &crate::ProjectContext,
-) -> Result<Vec<CheckpointSummary>> {
-    // Preserve the legacy Vec-returning API by surfacing result-level warnings
-    // on its first item. New callers should use CheckpointListResult instead.
-    let mut result = list_checkpoints_with_warnings_for_project(project)?;
-    if let Some(first) = result.checkpoints.first_mut() {
-        first.warnings.append(&mut result.warnings);
-    }
-    Ok(result.checkpoints)
-}
-
-pub fn list_checkpoints_with_warnings_for_project(
+pub fn list_checkpoints_for_project(
     project: &crate::ProjectContext,
 ) -> Result<CheckpointListResult> {
     let _lock = crate::acquire_project_repository_shared_lock(project, "checkpoint-list")?;
-    list_checkpoints_with_warnings_for_project_unlocked(project)
+    list_checkpoints_for_project_unlocked(project)
 }
 
-pub(crate) fn list_checkpoints_with_warnings_for_project_unlocked(
+pub(crate) fn list_checkpoints_for_project_unlocked(
     project: &crate::ProjectContext,
 ) -> Result<CheckpointListResult> {
     let mut checkpoints = crate::list_checkpoint_summaries_from_index(project)?;

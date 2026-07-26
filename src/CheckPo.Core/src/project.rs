@@ -12,14 +12,29 @@ use uuid::Uuid;
 const MARKER_DIR: &str = ".checkpo";
 const MARKER_FILE: &str = "project.json";
 const SEPARATE_INIT_PENDING_FILE: &str = "pending-separate-init.json";
-const SEPARATE_INIT_PENDING_SCHEMA_VERSION: u32 = 1;
+const SEPARATE_INIT_PENDING_SCHEMA_VERSION: u32 = 2;
+const SEPARATE_INIT_REPO_FORMAT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SeparateInitPending {
     schema_version: u32,
+    operation_id: ProjectId,
+    created_at_utc: String,
     previous_project_id: ProjectId,
     new_marker: ProjectMarkerFile,
+    storage_root_path: PathBuf,
+    repo_format_version: u32,
+    reason: ForceNewProjectReason,
+    phase: SeparateInitPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SeparateInitPhase {
+    Prepared,
+    RepositoryInitialized,
+    Registered,
 }
 
 pub fn init_project(project_path: impl AsRef<Path>) -> Result<ProjectView> {
@@ -269,6 +284,9 @@ fn load_separate_init_pending(project_root: &Path) -> Result<Option<SeparateInit
     if pending.schema_version != SEPARATE_INIT_PENDING_SCHEMA_VERSION
         || pending.previous_project_id == pending.new_marker.project_id
         || pending.new_marker.schema_version != 1
+        || pending.created_at_utc.is_empty()
+        || !pending.storage_root_path.is_absolute()
+        || pending.repo_format_version != SEPARATE_INIT_REPO_FORMAT_VERSION
     {
         return Err(CheckPoError::Corruption(format!(
             "pending separate-project initialization is invalid: {}",
@@ -281,6 +299,34 @@ fn load_separate_init_pending(project_root: &Path) -> Result<Option<SeparateInit
 fn write_separate_init_pending(project_root: &Path, pending: &SeparateInitPending) -> Result<()> {
     crate::storage::AnchoredRoot::open(project_root)?
         .write_json_atomic_path(&separate_init_pending_path(project_root), pending)
+}
+
+fn validate_separate_init_retry(
+    pending: &SeparateInitPending,
+    reason: ForceNewProjectReason,
+    requested_storage_root: Option<&Path>,
+) -> Result<()> {
+    if pending.reason != reason {
+        return Err(crate::user_error(
+            "the pending separate-project initialization has a different reason; finish or abort that operation first.",
+        ));
+    }
+    let stored = normalize_existing_dir_or_create_parent(&pending.storage_root_path)?;
+    if stored != pending.storage_root_path {
+        return Err(CheckPoError::Corruption(
+            "pending separate-project storage root is not canonical".to_string(),
+        ));
+    }
+    if let Some(requested) = requested_storage_root {
+        let requested = normalize_existing_dir_or_create_parent(requested)?;
+        if requested != stored {
+            return Err(CheckPoError::StorageRootConflict {
+                requested,
+                registered: stored,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn remove_separate_init_pending(project_root: &Path) -> Result<()> {
@@ -347,7 +393,8 @@ enum InitMode {
     ForceNewProject(ForceNewProjectReason),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 enum ForceNewProjectReason {
     CopiedProject,
     StorageLoss,
@@ -383,17 +430,29 @@ fn init_project_internal(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(crate::io_error(&marker_path, error)),
     };
-    let pending_separate_init = if mode.force_new_reason().is_some() {
+    let mut pending_separate_init = if mode.force_new_reason().is_some() {
         load_separate_init_pending(&project_root)?
     } else {
         None
     };
+    if let (Some(reason), Some(pending)) = (mode.force_new_reason(), pending_separate_init.as_ref())
+    {
+        validate_separate_init_retry(pending, reason, requested_storage_root)?;
+    }
     if let (Some(existing), Some(pending)) =
         (existing_marker.as_ref(), pending_separate_init.as_ref())
     {
         if *existing == pending.new_marker {
-            remove_separate_init_pending(&project_root)?;
-            return load_project_view(&project_root);
+            let context = load_project(&project_root)?;
+            if context.project_id != pending.new_marker.project_id {
+                return Err(CheckPoError::Corruption(
+                    "pending separate-project marker does not match the committed project"
+                        .to_string(),
+                ));
+            }
+            let _repository_lock =
+                acquire_project_repository_lock(&context, "project-init-finalize")?;
+            return finalize_project_initialization(context, true);
         }
         if existing.project_id != pending.previous_project_id {
             return Err(CheckPoError::Corruption(format!(
@@ -445,6 +504,17 @@ fn init_project_internal(
         )));
     }
     let registry = load_registry()?;
+    if let Some(pending) = pending_separate_init.as_ref() {
+        if !registry
+            .projects
+            .contains_key(pending.previous_project_id.as_str())
+        {
+            return Err(CheckPoError::InvalidProject(format!(
+                "pending separate-project initialization refers to unregistered previous project {}",
+                pending.previous_project_id
+            )));
+        }
+    }
     if mode.force_new_reason().is_some() {
         if let Some(entry) = registry.projects.get(marker.project_id.as_str()) {
             let registered_project_root = normalize_path_for_check(&entry.last_project_root_path)?;
@@ -457,64 +527,75 @@ fn init_project_internal(
             }
         }
     }
-    if let Some(reason) = mode.force_new_reason() {
-        let existing_marker = load_project_marker(&marker_path).map_err(|error| match error {
-            CheckPoError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
-                crate::user_error(
-                    "starting as a separate project requires an existing CheckPo marker.",
-                )
-            }
-            error => error,
-        })?;
-        let entry = registry
-            .projects
-            .get(existing_marker.project_id.as_str())
-            .ok_or_else(|| {
-                CheckPoError::InvalidProject(
-                    "Storage registry entry was not found for this project. Run init again."
-                        .to_string(),
-                )
-            })?;
-        let (status, _) =
-            project_location_status_and_warnings(&project_root, &existing_marker.project_id, entry);
-        let old_storage_root = normalize_existing_dir_or_create_parent(&entry.storage_root_path)?;
-        let old_repo_root = repo_root(&old_storage_root, &existing_marker.project_id);
-        match reason {
-            ForceNewProjectReason::CopiedProject => {
-                if status != ProjectLocationStatus::CopiedSuspected {
-                    return Err(crate::user_error(
-                        "starting as a separate project is only allowed for a copied project.",
-                    ));
+    // Once Prepared is durable, the old project and repository are no longer
+    // part of the retry contract. Rechecking them could make the prepared
+    // operation impossible to resume after the source project or drive moves.
+    if pending_separate_init.is_none() {
+        if let Some(reason) = mode.force_new_reason() {
+            let existing_marker =
+                load_project_marker(&marker_path).map_err(|error| match error {
+                    CheckPoError::Io { source, .. }
+                        if source.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        crate::user_error(
+                            "starting as a separate project requires an existing CheckPo marker.",
+                        )
+                    }
+                    error => error,
+                })?;
+            let entry = registry
+                .projects
+                .get(existing_marker.project_id.as_str())
+                .ok_or_else(|| {
+                    CheckPoError::InvalidProject(
+                        "Storage registry entry was not found for this project. Run init again."
+                            .to_string(),
+                    )
+                })?;
+            let (status, _) = project_location_status_and_warnings(
+                &project_root,
+                &existing_marker.project_id,
+                entry,
+            );
+            let old_storage_root =
+                normalize_existing_dir_or_create_parent(&entry.storage_root_path)?;
+            let old_repo_root = repo_root(&old_storage_root, &existing_marker.project_id);
+            match reason {
+                ForceNewProjectReason::CopiedProject => {
+                    if status != ProjectLocationStatus::CopiedSuspected {
+                        return Err(crate::user_error(
+                            "starting as a separate project is only allowed for a copied project.",
+                        ));
+                    }
                 }
-            }
-            ForceNewProjectReason::StorageLoss => {
-                if status == ProjectLocationStatus::CopiedSuspected {
-                    return Err(crate::user_error(
-                        "starting a new history after storage loss is not allowed for a copied project.",
-                    ));
-                }
-                if pending_separate_init.is_none()
-                    && old_repo_root
+                ForceNewProjectReason::StorageLoss => {
+                    if status == ProjectLocationStatus::CopiedSuspected {
+                        return Err(crate::user_error(
+                            "starting a new history after storage loss is not allowed for a copied project.",
+                        ));
+                    }
+                    if old_repo_root
                         .try_exists()
                         .map_err(|error| crate::io_error(&old_repo_root, error))?
-                {
-                    return Err(crate::user_error(
-                        "starting a new history after storage loss is only allowed when the registered repository is unavailable.",
-                    ));
+                    {
+                        return Err(crate::user_error(
+                            "starting a new history after storage loss is only allowed when the registered repository is unavailable.",
+                        ));
+                    }
                 }
             }
-        }
-        let old_context = ProjectContext {
-            project_id: existing_marker.project_id.clone(),
-            project_root: ProjectRoot::new(project_root.clone()),
-            repo_root: old_repo_root,
-            storage_root: StorageRoot::new(old_storage_root),
-            location_status: status,
-            warnings: Vec::new(),
-        };
-        if reason == ForceNewProjectReason::CopiedProject {
-            crate::ensure_no_pending_transactions(&old_context)?;
-            crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
+            let old_context = ProjectContext {
+                project_id: existing_marker.project_id.clone(),
+                project_root: ProjectRoot::new(project_root.clone()),
+                repo_root: old_repo_root,
+                storage_root: StorageRoot::new(old_storage_root),
+                location_status: status,
+                warnings: Vec::new(),
+            };
+            if reason == ForceNewProjectReason::CopiedProject {
+                crate::ensure_no_pending_transactions(&old_context)?;
+                crate::ensure_no_unresolved_transaction_quarantines(&old_context)?;
+            }
         }
     }
     if mode == InitMode::Normal
@@ -528,8 +609,21 @@ fn init_project_internal(
         return Err(copied_project_error(&project_root));
     }
 
-    let storage_root = match registry.projects.get(marker.project_id.as_str()) {
-        Some(entry) => {
+    let storage_root = match (
+        registry.projects.get(marker.project_id.as_str()),
+        pending_separate_init.as_ref(),
+    ) {
+        (Some(entry), Some(pending)) => {
+            let registered = normalize_existing_dir_or_create_parent(&entry.storage_root_path)?;
+            if registered != pending.storage_root_path {
+                return Err(CheckPoError::StorageRootConflict {
+                    requested: pending.storage_root_path.clone(),
+                    registered,
+                });
+            }
+            registered
+        }
+        (Some(entry), None) => {
             let registered = normalize_existing_dir_or_create_parent(&entry.storage_root_path)?;
             if let Some(requested) = requested_storage_root {
                 let requested = normalize_existing_dir_or_create_parent(requested)?;
@@ -542,12 +636,14 @@ fn init_project_internal(
             }
             registered
         }
-        None => match requested_storage_root {
+        (None, Some(pending)) => pending.storage_root_path.clone(),
+        (None, None) => match requested_storage_root {
             Some(storage_root_path) => normalize_existing_dir_or_create_parent(storage_root_path)?,
             None => default_storage_root()?,
         },
     };
     let storage_root = crate::create_absolute_dir_all_no_follow(&storage_root)?;
+    let storage_root = normalize_existing_dir(&storage_root)?;
     let planned_repo_root = repo_root(&storage_root, &marker.project_id);
     ensure_repo_outside_project(&project_root, &planned_repo_root)?;
     let marker_directory = marker_path.parent().ok_or_else(|| {
@@ -571,16 +667,30 @@ fn init_project_internal(
             })?
             .project_id
             .clone();
-        write_separate_init_pending(
-            &project_root,
-            &SeparateInitPending {
-                schema_version: SEPARATE_INIT_PENDING_SCHEMA_VERSION,
-                previous_project_id,
-                new_marker: marker.clone(),
-            },
-        )?;
+        let pending = SeparateInitPending {
+            schema_version: SEPARATE_INIT_PENDING_SCHEMA_VERSION,
+            operation_id: ProjectId::parse(&Uuid::new_v4().simple().to_string())
+                .expect("UUID simple string is a valid operation id"),
+            created_at_utc: now_utc_string(),
+            previous_project_id,
+            new_marker: marker.clone(),
+            storage_root_path: storage_root.clone(),
+            repo_format_version: SEPARATE_INIT_REPO_FORMAT_VERSION,
+            reason: mode
+                .force_new_reason()
+                .expect("force-new mode has a reason"),
+            phase: SeparateInitPhase::Prepared,
+        };
+        write_separate_init_pending(&project_root, &pending)?;
+        pending_separate_init = Some(pending);
     }
     let repo_root = init_repo_layout(&storage_root, &marker.project_id)?;
+    if let Some(pending) = pending_separate_init.as_mut() {
+        if pending.phase == SeparateInitPhase::Prepared {
+            pending.phase = SeparateInitPhase::RepositoryInitialized;
+            write_separate_init_pending(&project_root, pending)?;
+        }
+    }
     update_registry_locked(
         &registry_lock,
         registry,
@@ -588,10 +698,15 @@ fn init_project_internal(
         &project_root,
         &storage_root,
     )?;
+    if let Some(pending) = pending_separate_init.as_mut() {
+        if pending.phase != SeparateInitPhase::Registered {
+            pending.phase = SeparateInitPhase::Registered;
+            write_separate_init_pending(&project_root, pending)?;
+        }
+    }
     if mode.force_new_reason().is_some() {
         crate::storage::AnchoredRoot::open(&project_root)?
             .write_json_atomic_path(&marker_path, &marker)?;
-        remove_separate_init_pending(&project_root)?;
     }
     let context = ProjectContext {
         project_id: marker.project_id,
@@ -601,10 +716,34 @@ fn init_project_internal(
         location_status: ProjectLocationStatus::Current,
         warnings: Vec::new(),
     };
-    if !crate::db_path(&context.repo_root)?.exists()
-        && crate::storage::inventory_snapshot_count(&context.repo_root, &context.project_id)? == 0
-    {
-        crate::rebuild_index_for_project_unlocked(&context, None, None)?;
+    finalize_project_initialization(context, mode.force_new_reason().is_some())
+}
+
+fn finalize_project_initialization(
+    context: ProjectContext,
+    remove_pending_separate_init: bool,
+) -> Result<ProjectView> {
+    validate_current_repository_binding(&context, true)?;
+    let db_path = crate::db_path(&context.repo_root)?;
+    let snapshot_count =
+        crate::storage::inventory_snapshot_count(&context.repo_root, &context.project_id)?;
+    if !db_path.exists() && snapshot_count == 0 {
+        if let Err(error) = crate::rebuild_index_for_project_unlocked(&context, None, None) {
+            tracing::warn!(
+                project_id = %context.project_id,
+                error = %error,
+                "project initialization committed, but the derived SQLite index could not be initialized"
+            );
+        }
+    }
+    if remove_pending_separate_init {
+        if let Err(error) = remove_separate_init_pending(context.project_root.as_path()) {
+            tracing::warn!(
+                project_id = %context.project_id,
+                error = %error,
+                "project initialization committed, but the pending marker could not be cleaned up"
+            );
+        }
     }
     project_view(&context)
 }

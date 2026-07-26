@@ -44,38 +44,35 @@ pub fn validate_repository_config(config: &RepositoryConfig, project_id: &Projec
 
 pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<PathBuf> {
     let repo_root = repo_root(storage_root, project_id);
-    create_dir_all_no_follow(storage_root, &repo_root)?;
+    let anchored_repo = create_private_repository_root(storage_root, &repo_root)?;
     let config_path = repo_root.join("repo.json");
-    let config_exists = match fs::symlink_metadata(&config_path) {
-        Ok(metadata) => {
-            if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
-                return Err(CheckPoError::Corruption(format!(
-                    "repo.json is not a regular file: {}",
-                    config_path.display()
-                )));
-            }
-            load_repo_config(&repo_root, project_id)?;
+    let config_exists = match anchored_repo.open_file(Path::new("repo.json")) {
+        Ok(_) => {
+            load_repo_config_anchored(&anchored_repo, &config_path, project_id)?;
             true
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(io_error(&config_path, error)),
+        Err(CheckPoError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            false
+        }
+        Err(error) => return Err(error),
     };
-    for dir in [
-        repo_root.join("refs"),
-        snapshots_dir(&repo_root),
-        manifest_nodes_dir(&repo_root),
-        manifest_leaves_dir(&repo_root),
-        repo_root.join("objects").join("loose"),
-        repo_root.join("indexes"),
-        repo_root.join("journals"),
-        repo_root.join("journals").join("transactions"),
-        repo_root.join("tmp"),
-        repo_root.join("locks"),
+    for relative in [
+        Path::new("refs"),
+        Path::new("snapshots/v2"),
+        Path::new("manifests/v2/nodes"),
+        Path::new("manifests/v2/leaves"),
+        Path::new("objects/loose"),
+        Path::new("indexes"),
+        Path::new("journals"),
+        Path::new("journals/transactions"),
+        Path::new("tmp"),
+        Path::new("locks"),
     ] {
-        create_dir_all_no_follow(&repo_root, &dir)?;
+        let directory = anchored_repo.open_directory_for_mutation(relative, true)?;
+        anchored_repo.verify_parent_binding(relative, &directory)?;
     }
     if !config_exists {
-        match AnchoredRoot::open(&repo_root)?.write_json_atomic_new(
+        match anchored_repo.write_json_atomic_new(
             Path::new("repo.json"),
             &default_repository_config(project_id),
         ) {
@@ -83,22 +80,44 @@ pub fn init_repo_layout(storage_root: &Path, project_id: &ProjectId) -> Result<P
             Err(CheckPoError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::AlreadyExists =>
             {
-                let metadata = fs::symlink_metadata(&config_path)
-                    .map_err(|error| io_error(&config_path, error))?;
-                if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
-                    return Err(CheckPoError::Corruption(format!(
-                        "repo.json is not a regular file: {}",
-                        config_path.display()
-                    )));
-                }
-                load_repo_config(&repo_root, project_id)?;
+                load_repo_config_anchored(&anchored_repo, &config_path, project_id)?;
             }
             Err(error) => return Err(error),
         }
+        anchored_repo.make_file_private(Path::new("repo.json"))?;
     }
-    super::snapshot_inventory::initialize_snapshot_inventory(&repo_root, project_id)?;
+    anchored_repo.verify_root_binding()?;
+    super::snapshot_inventory::initialize_snapshot_inventory_anchored(
+        &anchored_repo,
+        &repo_root,
+        project_id,
+    )?;
+    anchored_repo.verify_root_binding()?;
     validate_repository_layout_no_follow(&repo_root)?;
     Ok(repo_root)
+}
+
+#[cfg(unix)]
+fn create_private_repository_root(storage_root: &Path, repo_root: &Path) -> Result<AnchoredRoot> {
+    let project_id = repo_root.file_name().ok_or_else(|| {
+        CheckPoError::Corruption(format!(
+            "repository root has no project id component: {}",
+            repo_root.display()
+        ))
+    })?;
+    let storage = AnchoredRoot::open(storage_root)?;
+    let storage_parent = storage.open_directory_for_mutation(Path::new(""), false)?;
+    let repos = storage_parent.open_or_create_private_directory(std::ffi::OsStr::new("repos"))?;
+    let repository = repos.open_or_create_private_directory(project_id)?;
+    let anchored_repo = AnchoredRoot::from_held_parent(repository);
+    anchored_repo.verify_root_binding()?;
+    Ok(anchored_repo)
+}
+
+#[cfg(not(unix))]
+fn create_private_repository_root(storage_root: &Path, repo_root: &Path) -> Result<AnchoredRoot> {
+    create_dir_all_no_follow(storage_root, repo_root)?;
+    AnchoredRoot::open(repo_root)
 }
 
 fn validate_repository_versions(schema_version: u32, repo_format_version: u32) -> Result<()> {
@@ -126,6 +145,15 @@ pub fn repo_root(storage_root: &Path, project_id: &ProjectId) -> PathBuf {
 pub fn load_repo_config(repo_root: &Path, project_id: &ProjectId) -> Result<RepositoryConfig> {
     let path = repo_root.join("repo.json");
     ensure_regular_directory_no_follow(repo_root)?;
+    let anchored_repo = AnchoredRoot::open(repo_root)?;
+    load_repo_config_anchored(&anchored_repo, &path, project_id)
+}
+
+fn load_repo_config_anchored(
+    anchored_repo: &AnchoredRoot,
+    path: &Path,
+    project_id: &ProjectId,
+) -> Result<RepositoryConfig> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct RepositoryConfigEnvelope {
@@ -133,9 +161,9 @@ pub fn load_repo_config(repo_root: &Path, project_id: &ProjectId) -> Result<Repo
         repo_format_version: Option<u32>,
     }
 
-    let bytes = AnchoredRoot::open(repo_root)?.read_bytes_bounded_path(&path, 1024 * 1024)?;
+    let bytes = anchored_repo.read_bytes_bounded_path(path, 1024 * 1024)?;
     let envelope: RepositoryConfigEnvelope =
-        serde_json::from_slice(&bytes).map_err(|error| json_error(&path, error))?;
+        serde_json::from_slice(&bytes).map_err(|error| json_error(path, error))?;
     if envelope.schema_version != REPOSITORY_CONFIG_SCHEMA_VERSION {
         return Err(CheckPoError::UnsupportedFormat {
             artifact: "repository config schema".to_string(),
@@ -153,7 +181,7 @@ pub fn load_repo_config(repo_root: &Path, project_id: &ProjectId) -> Result<Repo
         }
     }
     let config: RepositoryConfig =
-        serde_json::from_slice(&bytes).map_err(|error| json_error(&path, error))?;
+        serde_json::from_slice(&bytes).map_err(|error| json_error(path, error))?;
     validate_repository_config(&config, project_id)?;
     Ok(config)
 }

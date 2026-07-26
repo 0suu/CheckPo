@@ -122,6 +122,76 @@ fn init_repo_layout_does_not_overwrite_invalid_existing_config() {
     assert_eq!(fs::read(&config_path).unwrap(), invalid);
 }
 
+#[cfg(unix)]
+#[test]
+fn repository_layout_is_private_and_repairs_existing_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let unity_path = temp.path().join("UnityProject/Assets");
+    fs::create_dir_all(&unity_path).unwrap();
+    let unity_file = unity_path.join("Example.asset");
+    fs::write(&unity_file, "unity").unwrap();
+    fs::set_permissions(&unity_path, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&unity_file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::create_dir(temp.path().join("repos")).unwrap();
+    fs::set_permissions(temp.path().join("repos"), fs::Permissions::from_mode(0o755)).unwrap();
+    let project_id = ProjectId::parse("11111111111111111111111111111111").unwrap();
+    let repo = init_repo_layout(temp.path(), &project_id).unwrap();
+    assert_eq!(
+        fs::symlink_metadata(temp.path().join("repos"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(&repo).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(repo.join("repo.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    fs::set_permissions(&repo, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(repo.join("repo.json"), fs::Permissions::from_mode(0o666)).unwrap();
+    init_repo_layout(temp.path(), &project_id).unwrap();
+    assert_eq!(
+        fs::symlink_metadata(&repo).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(repo.join("repo.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o666
+    );
+    assert_eq!(
+        fs::symlink_metadata(&unity_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::symlink_metadata(&unity_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
+
 #[test]
 fn repository_config_future_versions_are_unsupported_and_not_rewritten() {
     let temp = tempfile::tempdir().unwrap();

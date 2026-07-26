@@ -1058,14 +1058,17 @@ fn analyze_gc_for_project(
         .iter()
         .map(|chunk| chunk.size_bytes)
         .sum();
-    let unreferenced_inventory_nodes =
-        crate::storage::inventory_gc_candidates(&project.repo_root, &project.project_id)?
-            .into_iter()
-            .map(|(node_path, size_bytes)| UnreferencedInventoryNode {
-                node_path,
-                size_bytes,
-            })
-            .collect::<Vec<_>>();
+    let unreferenced_inventory_nodes = crate::storage::inventory_gc_candidates(
+        &project.repo_root,
+        &project.project_id,
+        cancellation,
+    )?
+    .into_iter()
+    .map(|(node_path, size_bytes)| UnreferencedInventoryNode {
+        node_path,
+        size_bytes,
+    })
+    .collect::<Vec<_>>();
     let unreferenced_inventory_node_bytes = unreferenced_inventory_nodes
         .iter()
         .map(|node| node.size_bytes)
