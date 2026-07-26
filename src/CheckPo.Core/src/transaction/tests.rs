@@ -1480,11 +1480,9 @@ fn capacity_check_blocks_when_required_bytes_exceed_available_space() {
         ensure_checkpoint_storage_available_space(temp.path(), required).unwrap_err();
 
     assert!(matches!(checkpoint_error, CheckPoError::User(_)));
-    assert!(
-        checkpoint_error
-            .to_string()
-            .contains("復旧用データの片付け")
-    );
+    assert!(checkpoint_error
+        .to_string()
+        .contains("復旧用データの片付け"));
     assert!(checkpoint_error
         .to_string()
         .contains("checkpo maintenance cleanup-journals analyze <project-path>"));
