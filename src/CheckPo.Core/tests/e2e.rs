@@ -747,6 +747,55 @@ fn checkpoint_rejects_unreadable_tracked_file_without_creating_snapshot() {
 
 #[cfg(windows)]
 #[test]
+fn checkpoint_reuses_an_unchanged_working_file_while_its_content_handle_is_exclusive() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let exclusive = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&file)
+        .unwrap();
+
+    let second = core::create_checkpoint(&project, "Unchanged", Default::default()).unwrap();
+
+    assert_eq!(second.newly_stored_bytes, 0);
+    drop(exclusive);
+    assert!(core::verify_project(&project, true).unwrap().is_valid);
+}
+
+#[cfg(windows)]
+#[test]
+fn checkpoint_rejects_a_changed_working_file_while_its_content_handle_is_exclusive() {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (_guard, _temp, project, _data) = setup();
+    let file = project.join("Assets/Avatar/Foo.prefab");
+    fs::write(&file, "one").unwrap();
+    init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let mut exclusive = fs::OpenOptions::new()
+        .write(true)
+        .share_mode(0)
+        .open(&file)
+        .unwrap();
+    exclusive.write_all(b"two").unwrap();
+    exclusive.flush().unwrap();
+
+    let error = core::create_checkpoint(&project, "Changed", Default::default()).unwrap_err();
+
+    assert!(matches!(error, core::CheckPoError::User(_)));
+    assert!(error.to_string().contains("could not be read"));
+    assert_eq!(list_checkpoint_summaries(&project).unwrap().len(), 1);
+}
+
+#[cfg(windows)]
+#[test]
 fn checkpoint_reuses_a_known_object_while_its_content_handle_is_exclusive() {
     use std::os::windows::fs::OpenOptionsExt;
 
