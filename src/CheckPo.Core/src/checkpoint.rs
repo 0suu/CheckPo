@@ -617,7 +617,7 @@ fn preload_available_current_objects(
             };
             let mut outcomes = Vec::with_capacity(objects.len());
             for (leaf, object_id, expected_size) in objects {
-                let metadata = match parent.inspect_metadata_no_follow(&leaf) {
+                let metadata = match parent.inspect_checkpoint_object_metadata_no_follow(&leaf) {
                     Ok(metadata) => metadata,
                     Err(CheckPoError::Io { source, .. })
                         if source.kind() == ErrorKind::NotFound =>

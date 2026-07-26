@@ -887,6 +887,7 @@ mod unix_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn volume_identity_treats_only_known_different_volumes_as_definitive() {
@@ -1010,6 +1011,80 @@ mod windows_tests {
             .open(root_path.join("payload"))
             .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(32));
+    }
+
+    #[test]
+    fn checkpoint_object_metadata_handle_cannot_read_or_flush_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::write(root_path.join("payload"), b"approved").unwrap();
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let mut file =
+            open_windows_relative_file_for_metadata(&root.directory, OsStr::new("payload"))
+                .unwrap();
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(file.read(&mut byte).unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(file.sync_all().unwrap_err().raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn checkpoint_object_metadata_matches_the_existing_handle_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::write(root_path.join("payload"), b"approved").unwrap();
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let (parent, leaf) = root.open_parent(Path::new("payload"), false).unwrap();
+
+        let existing = parent.inspect_metadata_no_follow(&leaf).unwrap();
+        let metadata_only = parent
+            .inspect_checkpoint_object_metadata_no_follow(&leaf)
+            .unwrap();
+
+        assert_eq!(metadata_only, existing);
+    }
+
+    #[test]
+    fn checkpoint_object_metadata_is_not_blocked_by_an_exclusive_content_handle() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::write(root_path.join("payload"), b"approved").unwrap();
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let (parent, leaf) = root.open_parent(Path::new("payload"), false).unwrap();
+        let _exclusive = fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(root_path.join("payload"))
+            .unwrap();
+
+        let CheckPoError::Io { source, .. } = parent.inspect_metadata_no_follow(&leaf).unwrap_err()
+        else {
+            panic!("expected the content-read handle to be blocked");
+        };
+        assert_eq!(source.raw_os_error(), Some(32));
+
+        let metadata = parent
+            .inspect_checkpoint_object_metadata_no_follow(&leaf)
+            .unwrap();
+        assert_eq!(metadata.size_bytes, b"approved".len() as u64);
+    }
+
+    #[test]
+    fn checkpoint_object_metadata_rejects_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir_all(root_path.join("directory")).unwrap();
+        let root = AnchoredRoot::open(&root_path).unwrap();
+        let (parent, leaf) = root.open_parent(Path::new("directory"), false).unwrap();
+
+        assert!(parent
+            .inspect_checkpoint_object_metadata_no_follow(&leaf)
+            .is_err());
     }
 
     #[test]
@@ -1168,6 +1243,52 @@ mod windows_tests {
         let mut restored = reopened.open_file(Path::new("destination")).unwrap();
         assert_eq!(restored.read_bounded(32).unwrap(), b"approved");
         assert!(!root_path.join("temporary").exists());
+        assert_no_windows_replace_artifacts(&root_path);
+    }
+
+    #[test]
+    fn checkpoint_object_metadata_recovers_a_case_changed_missing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        fs::create_dir_all(&root_path).unwrap();
+        fs::write(root_path.join("Destination"), b"approved").unwrap();
+        fs::write(root_path.join("temporary"), b"replacement").unwrap();
+        {
+            let root = AnchoredRoot::open(&root_path).unwrap();
+            let parent = root
+                .open_directory_for_mutation(Path::new(""), false)
+                .unwrap();
+            let destination = parent
+                .open_file(std::ffi::OsStr::new("Destination"))
+                .unwrap();
+            let temporary = parent.open_file(std::ffi::OsStr::new("temporary")).unwrap();
+
+            let error = parent
+                .replace_from_temporary_stopping_at_windows_phase(
+                    std::ffi::OsStr::new("temporary"),
+                    &temporary,
+                    std::ffi::OsStr::new("Destination"),
+                    &destination,
+                    ReplaceProtocolPhase::DestinationDetached,
+                )
+                .unwrap_err();
+            assert!(matches!(error, CheckPoError::Unexpected(_)));
+            assert!(!root_path.join("Destination").exists());
+        }
+
+        let reopened = AnchoredRoot::open(&root_path).unwrap();
+        let (parent, leaf) = reopened
+            .open_parent(Path::new("destination"), false)
+            .unwrap();
+        let metadata = parent
+            .inspect_checkpoint_object_metadata_no_follow(&leaf)
+            .unwrap();
+
+        assert_eq!(metadata.size_bytes, b"approved".len() as u64);
+        assert_eq!(
+            fs::read(root_path.join("Destination")).unwrap(),
+            b"approved"
+        );
         assert_no_windows_replace_artifacts(&root_path);
     }
 

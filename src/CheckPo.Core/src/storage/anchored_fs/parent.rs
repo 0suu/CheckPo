@@ -978,8 +978,22 @@ impl AnchoredParent {
             )?
         };
         #[cfg(windows)]
-        let file = match open_windows_relative_file(&self.directory, leaf, false, false) {
-            Ok(file) => file,
+        let file = self.open_windows_file_with_replace_recovery(leaf, |directory, leaf| {
+            open_windows_relative_file(directory, leaf, false, false)
+        })?;
+        #[cfg(not(any(unix, windows)))]
+        let file = open_read_only_portable_file_no_follow(&display_path)?;
+        anchored_file_from_open_file(display_path, file)
+    }
+
+    #[cfg(windows)]
+    fn open_windows_file_with_replace_recovery(
+        &self,
+        leaf: &std::ffi::OsStr,
+        open: impl Fn(&File, &std::ffi::OsStr) -> Result<File>,
+    ) -> Result<File> {
+        match open(&self.directory, leaf) {
+            Ok(file) => Ok(file),
             Err(error)
                 if matches!(
                     &error,
@@ -1002,13 +1016,10 @@ impl AnchoredParent {
                 {
                     return Err(error);
                 }
-                open_windows_relative_file(&self.directory, leaf, false, false)?
+                open(&self.directory, leaf)
             }
-            Err(error) => return Err(error),
-        };
-        #[cfg(not(any(unix, windows)))]
-        let file = open_read_only_portable_file_no_follow(&display_path)?;
-        anchored_file_from_open_file(display_path, file)
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(windows)]
@@ -1101,6 +1112,44 @@ impl AnchoredParent {
             // change-time fingerprint. Keep that platform-specific cost while
             // exposing the same scanner API.
             let file = self.open_file(leaf)?;
+            let metadata = file.metadata()?;
+            Ok(AnchoredFileMetadata {
+                size_bytes: metadata.len(),
+                modified: metadata
+                    .modified()
+                    .map_err(|error| io_error(&display_path, error))?,
+                fingerprint: file.fingerprint()?,
+                is_regular: metadata.is_file(),
+                is_link: crate::metadata_is_link_or_reparse(&metadata),
+            })
+        }
+    }
+
+    /// Inspects an immutable loose object without requesting content-read access.
+    ///
+    /// A metadata-only Windows handle can coexist with an exclusive content
+    /// handle. The repository lock serializes CheckPo writers only; metadata
+    /// queried through this handle still reflects completed external writes,
+    /// while later writes remain the same TOCTOU risk as the fingerprint cache.
+    /// This optimization stays limited to immutable loose objects here because
+    /// accepting exclusively opened working files is a separate product decision.
+    pub(crate) fn inspect_checkpoint_object_metadata_no_follow(
+        &self,
+        leaf: &std::ffi::OsStr,
+    ) -> Result<AnchoredFileMetadata> {
+        #[cfg(not(windows))]
+        {
+            self.inspect_metadata_no_follow(leaf)
+        }
+
+        #[cfg(windows)]
+        {
+            validate_leaf(leaf, &self.display_path)?;
+            let display_path = self.display_path.join(leaf);
+            let file = self.open_windows_file_with_replace_recovery(leaf, |directory, leaf| {
+                open_windows_relative_file_for_metadata(directory, leaf)
+            })?;
+            let file = anchored_file_from_open_file(display_path.clone(), file)?;
             let metadata = file.metadata()?;
             Ok(AnchoredFileMetadata {
                 size_bytes: metadata.len(),
