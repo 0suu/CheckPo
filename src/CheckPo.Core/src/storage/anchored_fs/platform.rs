@@ -644,6 +644,25 @@ pub(super) fn open_windows_relative_file(
 }
 
 #[cfg(windows)]
+pub(super) fn open_windows_relative_file_for_metadata(
+    parent: &File,
+    leaf: &std::ffi::OsStr,
+) -> Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+    open_windows_relative(
+        parent,
+        leaf,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        false,
+        false,
+        false,
+        true,
+        true,
+    )
+    .map_err(|error| io_error(Path::new(leaf), error))
+}
+
+#[cfg(windows)]
 pub(super) fn open_windows_relative_file_for_mutation(
     parent: &File,
     leaf: &std::ffi::OsStr,

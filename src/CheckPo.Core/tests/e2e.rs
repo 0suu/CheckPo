@@ -745,6 +745,37 @@ fn checkpoint_rejects_unreadable_tracked_file_without_creating_snapshot() {
     assert!(!repo_path(&view).join("refs/latest").exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn checkpoint_reuses_a_known_object_while_its_content_handle_is_exclusive() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (_guard, _temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "one").unwrap();
+    let view = init_project_for_test(&project).unwrap();
+    let repo = repo_path(&view);
+    let first = core::create_checkpoint(&project, "Initial", Default::default()).unwrap();
+    let snapshot = core::load_snapshot(&repo, &first.checkpoint_id).unwrap();
+    let object_id = snapshot
+        .files
+        .iter()
+        .find(|entry| entry.path.as_str() == "Assets/Avatar/Foo.prefab")
+        .unwrap()
+        .content_hash();
+    let object = core::object_path(&repo, object_id);
+    let exclusive = fs::OpenOptions::new()
+        .write(true)
+        .share_mode(0)
+        .open(&object)
+        .unwrap();
+
+    let second = core::create_checkpoint(&project, "Unchanged", Default::default()).unwrap();
+
+    assert_eq!(second.newly_stored_bytes, 0);
+    drop(exclusive);
+    assert!(core::verify_project(&project, true).unwrap().is_valid);
+}
+
 #[test]
 fn checkpoint_repairs_changed_object_even_when_size_is_unchanged() {
     let (_guard, _temp, project, _data) = setup();
