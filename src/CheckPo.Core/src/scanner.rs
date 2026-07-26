@@ -185,20 +185,21 @@ fn scan_project_internal(
                 .into_par_iter()
                 .map(|(leaf, mut file)| {
                     crate::ensure_not_cancelled(cancellation)?;
-                    let inspected = match parent.inspect_metadata_no_follow(&leaf) {
-                        Ok(inspected) => inspected,
-                        Err(error) => {
-                            return Ok((
-                                None,
-                                Some(ScanWarning {
-                                    relative_path: file.path.to_string(),
-                                    reason: format!(
-                                        "file metadata could not be read safely: {error}"
-                                    ),
-                                }),
-                            ));
-                        }
-                    };
+                    let inspected =
+                        match parent.inspect_checkpoint_working_file_metadata_no_follow(&leaf) {
+                            Ok(inspected) => inspected,
+                            Err(error) => {
+                                return Ok((
+                                    None,
+                                    Some(ScanWarning {
+                                        relative_path: file.path.to_string(),
+                                        reason: format!(
+                                            "file metadata could not be read safely: {error}"
+                                        ),
+                                    }),
+                                ));
+                            }
+                        };
                     if inspected.is_link || !inspected.is_regular {
                         return Ok((
                             None,

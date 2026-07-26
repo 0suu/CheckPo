@@ -1048,6 +1048,7 @@ impl AnchoredParent {
         Ok(guarded)
     }
 
+    #[cfg(any(not(windows), test))]
     pub(crate) fn inspect_metadata_no_follow(
         &self,
         leaf: &std::ffi::OsStr,
@@ -1126,13 +1127,6 @@ impl AnchoredParent {
     }
 
     /// Inspects an immutable loose object without requesting content-read access.
-    ///
-    /// A metadata-only Windows handle can coexist with an exclusive content
-    /// handle. The repository lock serializes CheckPo writers only; metadata
-    /// queried through this handle still reflects completed external writes,
-    /// while later writes remain the same TOCTOU risk as the fingerprint cache.
-    /// This optimization stays limited to immutable loose objects here because
-    /// accepting exclusively opened working files is a separate product decision.
     pub(crate) fn inspect_checkpoint_object_metadata_no_follow(
         &self,
         leaf: &std::ffi::OsStr,
@@ -1144,23 +1138,52 @@ impl AnchoredParent {
 
         #[cfg(windows)]
         {
-            validate_leaf(leaf, &self.display_path)?;
-            let display_path = self.display_path.join(leaf);
-            let file = self.open_windows_file_with_replace_recovery(leaf, |directory, leaf| {
-                open_windows_relative_file_for_metadata(directory, leaf)
-            })?;
-            let file = anchored_file_from_open_file(display_path.clone(), file)?;
-            let metadata = file.metadata()?;
-            Ok(AnchoredFileMetadata {
-                size_bytes: metadata.len(),
-                modified: metadata
-                    .modified()
-                    .map_err(|error| io_error(&display_path, error))?,
-                fingerprint: file.fingerprint()?,
-                is_regular: metadata.is_file(),
-                is_link: crate::metadata_is_link_or_reparse(&metadata),
-            })
+            self.inspect_windows_metadata_without_content_access_no_follow(leaf)
         }
+    }
+
+    /// Assesses a checkpoint working file without requesting content-read access.
+    ///
+    /// On Windows, a file whose assessed fingerprint still matches can therefore
+    /// reuse its cached object while another process holds an exclusive content
+    /// handle. A fingerprint mismatch or cache miss still has to pass the existing
+    /// content-readable hash path.
+    pub(crate) fn inspect_checkpoint_working_file_metadata_no_follow(
+        &self,
+        leaf: &std::ffi::OsStr,
+    ) -> Result<AnchoredFileMetadata> {
+        #[cfg(not(windows))]
+        {
+            self.inspect_metadata_no_follow(leaf)
+        }
+
+        #[cfg(windows)]
+        {
+            self.inspect_windows_metadata_without_content_access_no_follow(leaf)
+        }
+    }
+
+    #[cfg(windows)]
+    fn inspect_windows_metadata_without_content_access_no_follow(
+        &self,
+        leaf: &std::ffi::OsStr,
+    ) -> Result<AnchoredFileMetadata> {
+        validate_leaf(leaf, &self.display_path)?;
+        let display_path = self.display_path.join(leaf);
+        let file = self.open_windows_file_with_replace_recovery(leaf, |directory, leaf| {
+            open_windows_relative_file_for_metadata(directory, leaf)
+        })?;
+        let file = anchored_file_from_open_file(display_path.clone(), file)?;
+        let metadata = file.metadata()?;
+        Ok(AnchoredFileMetadata {
+            size_bytes: metadata.len(),
+            modified: metadata
+                .modified()
+                .map_err(|error| io_error(&display_path, error))?,
+            fingerprint: file.fingerprint()?,
+            is_regular: metadata.is_file(),
+            is_link: crate::metadata_is_link_or_reparse(&metadata),
+        })
     }
 
     pub(crate) fn open_file_read_write(&self, leaf: &std::ffi::OsStr) -> Result<AnchoredFile> {
