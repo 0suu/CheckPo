@@ -1,9 +1,10 @@
 [package]
 name = "checkpo-tauri"
-version = "0.2.1"
+version.workspace = true
 description = "Tauri shell for CheckPo"
 authors = ["suu"]
 edition = "2021"
+license.workspace = true
 rust-version.workspace = true
 
 [lib]

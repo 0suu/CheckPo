@@ -2,6 +2,12 @@ use checkpo_core as core;
 use std::fs;
 use std::time::Instant;
 
+fn list_checkpoint_summaries(
+    project_path: impl AsRef<std::path::Path>,
+) -> core::Result<Vec<core::CheckpointSummary>> {
+    core::list_checkpoints(project_path).map(|result| result.checkpoints)
+}
+
 /// Destructive end-to-end scale verification for the snapshot v2 repository.
 ///
 /// Run explicitly, for example:
@@ -71,7 +77,7 @@ fn snapshot_v2_checkpoint_scale() {
 
         let completed = index + 1;
         if matches!(completed, 100 | 500 | 1000) || completed == checkpoint_count {
-            let listed = core::list_checkpoints(&project).unwrap();
+            let listed = list_checkpoint_summaries(&project).unwrap();
             assert_eq!(listed.len(), completed);
             let verification = core::verify_project(&project, false).unwrap();
             assert!(verification.is_valid, "{:?}", verification.errors);

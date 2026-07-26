@@ -15,6 +15,9 @@ const DEFAULT_INITIAL_CHECKPOINT_NAME: &str = "初回チェックポイント";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppErrorKind {
+    // Kept as a declared frontend wire kind even though Core now owns the
+    // copied-project eligibility error used by the only current producer.
+    #[allow(dead_code)]
     InvalidOperation,
     NotFound,
     Io,
@@ -192,13 +195,8 @@ async fn start_as_separate_project(
         "starting as a separate project requires confirmation.",
     )?;
     run_cancellable_blocking(app, state, move |token, progress| {
-        let project = core::load_project(&project_path).map_err(to_app_error)?;
-        if project.location_status != core::ProjectLocationStatus::CopiedSuspected {
-            return Err(AppError::new(
-                AppErrorKind::InvalidOperation,
-                "starting as a separate project is only allowed for copied-project warnings.",
-            ));
-        }
+        // Core owns both the initial copied-project eligibility check and the
+        // durable pending-operation retry contract.
         match storage_root_path
             .as_deref()
             .filter(|path| !path.trim().is_empty())

@@ -376,9 +376,9 @@ fn run() -> Result<u8, String> {
                 }
             }
             CheckpointCommand::List { project_path } => {
-                let summaries = core::list_checkpoints(project_path).map_err(to_message)?;
-                print_or_json(cli.json, &summaries, || {
-                    for summary in &summaries {
+                let result = core::list_checkpoints(project_path).map_err(to_message)?;
+                print_or_json(cli.json, &result, || {
+                    for summary in &result.checkpoints {
                         println!(
                             "{}  {}  {} files  {}",
                             summary.checkpoint_id,
@@ -386,6 +386,9 @@ fn run() -> Result<u8, String> {
                             summary.file_count,
                             summary.name
                         );
+                    }
+                    for warning in &result.warnings {
+                        println!("Warning: {warning}");
                     }
                 })?;
             }

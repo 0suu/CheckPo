@@ -21,6 +21,7 @@ const messages = {
     checkpointCount: "チェックポイント",
     logicalSize: "対象ファイル",
     storedSize: "保存容量",
+    calculateStorageSize: "保存容量を計算",
     referencedStorage: "使用中の保存データ",
     referencedStorageDescription: "チェックポイントが使用している保存データの合計です。不要データ、中断した作業の復旧データ、一時ファイルなどは含まれず、ディスク上の使用量とは一致しません。",
     uniqueBlobs: "ユニーク blob",

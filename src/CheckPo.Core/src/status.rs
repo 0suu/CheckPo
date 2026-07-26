@@ -36,7 +36,7 @@ fn project_status_for_project_unlocked(
     let mut warnings = Vec::new();
 
     let checkpoints = if checkpoint_index.state == CheckpointIndexState::Current {
-        match crate::list_checkpoints_with_warnings_for_project_unlocked(project) {
+        match crate::list_checkpoints_for_project_unlocked(project) {
             Ok(result) => {
                 warnings.extend(result.warnings);
                 Some(result.checkpoints)

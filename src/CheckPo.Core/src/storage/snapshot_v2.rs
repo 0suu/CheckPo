@@ -166,18 +166,30 @@ fn build_manifest_with_leaf_target(
     keyed.sort_by(|left, right| left.key.cmp(&right.key));
     validate_ordered_keys(&keyed)?;
 
-    let summary = keyed
-        .iter()
-        .try_fold(ManifestSummary::default(), |summary, keyed_entry| {
-            summary
-                .checked_add(entry_summary(&keyed_entry.entry)?)
-                .map_err(SnapshotV2Error::from)
-        })?;
+    let mut summary_prefixes = Vec::with_capacity(keyed.len() + 1);
+    summary_prefixes.push(ManifestSummary::default());
+    for keyed_entry in &keyed {
+        let summary = summary_prefixes
+            .last()
+            .copied()
+            .expect("summary prefix starts with zero")
+            .checked_add(entry_summary(&keyed_entry.entry)?)
+            .map_err(SnapshotV2Error::from)?;
+        summary_prefixes.push(summary);
+    }
     let mut chunks = BTreeMap::new();
-    let root = build_range(&keyed, 0, leaf_target_bytes, &mut chunks)?;
+    let root = build_range(
+        &keyed,
+        &summary_prefixes,
+        0,
+        keyed.len(),
+        0,
+        leaf_target_bytes,
+        &mut chunks,
+    )?;
     Ok(BuiltManifest {
-        root: Some(root),
-        summary,
+        root: Some(root.reference),
+        summary: root.summary,
         chunks,
     })
 }
@@ -188,64 +200,72 @@ struct KeyedEntry {
     entry: ManifestEntry,
 }
 
+struct BuiltRange {
+    reference: ManifestRef,
+    summary: ManifestSummary,
+}
+
 fn build_range(
     entries: &[KeyedEntry],
+    summary_prefixes: &[ManifestSummary],
+    range_start: usize,
+    range_end: usize,
     depth: usize,
     leaf_target_bytes: usize,
     chunks: &mut BTreeMap<ManifestRef, Vec<u8>>,
-) -> SnapshotV2Result<ManifestRef> {
+) -> SnapshotV2Result<BuiltRange> {
     if depth > MAX_MANIFEST_DEPTH {
         return Err(SnapshotV2Error::Invalid(format!(
             "manifest exceeds maximum depth {MAX_MANIFEST_DEPTH}"
         )));
     }
-    let first = entries
+    let range = entries.get(range_start..range_end).ok_or_else(|| {
+        SnapshotV2Error::Invalid("manifest range is outside its entries".to_string())
+    })?;
+    let first = range
         .first()
         .ok_or_else(|| SnapshotV2Error::Invalid("cannot build an empty chunk".to_string()))?;
-    let last = entries.last().expect("non-empty checked");
+    let last = range.last().expect("non-empty checked");
     let prefix_len = common_prefix_len(&first.key, &last.key);
     let prefix = first.key[..prefix_len].to_vec();
-    let summary = entries
-        .iter()
-        .try_fold(ManifestSummary::default(), |summary, keyed| {
-            summary
-                .checked_add(entry_summary(&keyed.entry)?)
-                .map_err(SnapshotV2Error::from)
-        })?;
-    if leaf_encoded_len(&prefix, summary)? <= leaf_target_bytes || entries.len() == 1 {
+    let summary = range_summary(summary_prefixes, range_start, range_end)?;
+    if leaf_encoded_len(&prefix, summary)? <= leaf_target_bytes || range.len() == 1 {
         let leaf_bytes = encode_leaf(&ManifestLeaf {
             portable_prefix: prefix.clone(),
-            entries: entries
+            entries: range
                 .iter()
                 .map(|keyed| keyed.entry.clone().into())
                 .collect(),
         })?;
-        return insert_chunk(ChunkKind::Leaf, leaf_bytes, chunks);
+        return Ok(BuiltRange {
+            reference: insert_chunk(ChunkKind::Leaf, leaf_bytes, chunks)?,
+            summary,
+        });
     }
 
     let mut children = Vec::new();
-    let mut start = 0;
-    while start < entries.len() {
-        let edge = edge_at(&entries[start].key, prefix_len);
-        let mut end = start + 1;
-        while end < entries.len() && edge_at(&entries[end].key, prefix_len) == edge {
-            end += 1;
+    let mut child_start = range_start;
+    while child_start < range_end {
+        let edge = edge_at(&entries[child_start].key, prefix_len);
+        let mut child_end = child_start + 1;
+        while child_end < range_end && edge_at(&entries[child_end].key, prefix_len) == edge {
+            child_end += 1;
         }
-        let child = build_range(&entries[start..end], depth + 1, leaf_target_bytes, chunks)?;
-        let child_summary =
-            entries[start..end]
-                .iter()
-                .try_fold(ManifestSummary::default(), |summary, keyed| {
-                    summary
-                        .checked_add(entry_summary(&keyed.entry)?)
-                        .map_err(SnapshotV2Error::from)
-                })?;
+        let child = build_range(
+            entries,
+            summary_prefixes,
+            child_start,
+            child_end,
+            depth + 1,
+            leaf_target_bytes,
+            chunks,
+        )?;
         children.push(ManifestChild {
             edge,
-            child,
-            summary: child_summary,
+            child: child.reference,
+            summary: child.summary,
         });
-        start = end;
+        child_start = child_end;
     }
     if children.len() < 2 {
         return Err(SnapshotV2Error::Invalid(
@@ -256,7 +276,43 @@ fn build_range(
         portable_prefix: prefix,
         children,
     })?;
-    insert_chunk(ChunkKind::Node, node_bytes, chunks)
+    Ok(BuiltRange {
+        reference: insert_chunk(ChunkKind::Node, node_bytes, chunks)?,
+        summary,
+    })
+}
+
+fn range_summary(
+    summary_prefixes: &[ManifestSummary],
+    start: usize,
+    end: usize,
+) -> SnapshotV2Result<ManifestSummary> {
+    let before = summary_prefixes.get(start).copied().ok_or_else(|| {
+        SnapshotV2Error::Invalid("manifest summary range start is invalid".to_string())
+    })?;
+    let after = summary_prefixes.get(end).copied().ok_or_else(|| {
+        SnapshotV2Error::Invalid("manifest summary range end is invalid".to_string())
+    })?;
+    Ok(ManifestSummary {
+        entry_count: after
+            .entry_count
+            .checked_sub(before.entry_count)
+            .ok_or_else(|| {
+                SnapshotV2Error::Invalid("manifest entry summary is not monotonic".to_string())
+            })?,
+        logical_size_bytes: after
+            .logical_size_bytes
+            .checked_sub(before.logical_size_bytes)
+            .ok_or_else(|| {
+                SnapshotV2Error::Invalid("manifest size summary is not monotonic".to_string())
+            })?,
+        total_exact_path_bytes: after
+            .total_exact_path_bytes
+            .checked_sub(before.total_exact_path_bytes)
+            .ok_or_else(|| {
+                SnapshotV2Error::Invalid("manifest path summary is not monotonic".to_string())
+            })?,
+    })
 }
 
 fn insert_chunk(

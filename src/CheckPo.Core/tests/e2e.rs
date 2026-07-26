@@ -4,6 +4,8 @@ use core::{
     SnapshotFile, TrackedUnityFilePath,
 };
 use std::fs;
+#[cfg(any(unix, windows))]
+use std::fs::{File, OpenOptions};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -36,6 +38,97 @@ fn setup() -> (
 
 fn repo_path(view: &core::ProjectView) -> std::path::PathBuf {
     view.storage_root_path.join("repos").join(&view.project_id)
+}
+
+fn list_checkpoint_summaries(
+    project_path: impl AsRef<std::path::Path>,
+) -> core::Result<Vec<core::CheckpointSummary>> {
+    core::list_checkpoints(project_path).map(|result| result.checkpoints)
+}
+
+fn copied_project_with_prepared_separate_init(
+    temp: &tempfile::TempDir,
+    source_project: &std::path::Path,
+    source_project_id: &str,
+    copy_name: &str,
+    new_project_id: &str,
+    storage_root: &std::path::Path,
+) -> std::path::PathBuf {
+    let copied = temp.path().join(copy_name);
+    fs::create_dir_all(copied.join("Assets")).unwrap();
+    fs::create_dir_all(copied.join("Packages")).unwrap();
+    fs::create_dir_all(copied.join("ProjectSettings")).unwrap();
+    fs::create_dir_all(copied.join(".checkpo")).unwrap();
+    fs::copy(
+        source_project.join("ProjectSettings/ProjectVersion.txt"),
+        copied.join("ProjectSettings/ProjectVersion.txt"),
+    )
+    .unwrap();
+    fs::copy(
+        source_project.join(".checkpo/project.json"),
+        copied.join(".checkpo/project.json"),
+    )
+    .unwrap();
+    fs::create_dir_all(storage_root).unwrap();
+    fs::write(
+        copied.join(".checkpo/pending-separate-init.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "operationId": "dddddddddddddddddddddddddddddddd",
+            "createdAtUtc": "2026-07-15T00:00:00Z",
+            "previousProjectId": source_project_id,
+            "newMarker": {
+                "schemaVersion": 1,
+                "projectId": new_project_id,
+                "createdAtUtc": "2026-07-15T00:00:00Z"
+            },
+            "storageRootPath": storage_root.canonicalize().unwrap(),
+            "repoFormatVersion": 5,
+            "reason": "copiedProject",
+            "phase": "prepared"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    copied
+}
+
+#[cfg(unix)]
+fn hold_shared_repository_lock(repo: &std::path::Path) -> File {
+    use std::os::fd::AsRawFd;
+
+    let path = repo.join("locks/repository.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    assert_eq!(
+        result,
+        0,
+        "failed to hold shared repository lock {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    file
+}
+
+#[cfg(windows)]
+fn hold_shared_repository_lock(repo: &std::path::Path) -> File {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(repo.join("locks/repository.lock"))
+        .unwrap()
 }
 
 fn first_regular_file_below(root: &std::path::Path) -> std::path::PathBuf {
@@ -526,7 +619,7 @@ fn checkpoint_does_not_follow_source_symlink_swapped_after_scan() {
         matches!(error, core::CheckPoError::WorkingTreeChanged(_)),
         "{error:?}"
     );
-    assert!(core::list_checkpoints(&project).unwrap().is_empty());
+    assert!(list_checkpoint_summaries(&project).unwrap().is_empty());
     assert!(!repo_path(&view).join("refs/latest").exists());
 }
 
@@ -559,7 +652,7 @@ fn checkpoint_final_object_readback_failure_does_not_publish_root_or_latest() {
 
     assert!(corrupted.load(Ordering::SeqCst));
     assert!(matches!(error, core::CheckPoError::ObjectHashMismatch(_)));
-    assert!(core::list_checkpoints(&project).unwrap().is_empty());
+    assert!(list_checkpoint_summaries(&project).unwrap().is_empty());
     assert!(!repo.join("refs/latest").exists());
     assert!(fs::read_dir(repo.join("snapshots/v2"))
         .unwrap()
@@ -621,7 +714,7 @@ fn checkpoint_cancel_during_directory_barrier_keeps_root_unpublished() {
     .unwrap_err();
 
     assert!(matches!(error, core::CheckPoError::Cancelled));
-    assert!(core::list_checkpoints(&project).unwrap().is_empty());
+    assert!(list_checkpoint_summaries(&project).unwrap().is_empty());
     assert!(!repo.join("refs/latest").exists());
     assert!(fs::read_dir(repo.join("snapshots/v2"))
         .unwrap()
@@ -648,7 +741,7 @@ fn checkpoint_rejects_unreadable_tracked_file_without_creating_snapshot() {
 
     assert!(matches!(error, core::CheckPoError::User(_)));
     assert!(error.to_string().contains("could not be read"));
-    assert!(core::list_checkpoints(&project).unwrap().is_empty());
+    assert!(list_checkpoint_summaries(&project).unwrap().is_empty());
     assert!(!repo_path(&view).join("refs/latest").exists());
 }
 
@@ -691,7 +784,7 @@ fn checkpoint_rejects_symlinked_object_shard_without_touching_outside() {
 
     assert!(matches!(error, core::CheckPoError::Corruption(_)));
     assert_eq!(fs::read_to_string(outside_object).unwrap(), "changed");
-    assert!(core::list_checkpoints(&project).unwrap().is_empty());
+    assert!(list_checkpoint_summaries(&project).unwrap().is_empty());
 }
 
 #[test]
@@ -1331,7 +1424,7 @@ fn incompatible_sqlite_index_requires_explicit_rebuild_without_dropping_live_db_
     let status = core::checkpoint_index_status(&context).unwrap();
     assert_eq!(status.state, core::CheckpointIndexState::Incompatible);
     assert!(matches!(
-        core::list_checkpoints(&project),
+        list_checkpoint_summaries(&project),
         Err(core::CheckPoError::IndexUnavailable(_))
     ));
 
@@ -1350,7 +1443,7 @@ fn incompatible_sqlite_index_requires_explicit_rebuild_without_dropping_live_db_
 
     let status = core::checkpoint_index_status(&context).unwrap();
     assert_eq!(status.state, core::CheckpointIndexState::Current);
-    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    assert_eq!(list_checkpoint_summaries(&project).unwrap().len(), 1);
     let conn = open_test_index(&repo);
     let schema_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1407,7 +1500,7 @@ fn list_and_storage_summary_do_not_rebuild_missing_sqlite_index() {
         core::CheckpointIndexState::Missing
     );
     assert!(matches!(
-        core::list_checkpoints(&project),
+        list_checkpoint_summaries(&project),
         Err(core::CheckPoError::IndexUnavailable(_))
     ));
     assert!(matches!(
@@ -1417,7 +1510,7 @@ fn list_and_storage_summary_do_not_rebuild_missing_sqlite_index() {
     assert!(!core::db_path(&repo).unwrap().exists());
 
     core::rebuild_index(&project).unwrap();
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let checkpoints = list_checkpoint_summaries(&project).unwrap();
     let summary = core::storage_summary(&project).unwrap();
     assert_eq!(checkpoints.len(), 2);
     assert_eq!(summary.checkpoint_count, 2);
@@ -1572,7 +1665,7 @@ fn rename_checkpoint_preserves_id_and_applies_to_all_summary_paths() {
     assert_eq!(renamed.checkpoint_id, created.checkpoint_id);
     assert_eq!(renamed.name, "after");
 
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let checkpoints = list_checkpoint_summaries(&project).unwrap();
     assert_eq!(checkpoints[0].checkpoint_id, created.checkpoint_id);
     assert_eq!(checkpoints[0].name, "after");
 
@@ -1598,20 +1691,37 @@ fn corrupt_checkpoint_display_names_do_not_block_checkpoint_list() {
     let names_path = repo_path(&view).join("refs").join("checkpoint_names.json");
     fs::write(&names_path, "not json").unwrap();
 
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let result = core::list_checkpoints(&project).unwrap();
+    let checkpoints = result.checkpoints;
 
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(checkpoints[0].checkpoint_id, created.checkpoint_id);
     assert_eq!(checkpoints[0].name, "before");
-    assert!(!checkpoints[0].warnings.is_empty());
+    assert!(!result.warnings.is_empty());
 
     let context = core::load_project(&project).unwrap();
-    let list_result = core::list_checkpoints_with_warnings_for_project(&context).unwrap();
+    let list_result = core::list_checkpoints_for_project(&context).unwrap();
     assert!(!list_result.warnings.is_empty());
     let (indexed, _) = core::checkpoint_summaries_and_storage_summary_from_index(&context).unwrap();
     assert_eq!(indexed.checkpoints[0].name, "before");
     assert!(!indexed.warnings.is_empty());
     assert!(indexed.checkpoints[0].warnings.is_empty());
+}
+
+#[test]
+fn checkpoint_list_result_preserves_warnings_for_empty_history() {
+    let (_guard, _temp, project, _data) = setup();
+    let view = init_project_for_test(&project).unwrap();
+    fs::write(
+        repo_path(&view).join("refs").join("checkpoint_names.json"),
+        "not json",
+    )
+    .unwrap();
+
+    let result = core::list_checkpoints(&project).unwrap();
+
+    assert!(result.checkpoints.is_empty());
+    assert!(!result.warnings.is_empty());
 }
 
 #[test]
@@ -1636,10 +1746,11 @@ fn corrupt_checkpoint_display_names_block_rename_and_delete_without_overwriting_
     assert_eq!(fs::read(&names_path).unwrap(), corrupt_bytes);
     assert!(core::snapshot_path(&repo, &created.checkpoint_id).is_file());
 
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let result = core::list_checkpoints(&project).unwrap();
+    let checkpoints = result.checkpoints;
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(checkpoints[0].name, "before");
-    assert!(!checkpoints[0].warnings.is_empty());
+    assert!(!result.warnings.is_empty());
 }
 
 #[test]
@@ -1699,7 +1810,7 @@ fn invalid_index_row_is_reported_as_index_unavailable() {
     conn.execute("UPDATE snapshots SET snapshot_id = 'invalid'", [])
         .unwrap();
 
-    let error = core::list_checkpoints(&project).unwrap_err();
+    let error = list_checkpoint_summaries(&project).unwrap_err();
     assert!(matches!(error, core::CheckPoError::IndexUnavailable(_)));
 }
 
@@ -1720,7 +1831,7 @@ fn unreadable_sqlite_index_is_reported_without_snapshot_fallback() {
         core::CheckpointIndexState::Corrupt
     );
     assert!(matches!(
-        core::list_checkpoints_with_warnings_for_project(&context),
+        core::list_checkpoints_for_project(&context),
         Err(core::CheckPoError::IndexUnavailable(_))
     ));
     assert!(db_path.is_dir());
@@ -1786,7 +1897,7 @@ fn cancelled_rebuild_index_does_not_remove_existing_index_db() {
     let index_db = core::db_path(&repo).unwrap();
     core::rebuild_index(&project).unwrap();
     assert!(index_db.is_file());
-    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    assert_eq!(list_checkpoint_summaries(&project).unwrap().len(), 1);
     let before = fs::read(&index_db).unwrap();
 
     let token = core::CancellationToken::new();
@@ -1807,7 +1918,7 @@ fn cancelled_rebuild_index_does_not_remove_existing_index_db() {
     assert!(matches!(error, core::CheckPoError::Cancelled));
     assert!(index_db.is_file());
     assert_eq!(fs::read(&index_db).unwrap(), before);
-    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    assert_eq!(list_checkpoint_summaries(&project).unwrap().len(), 1);
 }
 
 #[test]
@@ -1967,7 +2078,7 @@ fn object_size_mismatch_does_not_block_checkpoint_index_rebuild() {
         core::checkpoint_index_status(&context).unwrap().state,
         core::CheckpointIndexState::Current
     );
-    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    assert_eq!(list_checkpoint_summaries(&project).unwrap().len(), 1);
     let conn = open_test_index(&repo);
     let present_size: Option<i64> = conn
         .query_row(
@@ -2779,7 +2890,7 @@ fn external_future_root_keeps_head_status_current_and_blocks_gc_deletion() {
         core::CheckpointIndexState::Current
     );
     assert_eq!(
-        core::list_checkpoints_with_warnings_for_project(&context)
+        core::list_checkpoints_for_project(&context)
             .unwrap()
             .checkpoints
             .len(),
@@ -2835,7 +2946,7 @@ fn checkpoint_list_ignores_invalid_root_filename_but_verify_warns() {
         .join(view.project_id)
         .join("snapshots/v2");
     fs::write(snapshots.join("README.root"), "invalid").unwrap();
-    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    assert_eq!(list_checkpoint_summaries(&project).unwrap().len(), 1);
     let verify = core::verify_project(&project, false).unwrap();
     assert!(verify.is_valid);
     assert!(verify
@@ -4196,7 +4307,7 @@ fn delete_latest_checkpoint_points_latest_ref_to_newest_remaining_checkpoint() {
         fs::write(project.join("Assets/Avatar/Foo.prefab"), index.to_string()).unwrap();
         core::create_checkpoint(&project, &format!("cp{index}"), Default::default()).unwrap();
     }
-    let before = core::list_checkpoints(&project).unwrap();
+    let before = list_checkpoint_summaries(&project).unwrap();
     let deleted = before[0].checkpoint_id.clone();
     let expected_latest = before[1].checkpoint_id.clone();
 
@@ -4218,7 +4329,7 @@ fn delete_checkpoint_leaves_incomplete_sqlite_index_stale_until_explicit_rebuild
     core::create_checkpoint(&project, "cp1", Default::default()).unwrap();
     fs::write(project.join("Assets/Avatar/Foo.prefab"), "two").unwrap();
     core::create_checkpoint(&project, "cp2", Default::default()).unwrap();
-    let before = core::list_checkpoints(&project).unwrap();
+    let before = list_checkpoint_summaries(&project).unwrap();
     let deleted = before[0].checkpoint_id.clone();
     let expected_latest = before[1].checkpoint_id.clone();
     let repo = repo_path(&view);
@@ -4242,12 +4353,12 @@ fn delete_checkpoint_leaves_incomplete_sqlite_index_stale_until_explicit_rebuild
         core::CheckpointIndexState::Stale
     );
     assert!(matches!(
-        core::list_checkpoints(&project),
+        list_checkpoint_summaries(&project),
         Err(core::CheckPoError::IndexUnavailable(_))
     ));
 
     core::rebuild_index(&project).unwrap();
-    let after = core::list_checkpoints(&project).unwrap();
+    let after = list_checkpoint_summaries(&project).unwrap();
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].checkpoint_id, expected_latest);
 }
@@ -4260,7 +4371,7 @@ fn delete_checkpoint_updates_aggregate_object_reference_counts() {
         fs::write(project.join("Assets/Avatar/Foo.prefab"), index.to_string()).unwrap();
         core::create_checkpoint(&project, &format!("cp{index}"), Default::default()).unwrap();
     }
-    let before = core::list_checkpoints(&project).unwrap();
+    let before = list_checkpoint_summaries(&project).unwrap();
     let deleted = before[0].checkpoint_id.clone();
     let repo = repo_path(&view);
     let deleted_snapshot = core::load_snapshot(&repo, &deleted).unwrap();
@@ -4283,7 +4394,7 @@ fn delete_checkpoint_updates_aggregate_object_reference_counts() {
     drop(conn);
 
     let result = core::delete_checkpoint(&project, deleted.as_str()).unwrap();
-    let after = core::list_checkpoints(&project).unwrap();
+    let after = list_checkpoint_summaries(&project).unwrap();
 
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert_eq!(after.len(), 2);
@@ -4378,7 +4489,7 @@ fn checkpoint_create_recovery_finishes_published_root_with_compare_and_swap_late
             .state,
         core::CheckpointIndexState::Current
     );
-    assert!(core::list_checkpoints(&project)
+    assert!(list_checkpoint_summaries(&project)
         .unwrap()
         .iter()
         .any(|checkpoint| checkpoint.checkpoint_id == published_id));
@@ -4456,7 +4567,7 @@ fn checkpoint_create_recovery_preserves_newer_latest_as_a_branch() {
         Some(latest.checkpoint_id)
     );
     assert!(core::load_snapshot(&repo, &branch_id).is_ok());
-    assert!(core::list_checkpoints(&project)
+    assert!(list_checkpoint_summaries(&project)
         .unwrap()
         .iter()
         .any(|checkpoint| checkpoint.checkpoint_id == branch_id));
@@ -4501,7 +4612,7 @@ fn interrupted_checkpoint_delete_is_completed_from_its_journal() {
     )
     .unwrap();
 
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let checkpoints = list_checkpoint_summaries(&project).unwrap();
 
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(checkpoints[0].checkpoint_id, first.checkpoint_id);
@@ -4605,7 +4716,7 @@ fn checkpoint_cleanup_trash_is_drained_before_recovery_and_next_operations() {
     fs::write(&tracked, "two").unwrap();
     let second = core::create_checkpoint(&project, "two", Default::default()).unwrap();
     core::delete_checkpoint(&project, first.checkpoint_id.as_str()).unwrap();
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let checkpoints = list_checkpoint_summaries(&project).unwrap();
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(checkpoints[0].checkpoint_id, second.checkpoint_id);
 }
@@ -4989,6 +5100,30 @@ fn storage_gc_sweeps_unreachable_inventory_nodes() {
 }
 
 #[test]
+fn storage_gc_preserves_inventory_lineage_needed_after_deleting_a_middle_checkpoint() {
+    let (_guard, _temp, project, _data) = setup();
+    let tracked = project.join("Assets/Avatar/Foo.prefab");
+    init_project_for_test(&project).unwrap();
+
+    fs::write(&tracked, "a").unwrap();
+    let first = core::create_checkpoint(&project, "A", Default::default()).unwrap();
+    fs::write(&tracked, "b").unwrap();
+    let middle = core::create_checkpoint(&project, "B", Default::default()).unwrap();
+    fs::write(&tracked, "c").unwrap();
+    let latest = core::create_checkpoint(&project, "C", Default::default()).unwrap();
+
+    core::delete_checkpoint(&project, middle.checkpoint_id.as_str()).unwrap();
+    let plan = core::analyze_gc(&project).unwrap();
+    core::apply_gc_with_expected_plan(&project, &plan.plan_id).unwrap();
+
+    core::delete_checkpoint(&project, latest.checkpoint_id.as_str()).unwrap();
+
+    let remaining = list_checkpoint_summaries(&project).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].checkpoint_id, first.checkpoint_id);
+}
+
+#[test]
 fn storage_gc_honors_pre_cancelled_token() {
     let (_guard, _temp, project, _data) = setup();
     init_project_for_test(&project).unwrap();
@@ -5054,22 +5189,46 @@ fn copied_project_can_be_initialized_as_separate_project() {
     assert_copied_project_error(&error);
 
     let pending_project_id = "a".repeat(32);
+    let pending_storage = temp.path().join("pending-custom-storage");
+    fs::create_dir(&pending_storage).unwrap();
     fs::write(
         copied.join(".checkpo/pending-separate-init.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
+            "operationId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "createdAtUtc": "2026-07-15T00:00:00Z",
             "previousProjectId": original.project_id.as_str(),
             "newMarker": {
                 "schemaVersion": 1,
                 "projectId": pending_project_id,
                 "createdAtUtc": "2026-07-15T00:00:00Z"
-            }
+            },
+            "storageRootPath": pending_storage.canonicalize().unwrap(),
+            "repoFormatVersion": 5,
+            "reason": "copiedProject",
+            "phase": "prepared"
         }))
         .unwrap(),
     )
     .unwrap();
-    let copied_view =
-        core::start_as_separate_project(&copied, core::ApplyOptions { yes: true }).unwrap();
+    let different_storage = temp.path().join("different-storage");
+    let error = core::start_as_separate_project_with_storage_root(
+        &copied,
+        &different_storage,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        core::CheckPoError::StorageRootConflict { .. }
+    ));
+    assert!(copied.join(".checkpo/pending-separate-init.json").is_file());
+    let copied_view = core::start_as_separate_project_with_storage_root(
+        &copied,
+        &pending_storage,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
     let copied_marker: core::ProjectMarkerFile =
         core::read_json(&copied.join(".checkpo/project.json")).unwrap();
 
@@ -5078,8 +5237,163 @@ fn copied_project_can_be_initialized_as_separate_project() {
     assert_eq!(copied_marker.project_id.as_str(), copied_view.project_id);
     assert!(!copied.join(".checkpo/pending-separate-init.json").exists());
     assert!(repo_path(&copied_view).join("repo.json").is_file());
-    assert_eq!(core::list_checkpoints(&copied).unwrap().len(), 0);
-    assert_eq!(core::list_checkpoints(&project).unwrap().len(), 1);
+    assert_eq!(list_checkpoint_summaries(&copied).unwrap().len(), 0);
+    assert_eq!(list_checkpoint_summaries(&project).unwrap().len(), 1);
+
+    let db_path = core::db_path(&repo_path(&copied_view)).unwrap();
+    fs::remove_file(&db_path).unwrap();
+    fs::write(
+        copied.join(".checkpo/pending-separate-init.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "operationId": "cccccccccccccccccccccccccccccccc",
+            "createdAtUtc": "2026-07-15T00:01:00Z",
+            "previousProjectId": original.project_id.as_str(),
+            "newMarker": copied_marker,
+            "storageRootPath": copied_view.storage_root_path.clone(),
+            "repoFormatVersion": 5,
+            "reason": "copiedProject",
+            "phase": "registered"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    #[cfg(any(unix, windows))]
+    {
+        let repository_lock = hold_shared_repository_lock(&repo_path(&copied_view));
+        let error = core::start_as_separate_project_with_storage_root(
+            &copied,
+            &pending_storage,
+            core::ApplyOptions { yes: true },
+        )
+        .unwrap_err();
+        assert!(matches!(error, core::CheckPoError::RepositoryLocked(_)));
+        assert!(!db_path.exists());
+        assert!(copied.join(".checkpo/pending-separate-init.json").is_file());
+        drop(repository_lock);
+    }
+
+    let finalized = core::start_as_separate_project_with_storage_root(
+        &copied,
+        &pending_storage,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+    assert_eq!(finalized.project_id, copied_view.project_id);
+    assert!(db_path.is_file());
+    assert!(!copied.join(".checkpo/pending-separate-init.json").exists());
+}
+
+#[test]
+fn pending_separate_init_retry_survives_original_project_disappearance() {
+    let (_guard, temp, project, _data) = setup();
+    let original = init_project_for_test(&project).unwrap();
+    let storage_root = temp.path().join("resumed-storage");
+    let new_project_id = "e".repeat(32);
+    let copied = copied_project_with_prepared_separate_init(
+        &temp,
+        &project,
+        original.project_id.as_str(),
+        "CopiedAfterOriginalDisappears",
+        &new_project_id,
+        &storage_root,
+    );
+    fs::remove_file(project.join(".checkpo/project.json")).unwrap();
+
+    let resumed = core::start_as_separate_project_with_storage_root(
+        &copied,
+        &storage_root,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.project_id, new_project_id);
+    assert_eq!(
+        resumed.storage_root_path,
+        storage_root.canonicalize().unwrap()
+    );
+    assert_eq!(
+        core::load_project_view(&copied).unwrap().location_status,
+        ProjectLocationStatus::Current
+    );
+    assert!(repo_path(&resumed).join("repo.json").is_file());
+    assert!(list_checkpoint_summaries(&copied).unwrap().is_empty());
+    assert!(!copied.join(".checkpo/pending-separate-init.json").exists());
+}
+
+#[test]
+fn pending_separate_init_retry_does_not_require_previous_repository() {
+    let (_guard, temp, project, _data) = setup();
+    fs::write(project.join("Assets/Avatar/Foo.prefab"), "original").unwrap();
+    let original = init_project_for_test(&project).unwrap();
+    core::create_checkpoint(&project, "Original", Default::default()).unwrap();
+    let storage_root = temp.path().join("resumed-storage");
+    let new_project_id = "f".repeat(32);
+    let copied = copied_project_with_prepared_separate_init(
+        &temp,
+        &project,
+        original.project_id.as_str(),
+        "CopiedAfterRepositoryDisconnects",
+        &new_project_id,
+        &storage_root,
+    );
+    let detached_repository = temp.path().join("detached-original-repository");
+    fs::rename(repo_path(&original), &detached_repository).unwrap();
+
+    let resumed = core::start_as_separate_project_with_storage_root(
+        &copied,
+        &storage_root,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap();
+
+    assert_eq!(resumed.project_id, new_project_id);
+    assert!(repo_path(&resumed).join("repo.json").is_file());
+    assert!(list_checkpoint_summaries(&copied).unwrap().is_empty());
+    assert!(detached_repository.join("refs/latest").is_file());
+    assert!(!copied.join(".checkpo/pending-separate-init.json").exists());
+}
+
+#[test]
+fn pending_separate_init_retry_requires_previous_registry_binding() {
+    let (_guard, temp, project, _data) = setup();
+    let original = init_project_for_test(&project).unwrap();
+    let storage_root = temp.path().join("resumed-storage");
+    let new_project_id = "1".repeat(32);
+    let copied = copied_project_with_prepared_separate_init(
+        &temp,
+        &project,
+        original.project_id.as_str(),
+        "CopiedAfterRegistryEntryDisappears",
+        &new_project_id,
+        &storage_root,
+    );
+    let marker_path = copied.join(".checkpo/project.json");
+    let pending_path = copied.join(".checkpo/pending-separate-init.json");
+    let marker_before = fs::read(&marker_path).unwrap();
+    let pending_before = fs::read(&pending_path).unwrap();
+    let registry_path = core::registry_path().unwrap();
+    let mut registry: core::RegistryFile = core::read_json(&registry_path).unwrap();
+    registry
+        .projects
+        .remove(original.project_id.as_str())
+        .unwrap();
+    fs::write(&registry_path, serde_json::to_vec(&registry).unwrap()).unwrap();
+
+    let error = core::start_as_separate_project_with_storage_root(
+        &copied,
+        &storage_root,
+        core::ApplyOptions { yes: true },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, core::CheckPoError::InvalidProject(_)));
+    assert_eq!(fs::read(&marker_path).unwrap(), marker_before);
+    assert_eq!(fs::read(&pending_path).unwrap(), pending_before);
+    let registry: core::RegistryFile = core::read_json(&registry_path).unwrap();
+    assert!(!registry.projects.contains_key(&new_project_id));
+    assert!(!storage_root.join("repos").join(new_project_id).exists());
 }
 
 #[test]
@@ -5109,13 +5423,19 @@ fn pending_separate_init_cannot_claim_an_existing_project_id() {
     fs::write(
         copied.join(".checkpo/pending-separate-init.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
+            "operationId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "createdAtUtc": "2026-07-15T00:00:00Z",
             "previousProjectId": source.project_id.as_str(),
             "newMarker": {
                 "schemaVersion": 1,
                 "projectId": existing_owner.project_id.as_str(),
                 "createdAtUtc": "2026-07-15T00:00:00Z"
-            }
+            },
+            "storageRootPath": core::default_storage_root().unwrap().canonicalize().unwrap(),
+            "repoFormatVersion": 5,
+            "reason": "copiedProject",
+            "phase": "prepared"
         }))
         .unwrap(),
     )
@@ -5403,7 +5723,7 @@ fn copied_project_blocks_mutating_operations_until_decided() {
         fs::remove_file(&index_db).unwrap();
     }
     assert!(matches!(
-        core::list_checkpoints(&copied),
+        list_checkpoint_summaries(&copied),
         Err(core::CheckPoError::IndexUnavailable(_))
     ));
     assert!(!index_db.exists());

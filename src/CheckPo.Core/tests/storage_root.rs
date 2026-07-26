@@ -2,6 +2,12 @@ use checkpo_core as core;
 use std::fs::{self, File, OpenOptions};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+fn list_checkpoint_summaries(
+    project_path: impl AsRef<std::path::Path>,
+) -> core::Result<Vec<core::CheckpointSummary>> {
+    core::list_checkpoints(project_path).map(|result| result.checkpoints)
+}
+
 fn setup() -> (
     MutexGuard<'static, ()>,
     tempfile::TempDir,
@@ -74,7 +80,7 @@ fn set_project_storage_root_uses_manually_moved_repository() {
         new_storage.canonicalize().unwrap()
     );
     assert_eq!(
-        core::list_checkpoints(&project).unwrap()[0].checkpoint_id,
+        list_checkpoint_summaries(&project).unwrap()[0].checkpoint_id,
         summary.checkpoint_id
     );
 }
@@ -122,7 +128,7 @@ fn set_project_storage_root_recovers_prepared_checkpoint_create_journal() {
     );
     assert!(!journal_root.exists());
     assert_eq!(
-        core::list_checkpoints(&project).unwrap()[0].checkpoint_id,
+        list_checkpoint_summaries(&project).unwrap()[0].checkpoint_id,
         first.checkpoint_id
     );
 }
@@ -175,7 +181,7 @@ fn set_project_storage_root_recovers_staged_checkpoint_delete_journal() {
     core::set_project_storage_root(&project, &new_storage).unwrap();
 
     assert!(!transaction_root.exists());
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let checkpoints = list_checkpoint_summaries(&project).unwrap();
     assert_eq!(checkpoints.len(), 1);
     assert_eq!(checkpoints[0].checkpoint_id, first.checkpoint_id);
     assert!(core::verify_project(&project, false).unwrap().is_valid);
@@ -206,7 +212,7 @@ fn portable_repository_set_roundtrips_without_local_indexes_or_journals() {
     core::set_project_storage_root(&project, &new_storage).unwrap();
     core::rebuild_index(&project).unwrap();
 
-    let checkpoints = core::list_checkpoints(&project).unwrap();
+    let checkpoints = list_checkpoint_summaries(&project).unwrap();
     assert_eq!(checkpoints.len(), 2);
     assert_eq!(checkpoints[0].checkpoint_id, second.checkpoint_id);
     assert!(core::verify_project(&project, false).unwrap().is_valid);
@@ -435,7 +441,7 @@ fn start_new_history_after_storage_loss_preserves_old_registration() {
         .join("repos")
         .join(&restarted.project_id)
         .is_dir());
-    assert!(core::list_checkpoints(&project).unwrap().is_empty());
+    assert!(list_checkpoint_summaries(&project).unwrap().is_empty());
     let registry: serde_json::Value = core::read_json(&core::registry_path().unwrap()).unwrap();
     assert!(registry["projects"]
         .get(original.project_id.as_str())

@@ -1,35 +1,53 @@
-name: Dependency audit
+name: Dependency policy
 
 on:
   pull_request:
-    paths:
-      - "**/Cargo.toml"
-      - Cargo.lock
-      - .github/workflows/dependency-audit.yml
   push:
     branches:
       - main
-    paths:
-      - "**/Cargo.toml"
-      - Cargo.lock
-      - .github/workflows/dependency-audit.yml
   schedule:
     - cron: "41 17 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
-  checks: write
 
 jobs:
-  rustsec:
+  policy:
     name: Dependency policy
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Audit Cargo.lock
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: 1.88.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install cargo-deny
+        shell: bash
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Validate advisory exception review dates
+        run: node scripts/validate-advisory-ignores.mjs deny.toml
+
+      - name: Check dependency policy
+        run: cargo deny check
+
+      - name: Install cargo-about
+        shell: bash
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: Verify bundled third-party notices
+        shell: bash
+        run: |
+          git ls-files --error-unmatch LICENSE THIRD_PARTY_LICENSES.html
+          cargo about generate -o THIRD_PARTY_LICENSES.html about.hbs
+          git diff --exit-code -- THIRD_PARTY_LICENSES.html

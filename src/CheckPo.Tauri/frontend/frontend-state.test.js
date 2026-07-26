@@ -852,16 +852,35 @@ test("pending transaction errors resync the project so the recovery action becom
   );
 });
 
-test("journal cleanup invalidates and refreshes the rescue-size footer", () => {
+test("journal cleanup invalidates the rescue-size footer without starting an exact scan", () => {
   const appJs = readAppSource();
   const cleanupPath = appJs.match(
     /const result = await invokeCommand\("cleanup_journals"[\s\S]*?\r?\n    }\);/,
   )?.[0] || "";
 
   assert.match(cleanupPath, /invalidateStoredSize\(\)/);
-  assert.match(cleanupPath, /scheduleStorageSizeRefresh\(\{ force: true \}\)/);
+  assert.doesNotMatch(cleanupPath, /calculateStorageSize\(\)/);
   assert.match(appJs, /state\.storage\.recoveryRescueBytes = null/);
   assert.match(appJs, /state\.storage\.recoveryRescueFileCount = null/);
+});
+
+test("storage size is calculated only by explicit user action during normal rendering", () => {
+  const appJs = readAppSource();
+  const indexHtml = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  const i18nJs = fs.readFileSync(path.join(__dirname, "i18n.js"), "utf8");
+  const renderSnapshot = appJs.match(
+    /function renderSnapshot\(snapshot\) \{[\s\S]*?\r?\n}\r?\n\r?\nfunction sortCheckpoints/,
+  )?.[0] || "";
+
+  assert.doesNotMatch(renderSnapshot, /scheduleStorageSizeRefresh/);
+  assert.match(indexHtml, /id="calculateStorageSizeButton"/);
+  assert.match(i18nJs, /calculateStorageSize: "保存容量を計算"/);
+  assert.match(
+    appJs,
+    /\$\("calculateStorageSizeButton"\)\?\.addEventListener\("click", async \(\) => \{\r?\n\s+await calculateStorageSize\(\);/,
+  );
+  assert.match(appJs, /await run\("保存容量を計算中"/);
+  assert.doesNotMatch(appJs, /scheduleStorageSizeRefresh/);
 });
 
 test("restore and discard refresh the rescue-size footer after creating journals", () => {

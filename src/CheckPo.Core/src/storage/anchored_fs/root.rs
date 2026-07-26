@@ -2,6 +2,17 @@ use super::*;
 
 impl AnchoredRoot {
     const MAX_ANCHORED_JSON_BYTES: u64 = 512 * 1024 * 1024;
+
+    #[cfg(unix)]
+    pub(crate) fn from_held_parent(parent: AnchoredParent) -> Self {
+        Self {
+            display_path: parent.display_path,
+            identity: parent.identity,
+            #[cfg(any(unix, windows))]
+            directory: parent.directory,
+        }
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         if !path.is_absolute() {
             return Err(CheckPoError::Unexpected(format!(
@@ -163,6 +174,26 @@ impl AnchoredRoot {
         let display_path = self.display_path.join(relative);
         let bytes = serde_json::to_vec(value).map_err(|error| json_error(display_path, error))?;
         self.write_bytes_atomic_new(relative, &bytes)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn make_file_private(&self, relative: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file = self.open_file(relative)?;
+        file.file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| io_error(self.display_path.join(relative), error))?;
+        file.file
+            .sync_all()
+            .map_err(|error| io_error(self.display_path.join(relative), error))?;
+        self.verify_binding(relative, &file)?;
+        self.verify_root_binding()
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn make_file_private(&self, _relative: &Path) -> Result<()> {
+        Ok(())
     }
 
     pub(crate) fn write_json_atomic_path<T: serde::Serialize>(

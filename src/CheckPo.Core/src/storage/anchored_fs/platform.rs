@@ -108,11 +108,21 @@ pub(super) fn create_unix_directory_component_exclusive(
     component: &std::ffi::OsStr,
     display_path: &Path,
 ) -> Result<()> {
+    create_unix_directory_component_exclusive_with_mode(parent_fd, component, display_path, 0o777)
+}
+
+#[cfg(unix)]
+pub(super) fn create_unix_directory_component_exclusive_with_mode(
+    parent_fd: libc::c_int,
+    component: &std::ffi::OsStr,
+    display_path: &Path,
+    mode: libc::mode_t,
+) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let value = std::ffi::CString::new(component.as_bytes()).map_err(|_| {
         CheckPoError::Corruption(format!("path contains NUL: {}", display_path.display()))
     })?;
-    let result = unsafe { libc::mkdirat(parent_fd, value.as_ptr(), 0o777) };
+    let result = unsafe { libc::mkdirat(parent_fd, value.as_ptr(), mode) };
     if result == 0 {
         Ok(())
     } else {
