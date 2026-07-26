@@ -29,8 +29,8 @@ pub(crate) use apply::apply_restore_plan_and_resolve_quarantines;
 #[cfg(test)]
 use apply::{
     apply_plan_for_user_inner, apply_plan_inner, classify_apply_error, ensure_available_space,
-    estimated_project_required_bytes, estimated_repository_required_bytes, TransactionFaultPoint,
-    TRANSACTION_BACKUP_FILE_BATCH_SIZE,
+    ensure_checkpoint_storage_available_space, estimated_project_required_bytes,
+    estimated_repository_required_bytes, TransactionFaultPoint, TRANSACTION_BACKUP_FILE_BATCH_SIZE,
 };
 pub(crate) use journal::pending_transactions_for_project;
 pub use journal::{
@@ -50,10 +50,10 @@ use plan::{
 #[cfg(test)]
 use project_file_ops::backup_project_file_by_reflink_or_copy;
 use project_file_ops::*;
-use recovery::invalidate_operation_fingerprints;
 pub(crate) use recovery::unresolved_transaction_quarantines_for_project;
 pub use recovery::{
     analyze_transaction_recovery_conflicts, ensure_no_unresolved_transaction_quarantines,
     quarantine_transaction, recover_transaction_with_conflict_export, recover_transactions,
     unresolved_transaction_quarantines,
 };
+use recovery::{invalidate_operation_fingerprints, remove_repository_tree_if_exists};

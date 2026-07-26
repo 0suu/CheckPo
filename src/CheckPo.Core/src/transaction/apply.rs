@@ -351,6 +351,20 @@ fn apply_plan_once(
                 "{error}; additionally failed to abort transaction {transaction_id}: {abort_error}"
             )));
         }
+        if let Err(cleanup_error) = inject_transaction_fault(
+            fault_hook,
+            TransactionFaultPoint::StagedPayloadCleanupBefore,
+        )
+        .and_then(|()| remove_repository_tree_if_exists(&project.repo_root, &staged_root))
+        {
+            crate::diagnostics::log_warning(
+                "transaction-abort-staged-cleanup",
+                &format!(
+                    "transaction {transaction_id} was aborted, but private staged payload cleanup remains pending at {}: {cleanup_error}",
+                    staged_root.display()
+                ),
+            );
+        }
         return Err(error);
     }
 
@@ -783,8 +797,7 @@ fn inject_transaction_fault(
 }
 
 fn ensure_capacity_for_plan(project: &ProjectContext, plan: &OperationPlan) -> Result<()> {
-    ensure_available_space(
-        "checkpoint storage",
+    ensure_checkpoint_storage_available_space(
         project.repo_root.as_path(),
         estimated_repository_required_bytes(plan),
     )?;
@@ -792,6 +805,20 @@ fn ensure_capacity_for_plan(project: &ProjectContext, plan: &OperationPlan) -> R
         "Unity project",
         project.project_root.as_path(),
         estimated_project_required_bytes(plan),
+    )
+}
+
+pub(super) fn ensure_checkpoint_storage_available_space(
+    path: &Path,
+    required_bytes: u64,
+) -> Result<()> {
+    ensure_available_space_with_hint(
+        "checkpoint storage",
+        path,
+        required_bytes,
+        Some(
+            "If old transaction data is consuming checkpoint storage, use 上級者向け > 復旧用データの片付け. CLI users should first run `checkpo maintenance cleanup-journals analyze <project-path> --json > cleanup-plan.json`, then `checkpo maintenance cleanup-journals apply <project-path> --expected-plan cleanup-plan.json --yes`, and retry.",
+        ),
     )
 }
 
@@ -815,17 +842,31 @@ pub(super) fn estimated_project_required_bytes(plan: &OperationPlan) -> u64 {
 }
 
 pub(super) fn ensure_available_space(label: &str, path: &Path, required_bytes: u64) -> Result<()> {
+    ensure_available_space_with_hint(label, path, required_bytes, None)
+}
+
+fn ensure_available_space_with_hint(
+    label: &str,
+    path: &Path,
+    required_bytes: u64,
+    hint: Option<&str>,
+) -> Result<()> {
     if required_bytes == 0 {
         return Ok(());
     }
     let available_bytes = crate::available_space_bytes(path)?;
     if available_bytes < required_bytes {
-        return Err(crate::user_error(format!(
+        let mut message = format!(
             "not enough free space in {label}: need {}, available {} ({})",
             format_bytes(required_bytes),
             format_bytes(available_bytes),
             path.display()
-        )));
+        );
+        if let Some(hint) = hint {
+            message.push_str(". ");
+            message.push_str(hint);
+        }
+        return Err(crate::user_error(message));
     }
     Ok(())
 }

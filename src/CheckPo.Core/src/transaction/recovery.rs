@@ -31,7 +31,7 @@ pub(super) use rescue::{
     prepare_recovery_conflict_rescue_and_remove_first_for_test,
     prepare_recovery_conflict_rescue_for_test,
 };
-pub(super) use rollback::invalidate_operation_fingerprints;
+pub(super) use rollback::{invalidate_operation_fingerprints, remove_repository_tree_if_exists};
 
 pub fn recover_transactions(project_path: impl AsRef<Path>) -> Result<TransactionRecoveryResult> {
     let project = crate::load_project(project_path)?;
