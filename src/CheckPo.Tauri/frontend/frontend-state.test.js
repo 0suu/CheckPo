@@ -833,7 +833,10 @@ test("GUI usability guards keep dialogs reachable and accessible", () => {
     stylesCss,
     /\.status-bar #calculateStorageSizeButton \{[\s\S]*?height: 22px;[\s\S]*?min-height: 22px;/,
   );
-  assert.match(indexHtml, /id="checkpointName"[^>]*aria-label="チェックポイント名"/);
+  assert.match(
+    indexHtml,
+    /id="checkpointName"[^>]*autocomplete="off"[^>]*aria-label="チェックポイント名"/,
+  );
   assert.match(indexHtml, /id="themeSystem"[^>]*aria-pressed="true"/);
   assert.match(indexHtml, /class="busy-box"[^>]*tabindex="-1"/);
   assert.match(themeJs, /setAttribute\("aria-pressed", String\(selected\)\)/);
